@@ -30,12 +30,33 @@
 - Numeric type inference: `I64`, `F64`
 - Variable identifiers
 
-**NOT Yet:**
-- Hex/octal/binary literals (0x5, 0o5, 0b0101)
-- Type suffixes (5.U8, 5.I32, etc.)
-- Dec type (decimal)
-
 **Test File:** `phase2_numbers_test.roc` (created below)
+
+---
+
+### Phase 6: Numeric Type Variants & Formats (COMPLETE)
+**Status:** ✅ Parser & desugarer working
+
+**Implemented:**
+- Hex/octal/binary literals: `0xFF`, `0o77`, `0b1010`
+- Type suffixes: `255.U8`, `42.I32`, `3.14.F64`, `42.0.Dec`
+- Type annotations: `x : U8` (removed by desugarer)
+- Extended Type enum: U8-U128, I8-I128, F32, F64, Dec
+- Desugaring pass: Remove type annotations from Roc syntax
+
+**Parsing Verified:**
+- `0xFF` → 255
+- `0o77` → 63  
+- `0b1010` → 10
+- `255.U8` → parses, evaluates as 255
+- `x : U8` → removed by desugarer
+
+**NOT Yet (Deferred):**
+- Type checker: Track numeric type suffixes
+- Evaluator: Enforce type constraints
+- Mixed type arithmetic: proper coercion rules
+
+**Test File:** `phase6_number_types_test.roc` (created below)
 
 ---
 
@@ -89,37 +110,7 @@
 
 ## 🚀 Remaining Phases (Priority Order)
 
-### Phase 6: More Number Types & Literals (HIGH PRIORITY)
-**Target:** Support all numeric types from all_syntax_test.roc
-
-**Required for Type Support:**
-```roc
-# Type suffixes
-5.U8 : U8
-5.I32 : I32
-5.U64 : U64
-5.I128 : I128
-
-# Number formats
-0x5 : I64          # hex
-0o5 : I64          # octal
-0b0101 : I64       # binary
-
-# Decimal type
-42.0 : Dec         # Roc's arbitrary precision decimal
-```
-
-**Types to Support:**
-- `U8`, `I8`, `U16`, `I16`, `U32`, `I32`, `U64`, `I64`, `U128`, `I128`
-- `F32`, `F64`
-- `Dec` (arbitrary precision decimal)
-
-**Effort:** Medium (2-3 hours)  
-**Test File:** `phase6_number_types_test.roc` (created below)
-
----
-
-### Phase 7: Integer Division & Modulo (MEDIUM PRIORITY)
+### Phase 7: Integer Division & Modulo (NEXT - HIGH PRIORITY)
 **Target:** Support `//` and `%` operators
 
 **Required Types:**
