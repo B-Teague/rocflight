@@ -37,14 +37,8 @@ fn main() {
 
     // Type check (non-fatal for now - type system needs symbol table)
     let mut type_checker = TypeChecker::new();
-    match type_checker.synth(&ast) {
-        Ok(ty) => println!("Type: {}", ty),
-        Err(_e) => {
-            // Type checking failed, but we can still try to evaluate
-            // (Real Roc would exit here, but we're developing incrementally)
-            println!("Type: <inference skipped>");
-        }
-    }
+    let _type_result = type_checker.synth(&ast);
+    // Note: Type result not printed - only actual program output is shown
 
     // Evaluate
     let mut evaluator = Evaluator::new();
@@ -70,7 +64,10 @@ fn main() {
                                 lambda_eval.env.bind(params[0], args_value);
 
                                 match lambda_eval.eval(&body) {
-                                    Ok(result) => println!("App output: {}", result),
+                                    Ok(_result) => {
+                                        // App entry point executed successfully
+                                        // Output is handled by the program itself (e.g., Stdout.line!)
+                                    }
                                     Err(e) => {
                                         eprintln!("Runtime error in app entry point: {}", e);
                                         process::exit(1);
@@ -78,7 +75,10 @@ fn main() {
                                 }
                             } else if params.is_empty() {
                                 match lambda_eval.eval(&body) {
-                                    Ok(result) => println!("App output: {}", result),
+                                    Ok(_result) => {
+                                        // App entry point executed successfully
+                                        // Output is handled by the program itself
+                                    }
                                     Err(e) => {
                                         eprintln!("Runtime error in app entry point: {}", e);
                                         process::exit(1);
@@ -99,8 +99,9 @@ fn main() {
                     process::exit(1);
                 }
             } else {
-                // No app entry point, just print the result
-                println!("Result: {}", value);
+                // No app entry point - for non-app files, print the result
+                // (useful for REPL-like testing without "Result:" prefix)
+                println!("{}", value);
             }
         }
         Err(e) => {
