@@ -41,6 +41,35 @@ impl TypeChecker {
                 // Phase 4 will add environment lookup with actual types
                 Ok(self.fresh_var())
             }
+            Expr::Qualified { module, name } => {
+                // Qualified names are typically functions from builtins
+                // Create a function type that can accept arguments
+                // Input type: fresh var, Output type: fresh var
+                let input_type = self.fresh_var();
+                let output_type = self.fresh_var();
+                Ok(Type::Function(
+                    Box::new(input_type),
+                    Box::new(output_type),
+                ))
+            }
+            Expr::Lambda { params, body } => {
+                // For each parameter, allocate a fresh type variable
+                let mut param_types = vec![];
+                for _ in params {
+                    param_types.push(self.fresh_var());
+                }
+
+                // Infer body type
+                let body_type = self.synth(body)?;
+
+                // Build function type: (T1 -> T2 -> ... -> Tn)
+                let mut result_type = body_type;
+                for param_type in param_types.into_iter().rev() {
+                    result_type = Type::Function(Box::new(param_type), Box::new(result_type));
+                }
+
+                Ok(result_type)
+            }
             Expr::Call { func, args } => {
                 // Function type must be a function
                 let func_type = self.synth(func)?;

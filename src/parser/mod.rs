@@ -47,9 +47,47 @@ impl Parser {
     }
 
     /// Parse expression (entry point)
-    /// Handles: let bindings, function calls, literals
+    /// Handles: let bindings, function calls, literals, top-level definitions
     pub fn parse_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        self.skip_whitespace();
+
+        // Skip app and import declarations at the top level
+        loop {
+            let rest = &self.input[self.pos..].to_string(); // Clone to avoid borrow issues
+
+            if rest.starts_with("app ") {
+                self.skip_to_next_declaration();
+                self.skip_whitespace();
+            } else if rest.starts_with("import ") {
+                self.skip_to_line_end();
+                self.skip_whitespace();
+            } else {
+                break;
+            }
+        }
+
+        // Parse the main expression
         self.parse_let_or_expr()
+    }
+
+    /// Skip until next declaration or expression
+    fn skip_to_next_declaration(&mut self) {
+        while self.pos < self.input.len() {
+            let rest = &self.input[self.pos..];
+            if rest.starts_with('\n') {
+                self.pos += 1;
+                self.skip_whitespace();
+                return;
+            }
+            self.pos += 1;
+        }
+    }
+
+    /// Skip to end of line
+    fn skip_to_line_end(&mut self) {
+        while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b'\n' {
+            self.pos += 1;
+        }
     }
 
     /// Parse let binding or regular expression
@@ -113,6 +151,46 @@ impl Parser {
 
             Ok(Expr::Let { name, value, body })
         } else {
+            // Check for top-level binding: name = expr
+            // This is similar to let but at file level
+            let lookahead_rest = rest;
+            if let Ok((remaining, expr)) = parse_ident_nom(lookahead_rest) {
+                let lookahead_pos = lookahead_rest.len() - remaining.len();
+                let after_ident = &lookahead_rest[lookahead_pos..].trim_start();
+
+                if after_ident.starts_with('=') && !after_ident.starts_with("==") {
+                    // This is a binding!
+                    if let Expr::Ident(name) = expr {
+                        self.pos += lookahead_pos;
+                        self.skip_whitespace();
+                        self.pos += 1; // Skip '='
+                        self.skip_whitespace();
+
+                        // Parse value
+                        let value = Box::new(self.parse_call_expr()?);
+
+                        self.skip_whitespace();
+
+                        // Check if there's more content
+                        let rest3 = &self.input[self.pos..];
+                        if rest3.is_empty() {
+                            // If nothing after, create a let binding with the value as body
+                            // This will return the value
+                            return Ok(Expr::Let {
+                                name,
+                                value: value.clone(),
+                                body: value,
+                            });
+                        } else {
+                            // Continue parsing
+                            self.skip_whitespace();
+                            let body = Box::new(self.parse_let_or_expr()?);
+                            return Ok(Expr::Let { name, value, body });
+                        }
+                    }
+                }
+            }
+
             self.parse_call_expr()
         }
     }
@@ -171,7 +249,7 @@ impl Parser {
         Ok(expr)
     }
 
-    /// Parse primary expression: number, string, or identifier
+    /// Parse primary expression: number, string, identifier, lambda
     fn parse_primary_expr(&mut self) -> Result<Expr<'static>, ParseError> {
         self.skip_whitespace();
 
@@ -183,7 +261,12 @@ impl Parser {
             });
         }
 
-        // Try number first
+        // Try lambda first: |x| body or |x, y| body
+        if rest.starts_with('|') {
+            return self.parse_lambda();
+        }
+
+        // Try number
         if let Ok((remaining, expr)) = parse_number_nom(rest) {
             self.pos += rest.len() - remaining.len();
             self.skip_whitespace();
@@ -195,10 +278,29 @@ impl Parser {
             return self.parse_string();
         }
 
-        // Try identifier
+        // Try identifier or qualified name
         if is_ident_start(rest.chars().next().unwrap()) {
             if let Ok((remaining, expr)) = parse_ident_nom(rest) {
                 self.pos += rest.len() - remaining.len();
+
+                // Check for qualified name: Module.function
+                let rest2 = &self.input[self.pos..];
+                if rest2.starts_with('.') {
+                    let after_dot = &rest2[1..];
+                    if !after_dot.is_empty() && is_ident_start(after_dot.chars().next().unwrap()) {
+                        self.pos += 1; // Skip '.'
+                        if let Expr::Ident(module) = expr {
+                            if let Ok((remaining, name_expr)) = parse_ident_nom(&self.input[self.pos..]) {
+                                self.pos += self.input[self.pos..].len() - remaining.len();
+                                if let Expr::Ident(name) = name_expr {
+                                    self.skip_whitespace();
+                                    return Ok(Expr::Qualified { module, name });
+                                }
+                            }
+                        }
+                    }
+                }
+
                 self.skip_whitespace();
                 return Ok(expr);
             }
@@ -206,6 +308,65 @@ impl Parser {
 
         // Fallback to string parsing for error message
         self.parse_string()
+    }
+
+    /// Parse lambda expression: |params| body
+    fn parse_lambda(&mut self) -> Result<Expr<'static>, ParseError> {
+        self.skip_whitespace();
+
+        let rest = &self.input[self.pos..];
+        if !rest.starts_with('|') {
+            return Err(ParseError {
+                message: "Expected '|' to start lambda".to_string(),
+                position: self.pos,
+            });
+        }
+        self.pos += 1; // Skip '|'
+        self.skip_whitespace();
+
+        let mut params = Vec::new();
+
+        // Parse parameters
+        let rest = &self.input[self.pos..];
+        if !rest.starts_with('|') {
+            loop {
+                let rest = &self.input[self.pos..];
+                if let Ok((remaining, param_expr)) = parse_ident_nom(rest) {
+                    self.pos += rest.len() - remaining.len();
+                    if let Expr::Ident(param) = param_expr {
+                        params.push(param);
+                    }
+
+                    self.skip_whitespace();
+                    let rest = &self.input[self.pos..];
+
+                    if rest.starts_with(',') {
+                        self.pos += 1;
+                        self.skip_whitespace();
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        self.skip_whitespace();
+        let rest = &self.input[self.pos..];
+        if !rest.starts_with('|') {
+            return Err(ParseError {
+                message: "Expected '|' to end lambda parameters".to_string(),
+                position: self.pos,
+            });
+        }
+        self.pos += 1; // Skip '|'
+        self.skip_whitespace();
+
+        // Parse body
+        let body = Box::new(self.parse_expr()?);
+
+        Ok(Expr::Lambda { params, body })
     }
 
     /// Skip whitespace
@@ -256,9 +417,8 @@ fn parse_string_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
     if content.is_empty() {
         Ok((remaining, Expr::Str(string_pool::intern(""))))
     } else if content.contains("${") {
-        // Has interpolation - for Phase 1, just store as literal
-        let mut parts = Vec::new();
-        parts.push(StrPart::Literal(string_pool::intern(&content)));
+        // Parse interpolation expressions
+        let parts = parse_interpolation_parts(&content)?;
         Ok((remaining, Expr::StrInterp(parts)))
     } else {
         // Plain string
@@ -303,11 +463,13 @@ fn parse_string_content(input: &str) -> Result<(String, &str), ParseError> {
 }
 
 /// Check if character can start an identifier
+/// Allows both lowercase and uppercase for module names
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_lowercase() || c == '_'
+    c.is_ascii_alphabetic() || c == '_'
 }
 
 /// Check if character can be in an identifier
+/// Allows both lowercase and uppercase
 fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
@@ -404,4 +566,61 @@ fn parse_ident_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
     let remaining = &input[pos..];
 
     Ok((remaining, Expr::Ident(string_pool::intern(ident))))
+}
+
+/// Parse string interpolation: "text ${expr} more"
+/// Returns vector of literal strings and expressions
+fn parse_interpolation_parts(content: &str) -> Result<Vec<StrPart<'static>>, ParseError> {
+    let mut parts = Vec::new();
+    let mut current_literal = String::new();
+    let mut pos = 0;
+    let bytes = content.as_bytes();
+
+    while pos < bytes.len() {
+        // Look for ${
+        if pos + 1 < bytes.len() && bytes[pos] == b'$' && bytes[pos + 1] == b'{' {
+            // Save current literal if any
+            if !current_literal.is_empty() {
+                parts.push(StrPart::Literal(string_pool::intern(&current_literal)));
+                current_literal.clear();
+            }
+
+            // Find matching }
+            pos += 2; // Skip ${
+            let expr_start = pos;
+            let mut brace_depth = 1;
+
+            while pos < bytes.len() && brace_depth > 0 {
+                if bytes[pos] == b'{' {
+                    brace_depth += 1;
+                } else if bytes[pos] == b'}' {
+                    brace_depth -= 1;
+                }
+                pos += 1;
+            }
+
+            if brace_depth != 0 {
+                return Err(ParseError {
+                    message: "Unclosed ${ in string interpolation".to_string(),
+                    position: 0,
+                });
+            }
+
+            // Parse expression
+            let expr_str = &content[expr_start..pos - 1];
+            let mut expr_parser = Parser::new(expr_str);
+            let expr = expr_parser.parse_expr()?;
+            parts.push(StrPart::Expr(Box::leak(Box::new(expr))));
+        } else {
+            current_literal.push(bytes[pos] as char);
+            pos += 1;
+        }
+    }
+
+    // Add final literal if any
+    if !current_literal.is_empty() {
+        parts.push(StrPart::Literal(string_pool::intern(&current_literal)));
+    }
+
+    Ok(parts)
 }

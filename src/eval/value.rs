@@ -1,9 +1,10 @@
 //! Runtime values for the evaluator
 
 use std::fmt;
+use std::any::Any;
 
 /// Runtime value
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum Value {
     /// String value
     Str(&'static str),
@@ -11,6 +12,19 @@ pub enum Value {
     Int(i64),
     /// Float value (64-bit)
     Float(f64),
+    /// Builtin function marker: name + arity
+    Builtin(String, usize),
+}
+
+impl fmt::Debug for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Str(s) => write!(f, "Str({})", s),
+            Value::Int(n) => write!(f, "Int({})", n),
+            Value::Float(n) => write!(f, "Float({})", n),
+            Value::Builtin(name, arity) => write!(f, "Builtin({}, {})", name, arity),
+        }
+    }
 }
 
 impl fmt::Display for Value {
@@ -26,6 +40,7 @@ impl fmt::Display for Value {
                     write!(f, "{}", n)
                 }
             }
+            Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
         }
     }
 }

@@ -3,6 +3,7 @@
 //! Phase 1: String literals
 //! Phase 2: Numbers, identifiers
 //! Phase 3: Lambdas, calls, let bindings
+//! Phase 4: Builtins, lambdas, qualified names
 
 use std::fmt;
 
@@ -19,6 +20,16 @@ pub enum Expr<'a> {
     Float(f64),
     /// Identifier: x, main
     Ident(&'static str),
+    /// Qualified name: Module.function
+    Qualified {
+        module: &'static str,
+        name: &'static str,
+    },
+    /// Lambda function: |x| body or |x, y| x + y
+    Lambda {
+        params: Vec<&'static str>,
+        body: Box<Expr<'a>>,
+    },
     /// Function call: f(x) or add(1, 2)
     Call {
         func: Box<Expr<'a>>,
@@ -58,6 +69,12 @@ impl<'a> fmt::Display for Expr<'a> {
             Expr::Int(n) => write!(f, "{}", n),
             Expr::Float(n) => write!(f, "{}", n),
             Expr::Ident(name) => write!(f, "{}", name),
+            Expr::Qualified { module, name } => {
+                write!(f, "{}.{}", module, name)
+            }
+            Expr::Lambda { params, body } => {
+                write!(f, "|{}| {}", params.join(", "), body)
+            }
             Expr::Call { func, args } => {
                 write!(f, "{}(", func)?;
                 for (i, arg) in args.iter().enumerate() {
