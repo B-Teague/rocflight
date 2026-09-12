@@ -113,7 +113,7 @@ mod phase5_tests {
         "#;
         let mut parser = Parser::new(source);
         parser.parse_expr().unwrap();
-        assert_eq!(parser.app_entry_point, Some("main!".to_string()));
+        assert_eq!(parser.app_entry_point(), Some("main!".to_string()));
     }
 
     #[test]

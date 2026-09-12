@@ -15,7 +15,7 @@ pub struct Parser {
     input: String,
     pos: usize,
     /// App entry point (e.g., "main!") if app declaration found
-    pub app_entry_point: Option<String>,
+    entry_point: Option<String>,
 }
 
 impl Parser {
@@ -24,7 +24,7 @@ impl Parser {
         Parser {
             input: input.to_string(),
             pos: 0,
-            app_entry_point: None,
+            entry_point: None,
         }
     }
 
@@ -48,7 +48,12 @@ impl Parser {
         // Step 4: Parse desugared code
         let mut parser = Parser::new(&desugared);
         let expr = parser.parse_expr()?;
-        Ok((expr, parser.app_entry_point))
+        Ok((expr, parser.app_entry_point()))
+    }
+
+    /// Get the app entry point if one was found
+    pub fn app_entry_point(&self) -> Option<String> {
+        self.entry_point.clone()
     }
 
     /// Parse expression (entry point)
@@ -58,7 +63,7 @@ impl Parser {
 
         // Skip app and import declarations at the top level
         loop {
-            let rest = &self.input[self.pos..].to_string(); // Clone to avoid borrow issues
+            let rest = &self.input[self.pos..];
 
             if rest.starts_with("app ") {
                 // Extract entry point from app declaration: app [entry!] { ... }
@@ -102,7 +107,7 @@ impl Parser {
 
             if end > 0 {
                 let entry_point = rest[..end].to_string();
-                self.app_entry_point = Some(entry_point);
+                self.entry_point = Some(entry_point);
                 self.pos += end;
             }
         }
