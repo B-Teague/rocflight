@@ -41,7 +41,7 @@ impl TypeChecker {
                 // Phase 4 will add environment lookup with actual types
                 Ok(self.fresh_var())
             }
-            Expr::Qualified { module, name } => {
+            Expr::Qualified { module: _, name: _ } => {
                 // Qualified names are typically functions from builtins
                 // Create a function type that can accept arguments
                 // Input type: fresh var, Output type: fresh var

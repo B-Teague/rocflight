@@ -35,10 +35,12 @@ fn main() {
         }
     };
 
-    // Type check (non-fatal for now - type system needs symbol table)
+    // Type check
     let mut type_checker = TypeChecker::new();
-    let _type_result = type_checker.synth(&ast);
-    // Note: Type result not printed - only actual program output is shown
+    if let Err(e) = type_checker.synth(&ast) {
+        eprintln!("{}", e);
+        process::exit(1);
+    }
 
     // Evaluate
     let mut evaluator = Evaluator::new();
@@ -46,11 +48,22 @@ fn main() {
         Ok(value) => {
             // If there's an app entry point, invoke it
             if let Some(entry_name) = app_entry_point {
-                // Convert "main!" to "main" for lookup
-                let lookup_name = entry_name.trim_end_matches('!');
+                // Validate entry point name is not empty
+                if entry_name.is_empty() {
+                    eprintln!("Error: Empty app entry point name");
+                    process::exit(1);
+                }
+
+                // Note: desugarer removes trailing !, so entry_name might be "main" or "main!"
+                // Handle both cases by stripping ! if present
+                let lookup_name = if entry_name.ends_with('!') {
+                    &entry_name[..entry_name.len() - 1]
+                } else {
+                    &entry_name
+                };
 
                 // Try to find the entry point in the environment and call it
-                if let Some(entry_fn) = evaluator.env.lookup(&lookup_name) {
+                if let Some(entry_fn) = evaluator.env.lookup(lookup_name) {
                     match entry_fn {
                         rocflight::eval::Value::Lambda { params, body, env: lambda_env } => {
                             // Create a new evaluator with the lambda's environment

@@ -88,13 +88,16 @@ impl Parser {
             self.skip_whitespace();
 
             let rest = &self.input[self.pos..];
-            // Find the identifier (entry point)
+            // Find the identifier (entry point), including trailing '!'
             let mut end = 0;
-            for ch in rest.chars() {
+            for (i, ch) in rest.chars().enumerate() {
                 if ch == ']' || ch.is_whitespace() {
+                    end = i;
                     break;
                 }
-                end += ch.len_utf8();
+                if i == rest.len() - 1 {
+                    end = rest.len();
+                }
             }
 
             if end > 0 {

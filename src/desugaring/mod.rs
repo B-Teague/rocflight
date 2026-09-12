@@ -143,11 +143,11 @@ impl Desugarer {
     }
 
     /// Save desugared output to temp file (debug builds)
-    pub fn save_debug(&self, original_path: &str, desugared: &str) -> Result<(), std::io::Error> {
+    pub fn save_debug(&self, _original_path: &str, _desugared: &str) -> Result<(), std::io::Error> {
         #[cfg(debug_assertions)]
         {
-            let temp_path = format!("{}.desugared.roc", original_path);
-            std::fs::write(&temp_path, desugared)?;
+            let temp_path = format!("{}.desugared.roc", _original_path);
+            std::fs::write(&temp_path, _desugared)?;
             eprintln!("[Desugaring] Saved to: {}", temp_path);
         }
 
