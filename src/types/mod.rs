@@ -15,10 +15,14 @@ pub use checker::TypeChecker;
 pub enum Type {
     /// String type
     Str,
-    /// Integer type (64-bit signed)
-    I64,
-    /// Float type (64-bit)
-    F64,
+    /// Unsigned integers
+    U8, U16, U32, U64, U128,
+    /// Signed integers
+    I8, I16, I32, I64, I128,
+    /// Floating point
+    F32, F64,
+    /// Arbitrary precision decimal
+    Dec,
     /// Boolean type
     Bool,
     /// Type variable: $0, $1, etc.
@@ -33,8 +37,19 @@ impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Str => write!(f, "Str"),
+            Type::U8 => write!(f, "U8"),
+            Type::U16 => write!(f, "U16"),
+            Type::U32 => write!(f, "U32"),
+            Type::U64 => write!(f, "U64"),
+            Type::U128 => write!(f, "U128"),
+            Type::I8 => write!(f, "I8"),
+            Type::I16 => write!(f, "I16"),
+            Type::I32 => write!(f, "I32"),
             Type::I64 => write!(f, "I64"),
+            Type::I128 => write!(f, "I128"),
+            Type::F32 => write!(f, "F32"),
             Type::F64 => write!(f, "F64"),
+            Type::Dec => write!(f, "Dec"),
             Type::Bool => write!(f, "Bool"),
             Type::TypeVar(n) => write!(f, "${}", n),
             Type::List(t) => write!(f, "List({})", t),

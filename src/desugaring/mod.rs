@@ -32,8 +32,11 @@ impl Desugarer {
 
     /// Run all desugaring passes
     pub fn desugar(&self) -> Result<String, ParseError> {
+        // Pass 0: Remove type annotations (lines with : before =)
+        let step0 = self.remove_type_annotations(&self.input)?;
+
         // Pass 1: Remove ! from effectful function names and type annotations
-        let step1 = self.desugar_effects(&self.input)?;
+        let step1 = self.desugar_effects(&step0)?;
 
         // Pass 2: Replace ? operators with match expressions
         let step2 = self.desugar_question_mark(&step1)?;
@@ -48,6 +51,58 @@ impl Desugarer {
         let step5 = self.desugar_optional_fields(&step4)?;
 
         Ok(step5)
+    }
+
+    /// Pass 0: Remove type annotations
+    /// `x : Type` on its own line → removed
+    /// `x : Type` followed by `x = value` → keep only the binding
+    fn remove_type_annotations(&self, input: &str) -> Result<String, ParseError> {
+        let lines: Vec<&str> = input.lines().collect();
+        let mut result = Vec::new();
+        let mut i = 0;
+
+        while i < lines.len() {
+            let line = lines[i].trim();
+
+            // Check if this line is a type annotation: "name : Type"
+            let is_annotation = if let Some(colon_pos) = line.find(':') {
+                let before_colon = line[..colon_pos].trim();
+                // Type annotation: single identifier or qualified name before colon, no operators
+                before_colon.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') &&
+                !before_colon.contains("(") && !before_colon.contains("=")
+            } else {
+                false
+            };
+
+            if is_annotation {
+                // Check if next non-empty line is a binding for this name
+                let before_colon = &line[..line.find(':').unwrap()].trim();
+                let mut should_skip = false;
+
+                for next_idx in (i + 1)..lines.len() {
+                    let next_line = lines[next_idx].trim();
+                    if !next_line.is_empty() {
+                        // Check if this is the binding
+                        if next_line.starts_with(&format!("{} =", before_colon)) {
+                            should_skip = true;
+                        }
+                        break;
+                    }
+                }
+
+                if should_skip {
+                    // Skip this annotation line
+                    i += 1;
+                    continue;
+                }
+            }
+
+            // Keep the line
+            result.push(line);
+            i += 1;
+        }
+
+        Ok(result.join("\n"))
     }
 
     /// Pass 1: Remove ! from effectful function names

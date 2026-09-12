@@ -690,17 +690,21 @@ fn is_ident_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
-/// Parse number literal (int or float): 42, -3, 3.14, -2.5
+/// Parse number literal: decimal, hex (0xFF), octal (0o77), binary (0b1010)
+/// With optional type suffixes: .U8, .I32, .F32, .Dec
 fn parse_number_literal(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
     let mut pos = 0;
     let input_bytes = input.as_bytes();
 
     // Optional minus sign
-    if pos < input_bytes.len() && input_bytes[pos] == b'-' {
+    let is_negative = if pos < input_bytes.len() && input_bytes[pos] == b'-' {
         pos += 1;
-    }
+        true
+    } else {
+        false
+    };
 
-    // Must have at least one digit
+    // Must have at least one digit or start of special format
     if pos >= input_bytes.len() || !input_bytes[pos].is_ascii_digit() {
         return Err(ParseError {
             message: "Expected digit".to_string(),
@@ -708,48 +712,162 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr<'static>), ParseError
         });
     }
 
-    // Parse integer part
+    // Check for hex (0x), octal (0o), or binary (0b) formats
+    if input_bytes[pos] == b'0' && pos + 1 < input_bytes.len() {
+        match input_bytes[pos + 1] {
+            b'x' | b'X' => {
+                // Hex format: 0xFF
+                pos += 2; // Skip "0x"
+                let hex_start = pos;
+                while pos < input_bytes.len() && input_bytes[pos].is_ascii_hexdigit() {
+                    pos += 1;
+                }
+                if pos == hex_start {
+                    return Err(ParseError {
+                        message: "Expected hex digit after 0x".to_string(),
+                        position: pos,
+                    });
+                }
+                let hex_str = &input[hex_start..pos];
+                let num_val = i64::from_str_radix(hex_str, 16)
+                    .map_err(|_| ParseError {
+                        message: format!("Invalid hex number: {}", hex_str),
+                        position: 0,
+                    })?;
+                let remaining = &input[pos..];
+                return if is_negative {
+                    Ok((remaining, Expr::Int(-num_val)))
+                } else {
+                    Ok((remaining, Expr::Int(num_val)))
+                };
+            }
+            b'o' | b'O' => {
+                // Octal format: 0o77
+                pos += 2; // Skip "0o"
+                let oct_start = pos;
+                while pos < input_bytes.len() && input_bytes[pos] >= b'0' && input_bytes[pos] <= b'7' {
+                    pos += 1;
+                }
+                if pos == oct_start {
+                    return Err(ParseError {
+                        message: "Expected octal digit after 0o".to_string(),
+                        position: pos,
+                    });
+                }
+                let oct_str = &input[oct_start..pos];
+                let num_val = i64::from_str_radix(oct_str, 8)
+                    .map_err(|_| ParseError {
+                        message: format!("Invalid octal number: {}", oct_str),
+                        position: 0,
+                    })?;
+                let remaining = &input[pos..];
+                return if is_negative {
+                    Ok((remaining, Expr::Int(-num_val)))
+                } else {
+                    Ok((remaining, Expr::Int(num_val)))
+                };
+            }
+            b'b' | b'B' => {
+                // Binary format: 0b1010
+                pos += 2; // Skip "0b"
+                let bin_start = pos;
+                while pos < input_bytes.len() && (input_bytes[pos] == b'0' || input_bytes[pos] == b'1') {
+                    pos += 1;
+                }
+                if pos == bin_start {
+                    return Err(ParseError {
+                        message: "Expected binary digit after 0b".to_string(),
+                        position: pos,
+                    });
+                }
+                let bin_str = &input[bin_start..pos];
+                let num_val = i64::from_str_radix(bin_str, 2)
+                    .map_err(|_| ParseError {
+                        message: format!("Invalid binary number: {}", bin_str),
+                        position: 0,
+                    })?;
+                let remaining = &input[pos..];
+                return if is_negative {
+                    Ok((remaining, Expr::Int(-num_val)))
+                } else {
+                    Ok((remaining, Expr::Int(num_val)))
+                };
+            }
+            _ => {} // Regular decimal starting with 0
+        }
+    }
+
+    // Parse decimal integer part
+    let dec_start = pos;
     while pos < input_bytes.len() && input_bytes[pos].is_ascii_digit() {
         pos += 1;
     }
 
-    // Check for decimal point
-    let is_float = pos < input_bytes.len() && input_bytes[pos] == b'.';
+    // Check for decimal point (indicating float) or type suffix
+    let is_float = pos < input_bytes.len() && input_bytes[pos] == b'.' &&
+                   (pos + 1 >= input_bytes.len() || input_bytes[pos + 1].is_ascii_digit());
+
+    let is_type_suffix = pos < input_bytes.len() && input_bytes[pos] == b'.' &&
+                         pos + 1 < input_bytes.len() && input_bytes[pos + 1].is_ascii_alphabetic();
 
     if is_float {
         pos += 1; // Skip decimal point
-        // Must have at least one digit after decimal
-        if pos >= input_bytes.len() || !input_bytes[pos].is_ascii_digit() {
-            return Err(ParseError {
-                message: "Expected digit after decimal point".to_string(),
-                position: pos,
-            });
-        }
-        // Parse fractional part
         while pos < input_bytes.len() && input_bytes[pos].is_ascii_digit() {
             pos += 1;
         }
-    }
-
-    let num_str = &input[..pos];
-    let remaining = &input[pos..];
-
-    if is_float {
-        match num_str.parse::<f64>() {
-            Ok(f) => Ok((remaining, Expr::Float(f))),
-            Err(_) => Err(ParseError {
+        let num_str = &input[dec_start..pos];
+        let num_val = num_str.parse::<f64>()
+            .map_err(|_| ParseError {
                 message: format!("Invalid float: {}", num_str),
                 position: 0,
-            }),
+            })?;
+        let final_val = if is_negative { -num_val } else { num_val };
+
+        // Check for type suffix after float (e.g., 3.14.F32)
+        let remaining = &input[pos..];
+        if remaining.starts_with(".F32") {
+            return Ok((&remaining[4..], Expr::Float(final_val))); // For now, just return float
+        } else if remaining.starts_with(".F64") {
+            return Ok((&remaining[4..], Expr::Float(final_val)));
+        } else if remaining.starts_with(".Dec") {
+            return Ok((&remaining[4..], Expr::Float(final_val))); // Dec treated as float for now
         }
-    } else {
-        match num_str.parse::<i64>() {
-            Ok(i) => Ok((remaining, Expr::Int(i))),
-            Err(_) => Err(ParseError {
+
+        Ok((remaining, Expr::Float(final_val)))
+    } else if is_type_suffix {
+        // Parse number then type suffix: e.g., 255.U8, -128.I8
+        let num_str = &input[dec_start..pos];
+        let num_val = num_str.parse::<i64>()
+            .map_err(|_| ParseError {
                 message: format!("Invalid integer: {}", num_str),
                 position: 0,
-            }),
+            })?;
+        let final_val = if is_negative { -num_val } else { num_val };
+
+        // Parse type suffix (letters and digits, e.g., U8, I32, F64, Dec)
+        pos += 1; // Skip '.'
+        let suffix_start = pos;
+        while pos < input_bytes.len() && (input_bytes[pos].is_ascii_alphanumeric()) {
+            pos += 1;
         }
+        let _suffix = &input[suffix_start..pos];
+        // Note: we ignore the suffix for now; type checker will handle it
+        // We just need the parser to accept it without error
+
+        let remaining = &input[pos..];
+        Ok((remaining, Expr::Int(final_val)))
+    } else {
+        // Regular decimal integer
+        let num_str = &input[dec_start..pos];
+        let num_val = num_str.parse::<i64>()
+            .map_err(|_| ParseError {
+                message: format!("Invalid integer: {}", num_str),
+                position: 0,
+            })?;
+        let final_val = if is_negative { -num_val } else { num_val };
+
+        let remaining = &input[pos..];
+        Ok((remaining, Expr::Int(final_val)))
     }
 }
 
