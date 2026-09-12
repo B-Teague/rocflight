@@ -47,8 +47,50 @@ impl Parser {
     }
 
     /// Parse expression (entry point)
+    /// Tries to parse: number, string, or identifier
     pub fn parse_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        self.skip_whitespace();
+
+        let rest = &self.input[self.pos..];
+        if rest.is_empty() {
+            return Err(ParseError {
+                message: "Unexpected end of input".to_string(),
+                position: self.pos,
+            });
+        }
+
+        // Try parsing in order: number (int/float), string, identifier
+
+        // Try number first
+        if let Ok((remaining, expr)) = parse_number_nom(rest) {
+            self.pos += rest.len() - remaining.len();
+            self.skip_whitespace();
+            return Ok(expr);
+        }
+
+        // Try string
+        if rest.starts_with('"') {
+            return self.parse_string();
+        }
+
+        // Try identifier
+        if is_ident_start(rest.chars().next().unwrap()) {
+            if let Ok((remaining, expr)) = parse_ident_nom(rest) {
+                self.pos += rest.len() - remaining.len();
+                self.skip_whitespace();
+                return Ok(expr);
+            }
+        }
+
+        // Fallback to string parsing for error message
         self.parse_string()
+    }
+
+    /// Skip whitespace
+    fn skip_whitespace(&mut self) {
+        let rest = &self.input[self.pos..];
+        let trimmed = rest.trim_start();
+        self.pos += rest.len() - trimmed.len();
     }
 
     /// Parse string literal: "..."
@@ -136,4 +178,108 @@ fn parse_string_content(input: &str) -> Result<(String, &str), ParseError> {
     }
 
     Ok((result, &input[pos..]))
+}
+
+/// Check if character can start an identifier
+fn is_ident_start(c: char) -> bool {
+    c.is_ascii_lowercase() || c == '_'
+}
+
+/// Check if character can be in an identifier
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Parse number literal (int or float): 42, -3, 3.14, -2.5
+fn parse_number_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+    let mut pos = 0;
+    let input_bytes = input.as_bytes();
+
+    // Optional minus sign
+    if pos < input_bytes.len() && input_bytes[pos] == b'-' {
+        pos += 1;
+    }
+
+    // Must have at least one digit
+    if pos >= input_bytes.len() || !input_bytes[pos].is_ascii_digit() {
+        return Err(ParseError {
+            message: "Expected digit".to_string(),
+            position: 0,
+        });
+    }
+
+    // Parse integer part
+    while pos < input_bytes.len() && input_bytes[pos].is_ascii_digit() {
+        pos += 1;
+    }
+
+    // Check for decimal point
+    let is_float = pos < input_bytes.len() && input_bytes[pos] == b'.';
+
+    if is_float {
+        pos += 1; // Skip decimal point
+        // Must have at least one digit after decimal
+        if pos >= input_bytes.len() || !input_bytes[pos].is_ascii_digit() {
+            return Err(ParseError {
+                message: "Expected digit after decimal point".to_string(),
+                position: pos,
+            });
+        }
+        // Parse fractional part
+        while pos < input_bytes.len() && input_bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+    }
+
+    let num_str = &input[..pos];
+    let remaining = &input[pos..];
+
+    if is_float {
+        match num_str.parse::<f64>() {
+            Ok(f) => Ok((remaining, Expr::Float(f))),
+            Err(_) => Err(ParseError {
+                message: format!("Invalid float: {}", num_str),
+                position: 0,
+            }),
+        }
+    } else {
+        match num_str.parse::<i64>() {
+            Ok(i) => Ok((remaining, Expr::Int(i))),
+            Err(_) => Err(ParseError {
+                message: format!("Invalid integer: {}", num_str),
+                position: 0,
+            }),
+        }
+    }
+}
+
+/// Parse identifier: x, main, birds
+fn parse_ident_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+    let mut pos = 0;
+    let mut chars = input.chars();
+
+    // First character must be lowercase letter or underscore
+    match chars.next() {
+        Some(c) if is_ident_start(c) => pos += c.len_utf8(),
+        _ => {
+            return Err(ParseError {
+                message: "Expected identifier start".to_string(),
+                position: 0,
+            })
+        }
+    }
+
+    // Rest can be alphanumeric or underscore
+    for c in chars {
+        if is_ident_char(c) {
+            pos += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    let ident = &input[..pos];
+    let remaining = &input[pos..];
+
+    Ok((remaining, Expr::Ident(string_pool::intern(ident))))
 }

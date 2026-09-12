@@ -1,6 +1,7 @@
 //! Expression evaluator (tree-walk interpreter)
 //!
 //! Phase 1: String evaluation
+//! Phase 2: Numbers, identifiers (partial)
 
 use crate::ast::Expr;
 use crate::error::EvalError;
@@ -13,7 +14,6 @@ pub use environment::Environment;
 
 /// Tree-walk interpreter
 pub struct Evaluator {
-    #[allow(dead_code)]
     env: Environment,
 }
 
@@ -44,6 +44,15 @@ impl Evaluator {
                     }
                 }
                 Ok(Value::Str(Box::leak(result.into_boxed_str())))
+            }
+            Expr::Int(n) => Ok(Value::Int(*n)),
+            Expr::Float(f) => Ok(Value::Float(*f)),
+            Expr::Ident(name) => {
+                // Phase 3 will add proper environment lookup
+                // For now, return an error
+                Err(EvalError {
+                    message: format!("Undefined variable: {}", name),
+                })
             }
         }
     }

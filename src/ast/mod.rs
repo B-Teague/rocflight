@@ -1,6 +1,7 @@
 //! Abstract Syntax Tree definitions for Roc
 //!
 //! Phase 1: String literals
+//! Phase 2: Numbers, identifiers
 
 use std::fmt;
 
@@ -11,6 +12,12 @@ pub enum Expr<'a> {
     Str(&'static str),
     /// String interpolation: "x=${expr}"
     StrInterp(Vec<StrPart<'a>>),
+    /// Integer literal: 42, -3
+    Int(i64),
+    /// Float literal: 3.14, -2.5
+    Float(f64),
+    /// Identifier: x, main
+    Ident(&'static str),
 }
 
 /// Part of a string interpolation
@@ -36,6 +43,9 @@ impl<'a> fmt::Display for Expr<'a> {
                 }
                 write!(f, "\"")
             }
+            Expr::Int(n) => write!(f, "{}", n),
+            Expr::Float(n) => write!(f, "{}", n),
+            Expr::Ident(name) => write!(f, "{}", name),
         }
     }
 }

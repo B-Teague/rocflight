@@ -21,6 +21,8 @@ pub mod platform;
 
 pub use ast::{Expr, Pattern};
 pub use types::Type;
+pub use types::TypeChecker;
+pub use parser::Parser;
 pub use eval::Evaluator;
 pub use error::{ParseError, TypeError};
 pub use desugaring::Desugarer;

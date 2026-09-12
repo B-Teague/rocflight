@@ -33,6 +33,13 @@ impl TypeChecker {
         match expr {
             Expr::Str(_) => Ok(Type::Str),
             Expr::StrInterp(_) => Ok(Type::Str), // Interpolation always produces Str
+            Expr::Int(_) => Ok(Type::I64),       // Integer literals default to I64
+            Expr::Float(_) => Ok(Type::F64),     // Float literals default to F64
+            Expr::Ident(_) => {
+                // For now, return a fresh type var for identifiers
+                // Phase 3 will add environment lookup
+                Ok(self.fresh_var())
+            }
         }
     }
 
