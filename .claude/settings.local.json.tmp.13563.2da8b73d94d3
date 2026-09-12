@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Bash(roc check *)",
+      "Bash(/opt/roc/bin/roc repl *)",
+      "Bash(cargo test *)",
+      "Bash(cargo run *)",
+      "Bash(cargo check *)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Implement Phase 1B - Platform Loading Infrastructure *)"
+    ]
+  }
+}

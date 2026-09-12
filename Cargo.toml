@@ -1,0 +1,28 @@
+[package]
+name = "rocflight"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nom = "7.1"
+bumpalo = "3.14"
+once_cell = "1.19"
+regex = "1.10"
+thiserror = "1.0"
+
+# Platform loading (Phase 16)
+reqwest = { version = "0.11", features = ["stream"] }
+brotli = "3.3"
+tar = "0.4"
+sha2 = "0.10"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bin]]
+name = "rocflight"
+path = "src/main.rs"
+
+[lib]
+name = "rocflight"
+path = "src/lib.rs"
