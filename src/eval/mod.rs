@@ -105,7 +105,9 @@ impl Evaluator {
                 // valid for the lifetime of the program. The body is part of the
                 // parsed source, which we keep in memory.
                 let static_body = unsafe {
-                    std::mem::transmute::<Box<Expr<'_>>, Box<Expr<'static>>>(body.clone())
+                    std::mem::transmute::<Box<Expr<'_>>, Box<Expr<'static>>>(
+                        Box::new(body.as_ref().clone())
+                    )
                 };
                 Ok(Value::Lambda {
                     params: params.clone(),
