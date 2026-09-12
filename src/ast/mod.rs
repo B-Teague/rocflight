@@ -7,6 +7,45 @@
 
 use std::fmt;
 
+/// Binary operators
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOp {
+    // Arithmetic
+    Add,
+    Sub,
+    Mul,
+    Div,
+    // Comparison
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    // Logical
+    And,
+    Or,
+}
+
+impl fmt::Display for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BinOp::Add => write!(f, "+"),
+            BinOp::Sub => write!(f, "-"),
+            BinOp::Mul => write!(f, "*"),
+            BinOp::Div => write!(f, "/"),
+            BinOp::Eq => write!(f, "=="),
+            BinOp::Ne => write!(f, "!="),
+            BinOp::Lt => write!(f, "<"),
+            BinOp::Le => write!(f, "<="),
+            BinOp::Gt => write!(f, ">"),
+            BinOp::Ge => write!(f, ">="),
+            BinOp::And => write!(f, "&&"),
+            BinOp::Or => write!(f, "||"),
+        }
+    }
+}
+
 /// Top-level expression
 #[derive(Debug, Clone)]
 pub enum Expr<'a> {
@@ -24,6 +63,12 @@ pub enum Expr<'a> {
     Qualified {
         module: &'static str,
         name: &'static str,
+    },
+    /// Binary operation: left op right
+    BinOp {
+        left: Box<Expr<'a>>,
+        op: BinOp,
+        right: Box<Expr<'a>>,
     },
     /// Lambda function: |x| body or |x, y| x + y
     Lambda {
@@ -71,6 +116,9 @@ impl<'a> fmt::Display for Expr<'a> {
             Expr::Ident(name) => write!(f, "{}", name),
             Expr::Qualified { module, name } => {
                 write!(f, "{}.{}", module, name)
+            }
+            Expr::BinOp { left, op, right } => {
+                write!(f, "({} {} {})", left, op, right)
             }
             Expr::Lambda { params, body } => {
                 write!(f, "|{}| {}", params.join(", "), body)

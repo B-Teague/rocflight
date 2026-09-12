@@ -242,8 +242,160 @@ impl Parser {
                 }
             }
 
-            self.parse_call_expr()
+            self.parse_or_expr()
         }
+    }
+
+    /// Parse logical OR: a || b
+    fn parse_or_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        let mut left = self.parse_and_expr()?;
+
+        loop {
+            self.skip_whitespace();
+            let rest = &self.input[self.pos..];
+
+            if rest.starts_with("||") && !rest.starts_with("|||") {
+                self.pos += 2;
+                self.skip_whitespace();
+                let right = self.parse_and_expr()?;
+                left = Expr::BinOp {
+                    left: Box::new(left),
+                    op: crate::ast::BinOp::Or,
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+
+        Ok(left)
+    }
+
+    /// Parse logical AND: a && b
+    fn parse_and_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        let mut left = self.parse_comparison_expr()?;
+
+        loop {
+            self.skip_whitespace();
+            let rest = &self.input[self.pos..];
+
+            if rest.starts_with("&&") && !rest.starts_with("&&&") {
+                self.pos += 2;
+                self.skip_whitespace();
+                let right = self.parse_comparison_expr()?;
+                left = Expr::BinOp {
+                    left: Box::new(left),
+                    op: crate::ast::BinOp::And,
+                    right: Box::new(right),
+                };
+            } else {
+                break;
+            }
+        }
+
+        Ok(left)
+    }
+
+    /// Parse comparison: a == b, a < b, etc.
+    fn parse_comparison_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        let mut left = self.parse_additive_expr()?;
+
+        loop {
+            self.skip_whitespace();
+            let rest = &self.input[self.pos..];
+
+            let op = if rest.starts_with("==") {
+                self.pos += 2;
+                crate::ast::BinOp::Eq
+            } else if rest.starts_with("!=") {
+                self.pos += 2;
+                crate::ast::BinOp::Ne
+            } else if rest.starts_with("<=") {
+                self.pos += 2;
+                crate::ast::BinOp::Le
+            } else if rest.starts_with(">=") {
+                self.pos += 2;
+                crate::ast::BinOp::Ge
+            } else if rest.starts_with('<') && !rest.starts_with("<<") {
+                self.pos += 1;
+                crate::ast::BinOp::Lt
+            } else if rest.starts_with('>') && !rest.starts_with(">>") {
+                self.pos += 1;
+                crate::ast::BinOp::Gt
+            } else {
+                break;
+            };
+
+            self.skip_whitespace();
+            let right = self.parse_additive_expr()?;
+            left = Expr::BinOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// Parse addition/subtraction: a + b, a - b
+    fn parse_additive_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        let mut left = self.parse_multiplicative_expr()?;
+
+        loop {
+            self.skip_whitespace();
+            let rest = &self.input[self.pos..];
+
+            let op = if rest.starts_with('+') {
+                self.pos += 1;
+                crate::ast::BinOp::Add
+            } else if rest.starts_with('-') && !is_next_digit(rest) {
+                self.pos += 1;
+                crate::ast::BinOp::Sub
+            } else {
+                break;
+            };
+
+            self.skip_whitespace();
+            let right = self.parse_multiplicative_expr()?;
+            left = Expr::BinOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    /// Parse multiplication/division: a * b, a / b
+    fn parse_multiplicative_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        let mut left = self.parse_call_expr()?;
+
+        loop {
+            self.skip_whitespace();
+            let rest = &self.input[self.pos..];
+
+            let op = if rest.starts_with('*') {
+                self.pos += 1;
+                crate::ast::BinOp::Mul
+            } else if rest.starts_with('/') {
+                self.pos += 1;
+                crate::ast::BinOp::Div
+            } else {
+                break;
+            };
+
+            self.skip_whitespace();
+            let right = self.parse_call_expr()?;
+            left = Expr::BinOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
     }
 
     /// Parse function call or primary expression
@@ -674,4 +826,13 @@ fn parse_interpolation_parts(content: &str) -> Result<Vec<StrPart<'static>>, Par
     }
 
     Ok(parts)
+}
+
+/// Check if '-' is followed by a digit (negative literal) vs subtraction operator
+fn is_next_digit(rest: &str) -> bool {
+    if rest.len() < 2 {
+        return false;
+    }
+    let after_minus = &rest[1..];
+    after_minus.chars().next().map_or(false, |c| c.is_ascii_digit())
 }

@@ -3,7 +3,7 @@
 //! Bidirectional type checking: synthesis (infer) + checking (verify)
 //! Phase 3: Lambdas, calls, let bindings
 
-use crate::ast::Expr;
+use crate::ast::{Expr, BinOp};
 use crate::error::TypeError;
 use super::{Type, Substitution};
 
@@ -51,6 +51,28 @@ impl TypeChecker {
                     Box::new(input_type),
                     Box::new(output_type),
                 ))
+            }
+            Expr::BinOp { left, op, right } => {
+                let left_type = self.synth(left)?;
+                let right_type = self.synth(right)?;
+
+                match op {
+                    // Arithmetic operators return same numeric type
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        // For now, allow any combination and return I64 as result
+                        // More sophisticated type system would track numeric precision
+                        self.unify(&left_type, &right_type)?;
+                        Ok(Type::I64)
+                    }
+                    // Comparison operators always return I64 (0 or 1)
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        Ok(Type::I64)
+                    }
+                    // Logical operators return I64
+                    BinOp::And | BinOp::Or => {
+                        Ok(Type::I64)
+                    }
+                }
             }
             Expr::Lambda { params, body } => {
                 // For each parameter, allocate a fresh type variable
