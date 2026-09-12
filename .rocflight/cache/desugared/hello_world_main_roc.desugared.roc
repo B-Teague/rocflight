@@ -5,4 +5,4 @@ import pf.Stdout
 birds = -3
 
 main = |_args|
-Stdout.line("There are ${Num.to_str(birds)} birds.")
+match Stdout.line("There are ${Num.to_str(birds)} birds.") { Ok(v) => v, Err(e) => return Err(e) }

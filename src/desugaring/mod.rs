@@ -112,45 +112,111 @@ impl Desugarer {
 
     /// Pass 2: Handle effect markers and type arrows
     ///
-    /// Two transformations:
-    /// 1. Strip `!` from function names and calls (marks effectful, not part of name)
-    /// 2. Convert `=>` to `->` in type annotations
+    /// Three transformations:
+    /// 1. Wrap effectful function CALLS with `!` in match expressions
+    /// 2. Strip `!` from function names (definitions)
+    /// 3. Convert `=>` to `->` in type annotations
     ///
     /// After desugaring:
-    /// - `echo!("hello")` becomes `echo("hello")` (! removed)
-    /// - `main!` becomes `main` (! removed)
+    /// - `echo!("hello")` becomes `match echo("hello") { Ok(v) => v, Err(e) => return Err(e) }`
+    /// - `main!` becomes `main` (! removed from definition)
     /// - `Str => Result` becomes `Str -> Result` (arrow converted)
-    ///
-    /// NOTE: The ! removal here is just cleaning up names. Full error wrapping
-    /// happens in Pass 4 (desugar_question_operator) which wraps calls.
     fn desugar_effect_arrows(&self, input: &str) -> Result<String, ParseError> {
         let mut result = String::new();
         let mut chars = input.chars().peekable();
+        let mut in_string = false;
 
         while let Some(ch) = chars.next() {
             // Handle string literals: don't desugar inside them
-            if ch == '"' {
+            if ch == '"' && (result.is_empty() || !result.ends_with('\\')) {
+                in_string = !in_string;
                 result.push(ch);
-                // Copy string literal as-is, preserving all characters
-                while let Some(&next_ch) = chars.peek() {
-                    chars.next();
-                    result.push(next_ch);
+                continue;
+            }
 
-                    if next_ch == '"' {
-                        break; // End of string
-                    } else if next_ch == '\\' {
-                        // Handle escaped characters
-                        if let Some(&escaped) = chars.peek() {
-                            chars.next();
-                            result.push(escaped);
+            if in_string {
+                result.push(ch);
+                continue;
+            }
+
+            // Look for ! that marks effectful calls
+            if ch == '!' {
+                // Check what comes after the !
+                let after_bang = chars.peek().map(|&c| c);
+
+                // Pattern: identifier!(...) - lookahead to see if opening paren follows
+                if after_bang == Some('(') {
+                    // This is an effectful call: func!(...). We need to:
+                    // 1. Find where the identifier starts (scan backwards)
+                    // 2. Capture the full call including arguments
+                    // 3. Wrap only the call in match expression
+
+                    // Find where this identifier starts by scanning backwards
+                    let result_bytes = result.as_bytes();
+                    let mut ident_start = result_bytes.len();
+
+                    while ident_start > 0 {
+                        ident_start -= 1;
+                        let b = result_bytes[ident_start];
+                        // Check if this character can be part of an identifier
+                        let is_ident_char = (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z')
+                            || (b >= b'0' && b <= b'9') || b == b'_' || b == b'.';
+                        if !is_ident_char {
+                            ident_start += 1;
+                            break;
                         }
                     }
+
+                    // Extract the identifier and the part before it
+                    let before_ident = &result[..ident_start];
+                    let identifier = &result[ident_start..];
+
+                    // Consume the opening paren
+                    chars.next();
+                    let mut call_args = String::from("(");
+
+                    // Now find the matching closing paren
+                    let mut paren_depth = 1;
+
+                    while let Some(next_ch) = chars.next() {
+                        if next_ch == '"' {
+                            call_args.push(next_ch);
+                            // Handle strings inside the call
+                            while let Some(str_ch) = chars.next() {
+                                call_args.push(str_ch);
+                                if str_ch == '"' && !call_args.ends_with("\\\"") {
+                                    break;
+                                }
+                            }
+                        } else if next_ch == '(' {
+                            paren_depth += 1;
+                            call_args.push(next_ch);
+                        } else if next_ch == ')' {
+                            paren_depth -= 1;
+                            if paren_depth == 0 {
+                                // End of call!
+                                call_args.push(')');
+
+                                // Build the wrapped call
+                                let full_call = format!("{}{}", identifier, call_args);
+                                let wrapped_call = format!("match {} {{ Ok(v) => v, Err(e) => return Err(e) }}", full_call);
+
+                                // Rebuild result with wrapped call
+                                result = format!("{}{}", before_ident, wrapped_call);
+                                break;
+                            } else {
+                                call_args.push(next_ch);
+                            }
+                        } else {
+                            call_args.push(next_ch);
+                        }
+                    }
+                    continue;
+                } else {
+                    // Simple ! after identifier: main!, echo!, etc.
+                    // Just remove it - it's marking a definition, not a call
+                    continue;
                 }
-            } else if ch == '!' {
-                // Remove ! - it's not part of the identifier, it marks effectful functions
-                // The ! will be handled by error wrapping in Pass 4
-                // Just skip it here
-                continue;
             } else if ch == '=' && chars.peek() == Some(&'>') {
                 // Convert => to -> (only for type annotations)
                 chars.next(); // consume >
@@ -171,14 +237,12 @@ impl Desugarer {
         Ok(input.to_string())
     }
 
-    /// Pass 4: Expand ? operator (error propagation)
-    /// `expr?` → `match expr { Ok(v) => v, Err(e) => return Err(e) }`
+    /// Pass 4: Handle ? operator (error propagation)
+    /// Currently a placeholder - full ? operator handling will come in a later phase
+    /// The ! operator wrapping is now handled in Pass 2
     fn desugar_question_operator(&self, input: &str) -> Result<String, ParseError> {
-        // For now, this is a placeholder. Full implementation requires careful parsing to:
-        // 1. Identify complete expressions followed by ?
-        // 2. Not confuse with ? in type annotations
-        // 3. Handle nested expressions correctly
-        // This is deferred to Phase 7 when error handling is properly designed.
+        // TODO: Implement ? operator expansion to match expressions
+        // For now, just pass through - ! handling is in Pass 2
         Ok(input.to_string())
     }
 
@@ -267,9 +331,9 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar_effect_arrows(&desugarer.input).unwrap();
 
-        // ! is removed from all function names and calls
+        // ! is removed and calls are wrapped
         assert!(result.contains("echo ="));
-        assert!(result.contains("Stdout.line"));
+        assert!(result.contains("match Stdout.line(msg) { Ok(v) => v, Err(e) => return Err(e) }"));
         assert!(!result.contains("echo!"));
         assert!(!result.contains("line!"));
     }
