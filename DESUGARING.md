@@ -317,10 +317,28 @@ Wait, this is getting nested and complex. The actual desugaring needs careful se
 
 ## Implementation Notes
 
-### Parsing Order
+### Parsing Order (Pass 2: Effect Arrows and ! Wrapping)
 
-1. Parse type annotations first (simplest)
-2. Convert `=>` to `->` (simple string replacement)
+**Algorithm:**
+1. Scan input character by character
+2. When encountering `!`:
+   - Lookahead to see if `(` follows
+   - If YES: this is `identifier!(...)`
+     - Scan backwards to find identifier start
+     - Parse forward to find matching closing `)`
+     - Wrap the entire call: `match id(...) { Ok(v) => v, Err(e) => return Err(e) }`
+   - If NO: just a definition mark, remove `!`
+3. Simultaneously convert `=>` to `->`
+
+**Edge Cases Handled:**
+- Nested function calls: `func1!(func2!(x))`
+- Multiple arguments with commas
+- String literals and escapes inside arguments
+- Module-qualified calls: `Module.function!(args)`
+- Nested parens in arguments: `func!((1 + 2))`
+
+### Remaining Passes
+
 3. Expand `?` and `??` (requires careful position detection)
 4. Handle `.?` field access (requires expression parsing)
 5. Mark optional fields (requires record parsing)
@@ -362,12 +380,12 @@ Expected: "x = match risky() { Ok(v) => v, Err(e) => return Err(e) }"
 | Rule | Status | Implementation |
 |------|--------|-----------------|
 | 1. Type Annotations | ✅ Done | `remove_type_annotations()` |
-| 2. Effect Arrows | ✅ Done | `desugar_effects()` converts `=>` to `->` |
+| 2. Effect Arrows + ! Wrapping | ✅ Done | `desugar_effect_arrows()` - wraps `!` calls in match, converts `=>` to `->` |
 | 3. Error Propagation `?` | ❌ Placeholder | Needs full implementation |
 | 4. Default Values `??` | ❌ Placeholder | Needs full implementation |
 | 5. Optional Field Access `.?` | ❌ Placeholder | Needs full implementation |
 | 6. Optional Record Fields | ❌ Placeholder | Needs full implementation |
-| 7. Effectful Names `!` | ✅ Done | Preserved as identifier suffix |
+| 7. Effectful Calls `!` Wrapping | ✅ Done | Pattern: `id!(...) → match id(...) { Ok(v) => v, Err(e) => return Err(e) }` |
 
 ---
 

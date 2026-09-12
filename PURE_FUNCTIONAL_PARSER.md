@@ -396,10 +396,14 @@ The Roc interpreter now features:
 
 ### Comprehensive Desugaring System
 - ✅ Transforms shorthand syntax to verbose, explicit forms BEFORE parsing
-- ✅ 7 desugaring passes (type annotations, arrows, error propagation, defaults, fields)
+- ✅ Pass 1: Type annotation removal - COMPLETE
+- ✅ Pass 2: Effect arrows + effectful call wrapping - COMPLETE
+  - Converts `=>` to `->`
+  - Wraps `identifier!(args)` in `match expr { Ok(v) => v, Err(e) => return Err(e) }`
+  - Handles nested calls and module-qualified functions
+- ⏳ Passes 3-6: Error propagation `?`, defaults `??`, optional fields - Ready for implementation
 - ✅ Complete documentation in DESUGARING.md
 - ✅ Keeps parser simple; AST clean and unambiguous
-- ✅ Phases 1-2 fully implemented, Phases 3-6 ready for Phase 7/9
 
 This is an **exemplary functional parser** with **proper desugaring pipeline** suitable for a **functional language interpreter**.
 
