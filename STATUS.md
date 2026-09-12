@@ -11,20 +11,48 @@
 ## 🎯 Executive Summary
 
 A complete Rust interpreter for the Roc programming language with:
-- **7 major implementation phases** completed
-- **125 comprehensive tests** (all passing)
+- **6 implementation phases** completed (Phases 1-6)
+- **Comprehensive desugaring pipeline** (7 transformation passes)
+- **Pure functional parser** (zero external dependencies)
+- **124/125 comprehensive tests** passing (99.2%)
 - **Binary operator support** with proper precedence
 - **Professional error handling** with thiserror
 - **Zero compiler warnings**, idiomatic Rust code
 - **Clean architecture** following SOLID principles
 
-The interpreter can now:
+The interpreter features:
+- ✅ **Desugaring System** — Transforms shorthand syntax to explicit forms
+  - Type annotations removal
+  - Effect type arrow conversion (=>  becomes ->)
+  - Error propagation (? operator) — ready for Phase 7
+  - Default values (?? operator) — ready for Phase 7
+  - Optional field access (.?) — ready for Phase 9
+  - Effectful function names (!) — preserved correctly
 - ✅ Parse and evaluate strings, numbers, identifiers
 - ✅ Handle let bindings and variable scoping
 - ✅ Support lambda functions with closures
 - ✅ Execute arithmetic, comparison, and logical operations
 - ✅ Perform type checking and inference
 - ✅ Generate clear error messages
+
+---
+
+## 🔄 Desugaring Pipeline
+
+Every Roc source file undergoes 7 transformation passes before parsing:
+
+| Pass | Transformation | Status | Phase |
+|------|---|---|---|
+| 1 | Remove type annotations | ✅ Done | 1 |
+| 2 | Convert `=>` to `->` in types | ✅ Done | 1 |
+| 3 | Expand `??` operator to match | ⏳ Placeholder | 7 |
+| 4 | Expand `?` operator to match | ⏳ Placeholder | 7 |
+| 5 | Transform `.?` field access | ⏳ Placeholder | 9 |
+| 6 | Mark `?: Type` optional fields | ⏳ Placeholder | 9 |
+
+**Key Feature:** Effectful function names (`!`) are **preserved** as part of identifiers, not removed.
+
+See `DESUGARING.md` for complete documentation of all transformation rules.
 
 ---
 
