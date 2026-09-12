@@ -896,6 +896,11 @@ fn parse_identifier(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
         }
     }
 
+    // Optional trailing ! for effectful functions (e.g., echo!, main!)
+    if pos < input.len() && input.as_bytes()[pos] == b'!' {
+        pos += 1;
+    }
+
     let ident = &input[..pos];
     let remaining = &input[pos..];
 

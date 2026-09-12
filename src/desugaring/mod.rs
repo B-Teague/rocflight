@@ -105,11 +105,14 @@ impl Desugarer {
         Ok(result.join("\n"))
     }
 
-    /// Pass 1: Remove ! from effectful function names
-    /// `main!` → `main`
-    /// `Stdout.line!` → `Stdout.line`
-    /// Type `Str => Result` → `Str -> Result`
-    /// BUT: Don't touch ! inside string literals
+    /// Pass 1: Handle effect type syntax
+    /// IMPORTANT: Do NOT remove ! from identifiers - it's part of the name!
+    /// `echo!` stays as `echo!` - it's how effectful functions are named
+    /// `main!` stays as `main!` - part of the identifier
+    ///
+    /// Only convert effect type arrows:
+    /// Type `Str => Result` → `Str -> Result` (in type annotations)
+    /// BUT: Don't touch ! inside string literals or as part of identifiers
     fn desugar_effects(&self, input: &str) -> Result<String, ParseError> {
         let mut result = String::new();
         let mut chars = input.chars().peekable();
@@ -133,33 +136,12 @@ impl Desugarer {
                         }
                     }
                 }
-            } else if ch.is_alphabetic() || ch == '_' {
-                // Identifier possibly followed by !
-                let mut ident = String::from(ch);
-
-                // Collect identifier
-                while let Some(&next_ch) = chars.peek() {
-                    if next_ch.is_alphanumeric() || next_ch == '_' {
-                        ident.push(next_ch);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-
-                // Check if followed by !
-                if chars.peek() == Some(&'!') {
-                    // Remove the !
-                    chars.next(); // consume the !
-                    result.push_str(&ident); // add identifier without !
-                } else {
-                    result.push_str(&ident);
-                }
             } else if ch == '=' && chars.peek() == Some(&'>') {
-                // Convert => to ->
+                // Convert => to -> (only for type annotations)
                 chars.next(); // consume >
                 result.push_str("->");
             } else {
+                // Keep everything else as-is, including ! in identifiers
                 result.push(ch);
             }
         }
@@ -220,8 +202,8 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar_effects(&desugarer.input).expect("Desugaring failed");
 
-        assert!(result.contains("main ="));
-        assert!(!result.contains("main!"));
+        // IMPORTANT: ! is part of the identifier, NOT removed
+        assert!(result.contains("main! ="));
     }
 
     #[test]
@@ -230,8 +212,11 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar_effects(&desugarer.input).unwrap();
 
+        // => should become ->
         assert!(result.contains("->"));
         assert!(!result.contains("=>"));
+        // But main! stays intact
+        assert!(result.contains("main!"));
     }
 
     #[test]
@@ -240,9 +225,9 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar_effects(&desugarer.input).unwrap();
 
-        assert_eq!(result.matches("echo").count(), 1); // No echo! left
-        assert_eq!(result.matches("line").count(), 1); // No line! left
-        assert!(!result.contains("!"));
+        // ! is part of function names, stays in place
+        assert!(result.contains("echo!"));
+        assert!(result.contains("line!"));
     }
 
     #[test]
@@ -251,9 +236,8 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar().unwrap();
 
-        // After desugaring, the ! after identifier should be removed
-        // (but ! inside strings should be preserved)
-        assert!(result.starts_with("main = "));
+        // ! is part of identifier name, NOT removed
+        assert!(result.starts_with("main! ="));
         // Should still have the string with its ! preserved
         assert!(result.contains("\"Hello, world!\""));
     }
