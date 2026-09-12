@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-/// Parse errors from the nom-based parser
+/// Parse errors from the pure functional parser
 #[derive(Error, Debug, Clone)]
 #[error("Parse error at position {position}: {message}")]
 pub struct ParseError {

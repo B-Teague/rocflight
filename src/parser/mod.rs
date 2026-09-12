@@ -1,9 +1,18 @@
-//! Parser for Roc using nom
+//! Pure Functional Parser for Roc
+//!
+//! Built with pure functional combinators (no external parser libraries)
+//! Follows idiomatic Rust with Result-based error handling
 //!
 //! Pipeline:
 //! 1. Desugar shorthand syntax
 //! 2. Parse desugared code
 //! 3. Build AST
+//!
+//! Parser Architecture:
+//! - Recursive descent with explicit precedence levels
+//! - Pure functions that return Result<(T, &str), ParseError>
+//! - No side effects or external dependencies
+//! - Full transparency and control over parsing behavior
 
 use crate::ast::{Expr, StrPart};
 use crate::error::ParseError;
@@ -152,7 +161,7 @@ impl Parser {
 
             // Parse variable name
             let rest = &self.input[self.pos..];
-            let (remaining, name_expr) = parse_ident_nom(rest)?;
+            let (remaining, name_expr) = parse_identifier(rest)?;
             self.pos += rest.len() - remaining.len();
 
             let name = match name_expr {
@@ -205,7 +214,7 @@ impl Parser {
             // Check for top-level binding: name = expr
             // This is similar to let but at file level
             let lookahead_rest = rest;
-            if let Ok((remaining, expr)) = parse_ident_nom(lookahead_rest) {
+            if let Ok((remaining, expr)) = parse_identifier(lookahead_rest) {
                 let lookahead_pos = lookahead_rest.len() - remaining.len();
                 let after_ident = &lookahead_rest[lookahead_pos..].trim_start();
 
@@ -470,7 +479,7 @@ impl Parser {
         }
 
         // Try number
-        if let Ok((remaining, expr)) = parse_number_nom(rest) {
+        if let Ok((remaining, expr)) = parse_number_literal(rest) {
             self.pos += rest.len() - remaining.len();
             self.skip_whitespace();
             return Ok(expr);
@@ -484,7 +493,7 @@ impl Parser {
         // Try identifier or qualified name
         if let Some(first_char) = rest.chars().next() {
             if is_ident_start(first_char) {
-                if let Ok((remaining, expr)) = parse_ident_nom(rest) {
+                if let Ok((remaining, expr)) = parse_identifier(rest) {
                     self.pos += rest.len() - remaining.len();
 
                     // Check for qualified name: Module.function
@@ -495,7 +504,7 @@ impl Parser {
                                 if is_ident_start(after_dot_char) {
                                     self.pos += 1; // Skip '.'
                                     if let Expr::Ident(module) = expr {
-                                        if let Ok((remaining, name_expr)) = parse_ident_nom(&self.input[self.pos..]) {
+                                        if let Ok((remaining, name_expr)) = parse_identifier(&self.input[self.pos..]) {
                                             self.pos += self.input[self.pos..].len() - remaining.len();
                                             if let Expr::Ident(name) = name_expr {
                                                 self.skip_whitespace();
@@ -538,7 +547,7 @@ impl Parser {
         if !rest.starts_with('|') {
             loop {
                 let rest = &self.input[self.pos..];
-                if let Ok((remaining, param_expr)) = parse_ident_nom(rest) {
+                if let Ok((remaining, param_expr)) = parse_identifier(rest) {
                     self.pos += rest.len() - remaining.len();
                     if let Expr::Ident(param) = param_expr {
                         params.push(param);
@@ -586,7 +595,7 @@ impl Parser {
     /// Parse string literal: "..."
     fn parse_string(&mut self) -> Result<Expr<'static>, ParseError> {
         let rest = &self.input[self.pos..];
-        match parse_string_nom(rest) {
+        match parse_string_literal(rest) {
             Ok((remaining, expr)) => {
                 self.pos += rest.len() - remaining.len();
                 Ok(expr)
@@ -600,7 +609,7 @@ impl Parser {
 }
 
 /// Parse string literal with interpolation
-fn parse_string_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+fn parse_string_literal(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
     // Check for opening quote
     if !input.starts_with('"') {
         return Err(ParseError {
@@ -682,7 +691,7 @@ fn is_ident_char(c: char) -> bool {
 }
 
 /// Parse number literal (int or float): 42, -3, 3.14, -2.5
-fn parse_number_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+fn parse_number_literal(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
     let mut pos = 0;
     let input_bytes = input.as_bytes();
 
@@ -745,7 +754,7 @@ fn parse_number_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
 }
 
 /// Parse identifier: x, main, birds
-fn parse_ident_nom(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+fn parse_identifier(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
     let mut pos = 0;
     let mut chars = input.chars();
 
