@@ -17,38 +17,94 @@ use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 use rocflight::eval::Evaluator;
 use rocflight::eval::Value;
+use rocflight::desugaring::Desugarer;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <file.roc>", args[0]);
+        eprintln!("Usage: {} [options] <file.roc>", args[0]);
+        eprintln!("Options:");
+        eprintln!("  --show-desugared    Display desugared code after running");
+        eprintln!("  --clear-cache       Clear desugaring cache and exit");
         process::exit(1);
     }
 
-    let filename = &args[1];
+    // Parse command-line options
+    let mut show_desugared = false;
+    let mut filename = None;
+
+    for arg in &args[1..] {
+        match arg.as_str() {
+            "--clear-cache" => {
+                // Clear cache and exit
+                if let Err(e) = Desugarer::clear_cache() {
+                    eprintln!("Error clearing cache: {}", e);
+                    process::exit(1);
+                }
+                process::exit(0);
+            }
+            "--show-desugared" => {
+                show_desugared = true;
+            }
+            _ if !arg.starts_with("--") => {
+                filename = Some(arg.clone());
+            }
+            _ => {
+                eprintln!("Unknown option: {}", arg);
+                process::exit(1);
+            }
+        }
+    }
+
+    let filename = match filename {
+        Some(f) => f,
+        None => {
+            eprintln!("Error: No input file specified");
+            process::exit(1);
+        }
+    };
 
     // Run the interpreter with proper error handling
-    if let Err(e) = run(filename) {
+    if let Err(e) = run(&filename, show_desugared) {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
 }
 
 /// Main interpreter pipeline with Result-based error handling
-fn run(filename: &str) -> Result<(), Box<dyn Error>> {
-    // Step 1: Parse (includes desugaring + parsing)
-    let (ast, app_entry_point) = Parser::from_file(filename)?;
+fn run(filename: &str, show_desugared: bool) -> Result<(), Box<dyn Error>> {
+    // Step 1: Load and desugar file
+    let source = std::fs::read_to_string(filename)?;
+    let desugarer = Desugarer::new(source);
+    let desugared = desugarer.desugar()?;
 
-    // Step 2: Type check
+    // Save desugared version to cache
+    desugarer.save_debug(filename, &desugared)?;
+
+    // Optionally display desugared code
+    if show_desugared {
+        eprintln!("\n=== DESUGARED CODE ===");
+        eprintln!("{}", desugared);
+        eprintln!("=== END DESUGARED CODE ===\n");
+    }
+
+    // Step 2: Parse desugared code (includes AST building)
+    let mut parser = Parser::new(&desugared);
+    let (ast, app_entry_point) = {
+        let expr = parser.parse_expr()?;
+        (expr, parser.app_entry_point())
+    };
+
+    // Step 3: Type check
     let mut type_checker = TypeChecker::new();
     type_checker.synth(&ast)?;
 
-    // Step 3: Evaluate
+    // Step 4: Evaluate
     let mut evaluator = Evaluator::new();
     let _value = evaluator.eval(&ast)?;
 
-    // Step 4: Execute app entry point if present
+    // Step 5: Execute app entry point if present
     if let Some(entry_name) = app_entry_point {
         invoke_app_entry_point(&mut evaluator, &entry_name)?;
     } else {
