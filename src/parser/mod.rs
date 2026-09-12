@@ -482,30 +482,34 @@ impl Parser {
         }
 
         // Try identifier or qualified name
-        if is_ident_start(rest.chars().next().unwrap()) {
-            if let Ok((remaining, expr)) = parse_ident_nom(rest) {
-                self.pos += rest.len() - remaining.len();
+        if let Some(first_char) = rest.chars().next() {
+            if is_ident_start(first_char) {
+                if let Ok((remaining, expr)) = parse_ident_nom(rest) {
+                    self.pos += rest.len() - remaining.len();
 
-                // Check for qualified name: Module.function
-                let rest2 = &self.input[self.pos..];
-                if rest2.starts_with('.') {
-                    let after_dot = &rest2[1..];
-                    if !after_dot.is_empty() && is_ident_start(after_dot.chars().next().unwrap()) {
-                        self.pos += 1; // Skip '.'
-                        if let Expr::Ident(module) = expr {
-                            if let Ok((remaining, name_expr)) = parse_ident_nom(&self.input[self.pos..]) {
-                                self.pos += self.input[self.pos..].len() - remaining.len();
-                                if let Expr::Ident(name) = name_expr {
-                                    self.skip_whitespace();
-                                    return Ok(Expr::Qualified { module, name });
+                    // Check for qualified name: Module.function
+                    let rest2 = &self.input[self.pos..];
+                    if rest2.starts_with('.') {
+                        let after_dot = &rest2[1..];
+                        if let Some(after_dot_char) = after_dot.chars().next() {
+                                if is_ident_start(after_dot_char) {
+                                    self.pos += 1; // Skip '.'
+                                    if let Expr::Ident(module) = expr {
+                                        if let Ok((remaining, name_expr)) = parse_ident_nom(&self.input[self.pos..]) {
+                                            self.pos += self.input[self.pos..].len() - remaining.len();
+                                            if let Expr::Ident(name) = name_expr {
+                                                self.skip_whitespace();
+                                                return Ok(Expr::Qualified { module, name });
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
 
-                self.skip_whitespace();
-                return Ok(expr);
+                    self.skip_whitespace();
+                    return Ok(expr);
+                }
             }
         }
 

@@ -52,7 +52,7 @@ static GLOBAL_POOL: Lazy<Mutex<StringPool>> = Lazy::new(|| {
 
 /// Intern a string globally
 pub fn intern(s: &str) -> &'static str {
-    let mut pool = GLOBAL_POOL.lock().unwrap();
+    let mut pool = GLOBAL_POOL.lock().expect("String pool lock poisoned");
     pool.intern(s)
 }
 

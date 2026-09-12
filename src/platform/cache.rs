@@ -29,7 +29,12 @@ impl PlatformCache {
     }
 
     /// Get cached platform
-    pub fn get(&self, url: &str) -> Option<Platform> {
+    pub fn get(&self, url: &str) -> Option<&Platform> {
+        self.platforms.get(url)
+    }
+
+    /// Get cached platform (clone if needed)
+    pub fn get_clone(&self, url: &str) -> Option<Platform> {
         self.platforms.get(url).cloned()
     }
 
@@ -39,8 +44,8 @@ impl PlatformCache {
     }
 
     /// Get all cached platform URLs
-    pub fn cached_urls(&self) -> Vec<String> {
-        self.platforms.keys().cloned().collect()
+    pub fn cached_urls(&self) -> Vec<&String> {
+        self.platforms.keys().collect()
     }
 
     /// Number of cached platforms
@@ -67,22 +72,22 @@ impl Default for PlatformCache {
 
 /// Get or load a platform from cache
 ///
-/// If the platform is already cached, returns it.
+/// If the platform is already cached, returns a reference to it.
 /// Otherwise, returns None (caller must load it).
 pub fn get_platform(url: &str) -> Option<Platform> {
-    let cache = PLATFORM_CACHE.lock().unwrap();
-    cache.get(url)
+    let cache = PLATFORM_CACHE.lock().expect("Platform cache lock poisoned");
+    cache.get(url).cloned()
 }
 
 /// Store a platform in the global cache
 pub fn cache_platform(url: String, platform: Platform) {
-    let mut cache = PLATFORM_CACHE.lock().unwrap();
+    let mut cache = PLATFORM_CACHE.lock().expect("Platform cache lock poisoned");
     cache.insert(url, platform);
 }
 
 /// Clear the global platform cache
 pub fn clear_cache() {
-    let mut cache = PLATFORM_CACHE.lock().unwrap();
+    let mut cache = PLATFORM_CACHE.lock().expect("Platform cache lock poisoned");
     cache.clear();
 }
 
@@ -103,9 +108,9 @@ mod tests {
         let mut cache = PlatformCache::new();
         let platform = create_test_platform();
 
-        cache.insert("https://example.com/test.tar.br".to_string(), platform.clone());
+        cache.insert("https://example.com/test.tar.br".to_string(), platform);
         assert!(cache.contains("https://example.com/test.tar.br"));
-        assert_eq!(cache.get("https://example.com/test.tar.br").unwrap().name, "test");
+        assert_eq!(cache.get("https://example.com/test.tar.br").expect("Platform not found").name, "test");
     }
 
     #[test]

@@ -163,7 +163,7 @@ mod tests {
     fn test_desugar_simple_effect() {
         let input = "main! = |_args| \"hello\"".to_string();
         let desugarer = Desugarer::new(input);
-        let result = desugarer.desugar_effects(&desugarer.input).unwrap();
+        let result = desugarer.desugar_effects(&desugarer.input).expect("Desugaring failed");
 
         assert!(result.contains("main ="));
         assert!(!result.contains("main!"));
