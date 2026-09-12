@@ -243,28 +243,38 @@ Config := {
 
 ---
 
-## Rule 7: Effectful Function Names
+## Rule 7: Effectful Function Marker (!) - REMOVED
 
-**Important:** The `!` suffix is **NOT** desugared!
+**Critical:** The `!` suffix is **NOT** part of the function name - it's a postfix operator!
 
-**Why:** It's part of the function identifier itself:
-```roc
-echo! : Str -> Effect({})    # echo! is the function name
-main! = ...                   # main! is the function name
-```
+**What it means:** Functions marked with `!` return a `Try/Result` type (they're effectful).
 
-**Pattern:** Keep `!` as part of identifiers:
+**Desugaring:** Remove the `!` from all function names and calls:
 ```roc
 # Before:
 echo!("hello")
-main! = |_| { ... }
+main! = |_args| { ... }
 
-# After (NO CHANGE):
-echo!("hello")
-main! = |_| { ... }
+# After (! removed):
+echo("hello")
+main = |_args| { ... }
 ```
 
-The `!` tells the type system this function performs effects. It's not removed or converted.
+**Why:** The `!` is syntactic sugar that marks a function as performing effects. The actual function name doesn't include it. Full error handling wrapping happens in Pass 4.
+
+**Example:**
+```roc
+# Before desugaring:
+result = echo!("message")
+
+# After full desugaring (Pass 4 adds error wrapping):
+result = match echo("message") {
+    Ok(v) => v
+    Err(e) => return Err(e)
+}
+```
+
+The `!` tells the parser "this call returns Try, wrap it in error handling," but it's not part of the identifier itself.
 
 ---
 

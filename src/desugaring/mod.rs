@@ -110,9 +110,19 @@ impl Desugarer {
         Ok(result.join("\n"))
     }
 
-    /// Pass 2: Convert effect type arrows
-    /// `Str => Result` → `Str -> Result` (in type annotations)
-    /// IMPORTANT: Keep ! in function names (e.g., echo!, main!)
+    /// Pass 2: Handle effect markers and type arrows
+    ///
+    /// Two transformations:
+    /// 1. Strip `!` from function names and calls (marks effectful, not part of name)
+    /// 2. Convert `=>` to `->` in type annotations
+    ///
+    /// After desugaring:
+    /// - `echo!("hello")` becomes `echo("hello")` (! removed)
+    /// - `main!` becomes `main` (! removed)
+    /// - `Str => Result` becomes `Str -> Result` (arrow converted)
+    ///
+    /// NOTE: The ! removal here is just cleaning up names. Full error wrapping
+    /// happens in Pass 4 (desugar_question_operator) which wraps calls.
     fn desugar_effect_arrows(&self, input: &str) -> Result<String, ParseError> {
         let mut result = String::new();
         let mut chars = input.chars().peekable();
@@ -136,12 +146,16 @@ impl Desugarer {
                         }
                     }
                 }
+            } else if ch == '!' {
+                // Remove ! - it's not part of the identifier, it marks effectful functions
+                // The ! will be handled by error wrapping in Pass 4
+                // Just skip it here
+                continue;
             } else if ch == '=' && chars.peek() == Some(&'>') {
                 // Convert => to -> (only for type annotations)
                 chars.next(); // consume >
                 result.push_str("->");
             } else {
-                // Keep everything else as-is, including ! in identifiers
                 result.push(ch);
             }
         }
@@ -206,8 +220,10 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar_effect_arrows(&desugarer.input).expect("Desugaring failed");
 
-        // IMPORTANT: ! is part of the identifier, NOT removed
-        assert!(result.contains("main! ="));
+        // IMPORTANT: ! is REMOVED during desugaring
+        // It marks the function as effectful, but is not part of the name
+        assert!(result.contains("main ="));
+        assert!(!result.contains("main!"));
     }
 
     #[test]
@@ -219,8 +235,9 @@ mod tests {
         // => should become ->
         assert!(result.contains("->"));
         assert!(!result.contains("=>"));
-        // But main! stays intact
-        assert!(result.contains("main!"));
+        // ! should be removed
+        assert!(result.contains("main :"));
+        assert!(!result.contains("main!"));
     }
 
     #[test]
@@ -229,9 +246,11 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar_effect_arrows(&desugarer.input).unwrap();
 
-        // ! is part of function names, stays in place
-        assert!(result.contains("echo!"));
-        assert!(result.contains("line!"));
+        // ! is removed from all function names and calls
+        assert!(result.contains("echo ="));
+        assert!(result.contains("Stdout.line"));
+        assert!(!result.contains("echo!"));
+        assert!(!result.contains("line!"));
     }
 
     #[test]
@@ -240,9 +259,10 @@ mod tests {
         let desugarer = Desugarer::new(input);
         let result = desugarer.desugar().unwrap();
 
-        // ! is part of identifier name, NOT removed
-        assert!(result.starts_with("main! ="));
-        // Should still have the string with its ! preserved
+        // ! is REMOVED during desugaring (Pass 2)
+        assert!(result.starts_with("main ="));
+        assert!(!result.contains("main!"));
+        // Should still have the string with its ! preserved (inside string)
         assert!(result.contains("\"Hello, world!\""));
     }
 }

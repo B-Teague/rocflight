@@ -896,10 +896,9 @@ fn parse_identifier(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
         }
     }
 
-    // Optional trailing ! for effectful functions (e.g., echo!, main!)
-    if pos < input.len() && input.as_bytes()[pos] == b'!' {
-        pos += 1;
-    }
+    // Note: ! is NOT part of the identifier. It's a postfix operator that marks
+    // effectful functions. The desugarer removes ! and wraps the call in error handling.
+    // So parse_identifier stops at the identifier itself, not including any ! suffix.
 
     let ident = &input[..pos];
     let remaining = &input[pos..];

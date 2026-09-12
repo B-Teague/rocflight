@@ -260,27 +260,38 @@ Result: Complete AST ready for type checking
 
 ---
 
-## Critical Fix: Effectful Function Names
+## Critical Fix: Understanding Effectful Function Markers
 
-**Issue Found & Fixed (Phase 6):**
-The desugarer was incorrectly removing `!` from function names:
-- `echo!` was becoming `echo` (breaking code!)
-- `main!` was becoming `main` (syntax error!)
+**Issue Found & Fixed:**
+Initial misunderstanding about `!` - it was thought to be part of the function name.
 
 **The Truth About `!` in Roc:**
-The `!` is **NOT syntactic sugar to be removed**. It's **part of the identifier name itself**.
-- Effectful functions are literally named with a `!` suffix
-- `echo!` is a different function from `echo`
-- `main!` is a different function from `main`
-- This is how Roc marks functions that perform effects (I/O, state, etc.)
+The `!` is **NOT part of the identifier name** - it's a **postfix operator** marking effectful functions.
+- `echo!("hello")` means "call echo and handle the Result it returns"
+- `main!` means "main returns a Try/Result type"
+- During desugaring, `!` is **REMOVED** and replaced with error handling
 
-**Correct Desugaring:**
-Only convert effect type arrows: `=>` → `->`
-- ✅ `main! : Str => Result` becomes `main! : Str -> Result`
-- ✅ `echo!("hello")` stays as `echo!("hello")`
-- ❌ Never remove the `!` from identifiers
+**Correct Desugaring (Pass 2):**
+1. Remove `!` from all function names and calls
+2. Convert effect type arrows: `=>` → `->`
+3. Full error wrapping happens in Pass 4
 
-This fix ensures effectful functions can be called correctly in Roc code.
+**Example:**
+```roc
+# Before:
+echo!("hello")
+main! = |_args| { ... }
+
+# After Pass 2:
+echo("hello")
+main = |_args| { ... }
+
+# After Pass 4 (full desugaring):
+match echo("hello") { Ok(v) => v, Err(e) => return Err(e) }
+main = |_args| { ... }
+```
+
+This ensures correctness: the function name is just `echo` and `main`, with `!` being syntactic sugar for error handling.
 
 ---
 

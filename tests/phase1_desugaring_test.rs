@@ -2,8 +2,10 @@
 //!
 //! Tests for shorthand syntax desugaring before parsing
 //!
-//! IMPORTANT: ! is part of effectful function names, NOT removed!
-//! The desugarer only converts => to -> in type annotations.
+//! IMPORTANT: ! is NOT part of the function name!
+//! The ! is a postfix operator marking effectful functions.
+//! During desugaring, ! is REMOVED from function names and calls.
+//! The full error handling wrapping happens in Pass 4 (Phase 7).
 
 use rocflight::desugaring::Desugarer;
 
@@ -13,8 +15,9 @@ fn test_desugar_simple_effect() {
     let desugarer = Desugarer::new(input);
     let result = desugarer.desugar().unwrap();
 
-    // IMPORTANT: ! stays as part of identifier
-    assert!(result.contains("main! ="));
+    // ! is REMOVED during desugaring
+    assert!(result.contains("main ="));
+    assert!(!result.contains("main!"));
     assert!(result.contains("\"Hello\""));
 }
 
@@ -24,10 +27,12 @@ fn test_desugar_effect_type_notation() {
     let desugarer = Desugarer::new(input);
     let result = desugarer.desugar().unwrap();
 
-    // => converts to ->, but ! stays in identifier
-    assert!(result.contains("main!"));
+    // => converts to ->
     assert!(!result.contains("=>"));
     assert!(result.contains("->"));
+    // ! is REMOVED
+    assert!(result.contains("main :"));
+    assert!(!result.contains("main!"));
 }
 
 #[test]
@@ -36,9 +41,11 @@ fn test_desugar_multiple_effects() {
     let desugarer = Desugarer::new(input);
     let result = desugarer.desugar().unwrap();
 
-    // ! is part of function names, stays in place
-    assert!(result.contains("echo! ="));
-    assert!(result.contains("Stdout.line!"));
+    // ! is REMOVED from all function names and calls
+    assert!(result.contains("echo ="));
+    assert!(result.contains("Stdout.line"));
+    assert!(!result.contains("echo!"));
+    assert!(!result.contains("line!"));
 }
 
 #[test]
@@ -47,12 +54,13 @@ fn test_desugar_preserves_strings() {
     let desugarer = Desugarer::new(input);
     let result = desugarer.desugar().unwrap();
 
-    // String ! is preserved
+    // String ! is preserved (inside string)
     assert!(result.contains("There are"));
     assert!(result.contains("birds"));
     assert!(result.contains("!\""));
-    // Function name ! is also preserved
-    assert!(result.contains("main! ="));
+    // Function name ! is REMOVED
+    assert!(result.contains("main ="));
+    assert!(!result.contains("main!"));
 }
 
 #[test]
@@ -72,12 +80,14 @@ main! = |_args|
     let desugarer = Desugarer::new(input);
     let result = desugarer.desugar().unwrap();
 
-    // ! is preserved in function names
-    assert!(result.contains("main!"));
-    assert!(result.contains("Stdout.line!"));
+    // ! is REMOVED from function names
+    assert!(result.contains("app [main]"));
+    assert!(result.contains("main ="));
+    assert!(result.contains("Stdout.line"));
+    assert!(!result.contains("main!"));
+    assert!(!result.contains("line!"));
 
     // Structure should be preserved
-    assert!(result.contains("app [main!]"));
     assert!(result.contains("birds"));
 }
 
@@ -92,8 +102,9 @@ fn test_desugarer_from_file() {
     let desugarer = Desugarer::from_file(test_path).expect("Failed to load file");
     let result = desugarer.desugar().expect("Failed to desugar");
 
-    // ! stays as part of identifier
-    assert!(result.contains("echo! ="));
+    // ! is REMOVED
+    assert!(result.contains("echo ="));
+    assert!(!result.contains("echo!"));
     assert!(result.contains("msg"));
 
     // Clean up
@@ -106,8 +117,9 @@ fn test_desugar_preserves_non_effect_identifiers() {
     let desugarer = Desugarer::new(input);
     let result = desugarer.desugar().unwrap();
 
-    // ! is part of the function name, stays in place
-    assert!(result.contains("factorial! ="));
+    // ! is REMOVED from the function name
+    assert!(result.contains("factorial ="));
+    assert!(!result.contains("factorial!"));
     // Parameter is preserved
     assert!(result.contains("n"));
 }
@@ -121,7 +133,8 @@ fn test_multiple_desugaring_passes() {
     // Type arrow converted
     assert!(result.contains("->"));
     assert!(!result.contains("=>"));
-    // But ! stays in function names
-    assert!(result.contains("main! ="));
+    // ! REMOVED from function name
+    assert!(result.contains("main ="));
+    assert!(!result.contains("main!"));
     assert!(result.contains("Str"));
 }
