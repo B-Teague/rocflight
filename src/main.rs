@@ -10,11 +10,13 @@
 //! 5. Evaluate with tree-walk interpreter
 
 use std::env;
+use std::error::Error;
 use std::process;
 
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 use rocflight::eval::Evaluator;
+use rocflight::eval::Value;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -26,100 +28,90 @@ fn main() {
 
     let filename = &args[1];
 
-    // Parse (includes desugaring + parsing)
-    let (ast, app_entry_point) = match Parser::from_file(filename) {
-        Ok((expr, entry)) => (expr, entry),
-        Err(e) => {
-            eprintln!("Parse error: {}", e);
-            process::exit(1);
-        }
-    };
-
-    // Type check
-    let mut type_checker = TypeChecker::new();
-    if let Err(e) = type_checker.synth(&ast) {
-        eprintln!("{}", e);
+    // Run the interpreter with proper error handling
+    if let Err(e) = run(filename) {
+        eprintln!("Error: {}", e);
         process::exit(1);
     }
+}
 
-    // Evaluate
+/// Main interpreter pipeline with Result-based error handling
+fn run(filename: &str) -> Result<(), Box<dyn Error>> {
+    // Step 1: Parse (includes desugaring + parsing)
+    let (ast, app_entry_point) = Parser::from_file(filename)?;
+
+    // Step 2: Type check
+    let mut type_checker = TypeChecker::new();
+    type_checker.synth(&ast)?;
+
+    // Step 3: Evaluate
     let mut evaluator = Evaluator::new();
-    match evaluator.eval(&ast) {
-        Ok(value) => {
-            // If there's an app entry point, invoke it
-            if let Some(entry_name) = app_entry_point {
-                // Validate entry point name is not empty
-                if entry_name.is_empty() {
-                    eprintln!("Error: Empty app entry point name");
-                    process::exit(1);
+    let _value = evaluator.eval(&ast)?;
+
+    // Step 4: Execute app entry point if present
+    if let Some(entry_name) = app_entry_point {
+        invoke_app_entry_point(&mut evaluator, &entry_name)?;
+    } else {
+        // No app entry point - for non-app files, print the result
+        println!("{}", _value);
+    }
+
+    Ok(())
+}
+
+/// Invoke the app entry point function
+fn invoke_app_entry_point(
+    evaluator: &mut Evaluator,
+    entry_name: &str,
+) -> Result<(), Box<dyn Error>> {
+    // Validate entry point name is not empty
+    if entry_name.is_empty() {
+        return Err("Empty app entry point name".into());
+    }
+
+    // Note: desugarer removes trailing !, so entry_name might be "main" or "main!"
+    // Handle both cases by stripping ! if present
+    let lookup_name = if entry_name.ends_with('!') {
+        &entry_name[..entry_name.len() - 1]
+    } else {
+        entry_name
+    };
+
+    // Look up the entry point function
+    let entry_fn = evaluator
+        .env
+        .lookup(lookup_name)
+        .ok_or_else(|| format!("App entry point '{}' not found", entry_name))?;
+
+    // Match on the entry point type
+    match entry_fn {
+        Value::Lambda { params, body, env: lambda_env } => {
+            // Create a new evaluator with the lambda's captured environment
+            let mut lambda_eval = Evaluator { env: lambda_env };
+            lambda_eval.env.push_scope();
+
+            // Handle different arities
+            match params.len() {
+                1 => {
+                    // Pass empty string as args (Roc CLI args not yet supported)
+                    let args_value = Value::Str("");
+                    lambda_eval.env.bind(params[0], args_value);
+                    lambda_eval.eval(&body)?;
                 }
-
-                // Note: desugarer removes trailing !, so entry_name might be "main" or "main!"
-                // Handle both cases by stripping ! if present
-                let lookup_name = if entry_name.ends_with('!') {
-                    &entry_name[..entry_name.len() - 1]
-                } else {
-                    &entry_name
-                };
-
-                // Try to find the entry point in the environment and call it
-                if let Some(entry_fn) = evaluator.env.lookup(lookup_name) {
-                    match entry_fn {
-                        rocflight::eval::Value::Lambda { params, body, env: lambda_env } => {
-                            // Create a new evaluator with the lambda's environment
-                            let mut lambda_eval = Evaluator { env: lambda_env };
-                            lambda_eval.env.push_scope();
-
-                            // Bind parameters to arguments
-                            if params.len() == 1 {
-                                // Pass empty string as args (Roc CLI args not yet supported)
-                                let args_value = rocflight::eval::Value::Str("");
-                                lambda_eval.env.bind(params[0], args_value);
-
-                                match lambda_eval.eval(&body) {
-                                    Ok(_result) => {
-                                        // App entry point executed successfully
-                                        // Output is handled by the program itself (e.g., Stdout.line!)
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Runtime error in app entry point: {}", e);
-                                        process::exit(1);
-                                    }
-                                }
-                            } else if params.is_empty() {
-                                match lambda_eval.eval(&body) {
-                                    Ok(_result) => {
-                                        // App entry point executed successfully
-                                        // Output is handled by the program itself
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Runtime error in app entry point: {}", e);
-                                        process::exit(1);
-                                    }
-                                }
-                            } else {
-                                eprintln!("App entry point expects {} arguments, only 0 or 1 supported", params.len());
-                                process::exit(1);
-                            }
-                        }
-                        _ => {
-                            eprintln!("App entry point '{}' is not a function", entry_name);
-                            process::exit(1);
-                        }
-                    }
-                } else {
-                    eprintln!("App entry point '{}' not found", entry_name);
-                    process::exit(1);
+                0 => {
+                    // No parameters needed
+                    lambda_eval.eval(&body)?;
                 }
-            } else {
-                // No app entry point - for non-app files, print the result
-                // (useful for REPL-like testing without "Result:" prefix)
-                println!("{}", value);
+                n => {
+                    return Err(
+                        format!("App entry point expects {} arguments, only 0 or 1 supported", n)
+                            .into(),
+                    );
+                }
             }
+
+            Ok(())
         }
-        Err(e) => {
-            eprintln!("Runtime error: {}", e);
-            process::exit(1);
-        }
+        _ => Err(format!("App entry point '{}' is not a function", entry_name).into()),
     }
 }
