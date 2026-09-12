@@ -14,6 +14,8 @@ use crate::desugaring::Desugarer;
 pub struct Parser {
     input: String,
     pos: usize,
+    /// App entry point (e.g., "main!") if app declaration found
+    pub app_entry_point: Option<String>,
 }
 
 impl Parser {
@@ -22,11 +24,13 @@ impl Parser {
         Parser {
             input: input.to_string(),
             pos: 0,
+            app_entry_point: None,
         }
     }
 
     /// Load and parse file (with desugaring)
-    pub fn from_file(path: &str) -> Result<Expr<'static>, ParseError> {
+    /// Returns: (AST, app_entry_point)
+    pub fn from_file(path: &str) -> Result<(Expr<'static>, Option<String>), ParseError> {
         // Step 1: Load file
         let source = std::fs::read_to_string(path)
             .map_err(|e| ParseError {
@@ -43,7 +47,8 @@ impl Parser {
 
         // Step 4: Parse desugared code
         let mut parser = Parser::new(&desugared);
-        parser.parse_expr()
+        let expr = parser.parse_expr()?;
+        Ok((expr, parser.app_entry_point))
     }
 
     /// Parse expression (entry point)
@@ -56,6 +61,8 @@ impl Parser {
             let rest = &self.input[self.pos..].to_string(); // Clone to avoid borrow issues
 
             if rest.starts_with("app ") {
+                // Extract entry point from app declaration: app [entry!] { ... }
+                self.extract_app_entry_point();
                 self.skip_to_next_declaration();
                 self.skip_whitespace();
             } else if rest.starts_with("import ") {
@@ -68,6 +75,34 @@ impl Parser {
 
         // Parse the main expression
         self.parse_let_or_expr()
+    }
+
+    /// Extract app entry point from declaration like: app [main!] { ... }
+    fn extract_app_entry_point(&mut self) {
+        self.pos += 4; // Skip "app "
+        self.skip_whitespace();
+
+        let rest = &self.input[self.pos..];
+        if rest.starts_with('[') {
+            self.pos += 1; // Skip '['
+            self.skip_whitespace();
+
+            let rest = &self.input[self.pos..];
+            // Find the identifier (entry point)
+            let mut end = 0;
+            for ch in rest.chars() {
+                if ch == ']' || ch.is_whitespace() {
+                    break;
+                }
+                end += ch.len_utf8();
+            }
+
+            if end > 0 {
+                let entry_point = rest[..end].to_string();
+                self.app_entry_point = Some(entry_point);
+                self.pos += end;
+            }
+        }
     }
 
     /// Skip until next declaration or expression
@@ -137,13 +172,21 @@ impl Parser {
 
             // Expect "in"
             let rest = &self.input[self.pos..];
-            if !rest.starts_with("in ") {
+            if !rest.starts_with("in") {
                 return Err(ParseError {
                     message: "Expected 'in' after value in let binding".to_string(),
                     position: self.pos,
                 });
             }
-            self.pos += 3; // Skip "in "
+            // Make sure "in" is followed by whitespace or end of input
+            let after_in = &rest[2..];
+            if !after_in.is_empty() && !after_in.starts_with(|c: char| c.is_whitespace()) {
+                return Err(ParseError {
+                    message: "Expected whitespace or end of input after 'in'".to_string(),
+                    position: self.pos + 2,
+                });
+            }
+            self.pos += 2; // Skip "in"
             self.skip_whitespace();
 
             // Parse body expression

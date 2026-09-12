@@ -15,7 +15,7 @@ pub use environment::Environment;
 
 /// Tree-walk interpreter
 pub struct Evaluator {
-    env: Environment,
+    pub env: Environment,
 }
 
 impl Evaluator {
@@ -52,6 +52,7 @@ impl Evaluator {
                                             }
                                         }
                                         Value::Builtin(name, arity) => format!("<{}/{}>", name, arity),
+                                        Value::Lambda { params, .. } => format!("<lambda |{}|>", params.join(", ")),
                                     };
                                     result.push_str(&s);
                                 }
@@ -93,13 +94,19 @@ impl Evaluator {
                     }),
                 }
             }
-            Expr::Lambda { params, .. } => {
-                // Return a builtin marker for lambdas
-                // Full lambda support (with closure capture) comes in Phase 5
-                Ok(Value::Builtin(
-                    format!("lambda/{}", params.len()),
-                    params.len(),
-                ))
+            Expr::Lambda { params, body } => {
+                // Create a closure capturing the current environment
+                // SAFETY: We transmute to 'static because the parsed AST remains
+                // valid for the lifetime of the program. The body is part of the
+                // parsed source, which we keep in memory.
+                let static_body = unsafe {
+                    std::mem::transmute::<Box<Expr<'_>>, Box<Expr<'static>>>(body.clone())
+                };
+                Ok(Value::Lambda {
+                    params: params.clone(),
+                    body: static_body,
+                    env: self.env.clone(),
+                })
             }
             Expr::Call { func, args } => {
                 // Handle builtin functions and calls
@@ -108,6 +115,39 @@ impl Evaluator {
                         self.call_builtin(module, name, args)
                     }
                     Expr::Ident(name) => {
+                        // First check if it's a variable bound to a lambda
+                        if let Some(val) = self.env.lookup(name) {
+                            match val {
+                                Value::Lambda { params, body, env: lambda_env } => {
+                                    // Call the lambda
+                                    if args.len() != params.len() {
+                                        return Err(EvalError {
+                                            message: format!("Lambda expects {} arguments, got {}", params.len(), args.len()),
+                                        });
+                                    }
+
+                                    // Evaluate arguments in current environment
+                                    let mut arg_vals = Vec::new();
+                                    for arg in args {
+                                        arg_vals.push(self.eval(arg)?);
+                                    }
+
+                                    // Create new evaluator with lambda's captured environment
+                                    let mut lambda_eval = Evaluator { env: lambda_env };
+                                    lambda_eval.env.push_scope();
+
+                                    // Bind parameters to arguments
+                                    for (param, arg_val) in params.iter().zip(arg_vals.iter()) {
+                                        lambda_eval.env.bind(param, arg_val.clone());
+                                    }
+
+                                    // Evaluate body in lambda's environment
+                                    return lambda_eval.eval(&body);
+                                }
+                                _ => {}  // Not a lambda, fall through
+                            }
+                        }
+
                         // Try to call as builtin without module
                         match *name {
                             "to_str" => {
@@ -128,9 +168,41 @@ impl Evaluator {
                         }
                     }
                     _ => {
-                        Err(EvalError {
-                            message: "Function calls not yet supported".to_string(),
-                        })
+                        // Evaluate the function expression (e.g., for chained calls like f()(x))
+                        let func_val = self.eval(func)?;
+                        match func_val {
+                            Value::Lambda { params, body, env: lambda_env } => {
+                                // Call the lambda
+                                if args.len() != params.len() {
+                                    return Err(EvalError {
+                                        message: format!("Lambda expects {} arguments, got {}", params.len(), args.len()),
+                                    });
+                                }
+
+                                // Evaluate arguments in current environment
+                                let mut arg_vals = Vec::new();
+                                for arg in args {
+                                    arg_vals.push(self.eval(arg)?);
+                                }
+
+                                // Create new evaluator with lambda's captured environment
+                                let mut lambda_eval = Evaluator { env: lambda_env };
+                                lambda_eval.env.push_scope();
+
+                                // Bind parameters to arguments
+                                for (param, arg_val) in params.iter().zip(arg_vals.iter()) {
+                                    lambda_eval.env.bind(param, arg_val.clone());
+                                }
+
+                                // Evaluate body in lambda's environment
+                                lambda_eval.eval(&body)
+                            }
+                            _ => {
+                                Err(EvalError {
+                                    message: "Attempted to call a non-function value".to_string(),
+                                })
+                            }
+                        }
                     }
                 }
             }

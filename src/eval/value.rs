@@ -1,7 +1,8 @@
 //! Runtime values for the evaluator
 
 use std::fmt;
-use std::any::Any;
+use crate::ast::Expr;
+use crate::eval::Environment;
 
 /// Runtime value
 #[derive(Clone)]
@@ -14,6 +15,12 @@ pub enum Value {
     Float(f64),
     /// Builtin function marker: name + arity
     Builtin(String, usize),
+    /// Lambda closure: params + body + captured environment
+    Lambda {
+        params: Vec<&'static str>,
+        body: Box<Expr<'static>>,
+        env: Environment,
+    },
 }
 
 impl fmt::Debug for Value {
@@ -23,6 +30,9 @@ impl fmt::Debug for Value {
             Value::Int(n) => write!(f, "Int({})", n),
             Value::Float(n) => write!(f, "Float({})", n),
             Value::Builtin(name, arity) => write!(f, "Builtin({}, {})", name, arity),
+            Value::Lambda { params, .. } => {
+                write!(f, "Lambda(|{}| ...)", params.join(", "))
+            }
         }
     }
 }
@@ -41,6 +51,7 @@ impl fmt::Display for Value {
                 }
             }
             Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
+            Value::Lambda { params, .. } => write!(f, "<lambda |{}|>", params.join(", ")),
         }
     }
 }
