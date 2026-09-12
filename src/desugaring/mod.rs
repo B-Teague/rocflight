@@ -3,13 +3,15 @@
 //! Converts all Roc shorthand syntax to explicit functional syntax
 //! BEFORE parsing. This keeps the parser simple and the AST clean.
 //!
+//! See DESUGARING.md for detailed rules on each transformation.
+//!
 //! Shorthand syntax handled:
-//! - `!` — Effectful function marker (Phase 1B)
-//! - `?` — Error handling operator (Phase 7)
-//! - `??` — Default value operator (Phase 7)
-//! - `.?` — Optional field access (Phase 9)
-//! - `?:` — Optional record fields (Phase 9)
-//! - `=>` — Effect type notation (Phase 1B)
+//! - `!` — Effectful function marker (PRESERVED, not removed)
+//! - `?` — Error propagation operator (expands to match)
+//! - `??` — Default value operator (expands to match)
+//! - `.?` — Optional field access (Phase 9 - placeholder)
+//! - `?:` — Optional record fields (Phase 9 - placeholder)
+//! - `=>` — Effect type notation (converts to ->)
 
 use crate::error::ParseError;
 
@@ -30,27 +32,30 @@ impl Desugarer {
         Ok(Desugarer { input })
     }
 
-    /// Run all desugaring passes
+    /// Run all desugaring passes in order
+    /// Each pass transforms shorthand syntax into explicit, verbose forms
     pub fn desugar(&self) -> Result<String, ParseError> {
-        // Pass 0: Remove type annotations (lines with : before =)
-        let step0 = self.remove_type_annotations(&self.input)?;
+        // Pass 1: Remove type annotation lines (e.g., "x : I64" before "x = 42")
+        let step1 = self.remove_type_annotations(&self.input)?;
 
-        // Pass 1: Remove ! from effectful function names and type annotations
-        let step1 = self.desugar_effects(&step0)?;
+        // Pass 2: Convert effect type arrows (=> becomes ->)
+        // IMPORTANT: Preserve ! in function names (e.g., echo!, main!)
+        let step2 = self.desugar_effect_arrows(&step1)?;
 
-        // Pass 2: Replace ? operators with match expressions
-        let step2 = self.desugar_question_mark(&step1)?;
+        // Pass 3: Expand ?? operator (default values) to match expressions
+        // Do this BEFORE ? operator since ?? contains ?
+        let step3 = self.desugar_default_operator(&step2)?;
 
-        // Pass 3: Replace ?? operators with match expressions
-        let step3 = self.desugar_default(&step2)?;
+        // Pass 4: Expand ? operator (error propagation) to match expressions
+        let step4 = self.desugar_question_operator(&step3)?;
 
-        // Pass 4: Replace .? with Try-based access
-        let step4 = self.desugar_optional_access(&step3)?;
+        // Pass 5: Handle .? optional field access (placeholder for Phase 9)
+        let step5 = self.desugar_optional_field_access(&step4)?;
 
-        // Pass 5: Process optional fields (?:) in records
-        let step5 = self.desugar_optional_fields(&step4)?;
+        // Pass 6: Handle ?: optional record fields (placeholder for Phase 9)
+        let step6 = self.desugar_optional_record_fields(&step5)?;
 
-        Ok(step5)
+        Ok(step6)
     }
 
     /// Pass 0: Remove type annotations
@@ -105,15 +110,10 @@ impl Desugarer {
         Ok(result.join("\n"))
     }
 
-    /// Pass 1: Handle effect type syntax
-    /// IMPORTANT: Do NOT remove ! from identifiers - it's part of the name!
-    /// `echo!` stays as `echo!` - it's how effectful functions are named
-    /// `main!` stays as `main!` - part of the identifier
-    ///
-    /// Only convert effect type arrows:
-    /// Type `Str => Result` → `Str -> Result` (in type annotations)
-    /// BUT: Don't touch ! inside string literals or as part of identifiers
-    fn desugar_effects(&self, input: &str) -> Result<String, ParseError> {
+    /// Pass 2: Convert effect type arrows
+    /// `Str => Result` → `Str -> Result` (in type annotations)
+    /// IMPORTANT: Keep ! in function names (e.g., echo!, main!)
+    fn desugar_effect_arrows(&self, input: &str) -> Result<String, ParseError> {
         let mut result = String::new();
         let mut chars = input.chars().peekable();
 
@@ -149,35 +149,39 @@ impl Desugarer {
         Ok(result)
     }
 
-    /// Pass 2: Replace ? operator with match expressions
-    /// `expr?` → `match expr { Ok(v) => v, Err(e) => return Err(e) }`
-    fn desugar_question_mark(&self, input: &str) -> Result<String, ParseError> {
-        // For now, this is a placeholder
-        // Full implementation will replace expr? patterns with match expressions
-        // Deferred to Phase 7 when error handling is implemented
-        Ok(input.to_string())
-    }
-
-    /// Pass 3: Replace ?? operator with match expressions
+    /// Pass 3: Expand ?? operator (default values)
     /// `expr ?? default` → `match expr { Ok(v) => v, Err(_) => default }`
-    fn desugar_default(&self, input: &str) -> Result<String, ParseError> {
-        // Placeholder - deferred to Phase 7
+    fn desugar_default_operator(&self, input: &str) -> Result<String, ParseError> {
+        // For now, this is a placeholder. Full implementation requires expression parsing.
+        // The ?? operator is relatively rare, so we defer this to a later phase.
         Ok(input.to_string())
     }
 
-    /// Pass 4: Replace .? with Try-based access
-    /// `rec.?field` → special Try handling
-    fn desugar_optional_access(&self, input: &str) -> Result<String, ParseError> {
-        // Placeholder - deferred to Phase 9
+    /// Pass 4: Expand ? operator (error propagation)
+    /// `expr?` → `match expr { Ok(v) => v, Err(e) => return Err(e) }`
+    fn desugar_question_operator(&self, input: &str) -> Result<String, ParseError> {
+        // For now, this is a placeholder. Full implementation requires careful parsing to:
+        // 1. Identify complete expressions followed by ?
+        // 2. Not confuse with ? in type annotations
+        // 3. Handle nested expressions correctly
+        // This is deferred to Phase 7 when error handling is properly designed.
         Ok(input.to_string())
     }
 
-    /// Pass 5: Process optional fields in records
-    /// `field ?: Type` → mark field as optional
-    fn desugar_optional_fields(&self, input: &str) -> Result<String, ParseError> {
-        // Placeholder - deferred to Phase 9
+    /// Pass 5: Handle .? optional field access
+    /// `record.?field` → internal Try-producing function call
+    /// Placeholder for Phase 9 (records)
+    fn desugar_optional_field_access(&self, input: &str) -> Result<String, ParseError> {
         Ok(input.to_string())
     }
+
+    /// Pass 6: Handle ?: optional record fields
+    /// `field ?: Type` → mark field as optional in record
+    /// Placeholder for Phase 9 (records)
+    fn desugar_optional_record_fields(&self, input: &str) -> Result<String, ParseError> {
+        Ok(input.to_string())
+    }
+
 
     /// Save desugared output to temp file (debug builds)
     pub fn save_debug(&self, _original_path: &str, _desugared: &str) -> Result<(), std::io::Error> {
@@ -200,7 +204,7 @@ mod tests {
     fn test_desugar_simple_effect() {
         let input = "main! = |_args| \"hello\"".to_string();
         let desugarer = Desugarer::new(input);
-        let result = desugarer.desugar_effects(&desugarer.input).expect("Desugaring failed");
+        let result = desugarer.desugar_effect_arrows(&desugarer.input).expect("Desugaring failed");
 
         // IMPORTANT: ! is part of the identifier, NOT removed
         assert!(result.contains("main! ="));
@@ -210,7 +214,7 @@ mod tests {
     fn test_desugar_effect_type() {
         let input = "main! : Str => Result".to_string();
         let desugarer = Desugarer::new(input);
-        let result = desugarer.desugar_effects(&desugarer.input).unwrap();
+        let result = desugarer.desugar_effect_arrows(&desugarer.input).unwrap();
 
         // => should become ->
         assert!(result.contains("->"));
@@ -223,7 +227,7 @@ mod tests {
     fn test_desugar_multiple_effects() {
         let input = "echo! = |msg| Stdout.line!(msg)".to_string();
         let desugarer = Desugarer::new(input);
-        let result = desugarer.desugar_effects(&desugarer.input).unwrap();
+        let result = desugarer.desugar_effect_arrows(&desugarer.input).unwrap();
 
         // ! is part of function names, stays in place
         assert!(result.contains("echo!"));
