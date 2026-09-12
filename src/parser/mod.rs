@@ -47,8 +47,13 @@ impl Parser {
     }
 
     /// Parse expression (entry point)
-    /// Tries to parse: number, string, or identifier
+    /// Handles: let bindings, function calls, literals
     pub fn parse_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        self.parse_let_or_expr()
+    }
+
+    /// Parse let binding or regular expression
+    fn parse_let_or_expr(&mut self) -> Result<Expr<'static>, ParseError> {
         self.skip_whitespace();
 
         let rest = &self.input[self.pos..];
@@ -59,7 +64,124 @@ impl Parser {
             });
         }
 
-        // Try parsing in order: number (int/float), string, identifier
+        // Check for "let" keyword
+        if rest.starts_with("let ") {
+            self.pos += 4; // Skip "let "
+            self.skip_whitespace();
+
+            // Parse variable name
+            let rest = &self.input[self.pos..];
+            let (remaining, name_expr) = parse_ident_nom(rest)?;
+            self.pos += rest.len() - remaining.len();
+
+            let name = match name_expr {
+                Expr::Ident(n) => n,
+                _ => unreachable!(),
+            };
+
+            self.skip_whitespace();
+
+            // Expect "="
+            let rest = &self.input[self.pos..];
+            if !rest.starts_with('=') {
+                return Err(ParseError {
+                    message: "Expected '=' after variable name in let binding".to_string(),
+                    position: self.pos,
+                });
+            }
+            self.pos += 1;
+            self.skip_whitespace();
+
+            // Parse value expression
+            let value = Box::new(self.parse_primary_expr()?);
+
+            self.skip_whitespace();
+
+            // Expect "in"
+            let rest = &self.input[self.pos..];
+            if !rest.starts_with("in ") {
+                return Err(ParseError {
+                    message: "Expected 'in' after value in let binding".to_string(),
+                    position: self.pos,
+                });
+            }
+            self.pos += 3; // Skip "in "
+            self.skip_whitespace();
+
+            // Parse body expression
+            let body = Box::new(self.parse_let_or_expr()?);
+
+            Ok(Expr::Let { name, value, body })
+        } else {
+            self.parse_call_expr()
+        }
+    }
+
+    /// Parse function call or primary expression
+    fn parse_call_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        let mut expr = self.parse_primary_expr()?;
+
+        loop {
+            self.skip_whitespace();
+            let rest = &self.input[self.pos..];
+
+            // Check for function call
+            if rest.starts_with('(') {
+                self.pos += 1; // Skip '('
+                self.skip_whitespace();
+
+                let mut args = Vec::new();
+
+                // Parse arguments
+                let rest = &self.input[self.pos..];
+                if !rest.starts_with(')') {
+                    loop {
+                        args.push(self.parse_primary_expr()?);
+                        self.skip_whitespace();
+
+                        let rest = &self.input[self.pos..];
+                        if rest.starts_with(',') {
+                            self.pos += 1;
+                            self.skip_whitespace();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
+                self.skip_whitespace();
+                let rest = &self.input[self.pos..];
+                if !rest.starts_with(')') {
+                    return Err(ParseError {
+                        message: "Expected ')' after function arguments".to_string(),
+                        position: self.pos,
+                    });
+                }
+                self.pos += 1; // Skip ')'
+
+                expr = Expr::Call {
+                    func: Box::new(expr),
+                    args,
+                };
+            } else {
+                break;
+            }
+        }
+
+        Ok(expr)
+    }
+
+    /// Parse primary expression: number, string, or identifier
+    fn parse_primary_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+        self.skip_whitespace();
+
+        let rest = &self.input[self.pos..];
+        if rest.is_empty() {
+            return Err(ParseError {
+                message: "Unexpected end of input".to_string(),
+                position: self.pos,
+            });
+        }
 
         // Try number first
         if let Ok((remaining, expr)) = parse_number_nom(rest) {

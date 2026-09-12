@@ -9,6 +9,7 @@ pub struct StackFrame {
 }
 
 /// Environment with scope stack
+#[derive(Debug, Clone)]
 pub struct Environment {
     scopes: Vec<StackFrame>,
 }

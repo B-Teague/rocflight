@@ -2,6 +2,7 @@
 //!
 //! Phase 1: String evaluation
 //! Phase 2: Numbers, identifiers (partial)
+//! Phase 3: Lambdas, calls, let bindings
 
 use crate::ast::Expr;
 use crate::error::EvalError;
@@ -48,11 +49,39 @@ impl Evaluator {
             Expr::Int(n) => Ok(Value::Int(*n)),
             Expr::Float(f) => Ok(Value::Float(*f)),
             Expr::Ident(name) => {
-                // Phase 3 will add proper environment lookup
-                // For now, return an error
-                Err(EvalError {
-                    message: format!("Undefined variable: {}", name),
-                })
+                // Look up variable in environment
+                match self.env.lookup(name) {
+                    Some(val) => Ok(val),
+                    None => Err(EvalError {
+                        message: format!("Undefined variable: {}", name),
+                    }),
+                }
+            }
+            Expr::Call { func, args: _ } => {
+                // Phase 3: Basic calls not yet supported
+                // Phase 4 will add builtin functions and user-defined functions
+                match &**func {
+                    Expr::Ident(name) => {
+                        Err(EvalError {
+                            message: format!("Function '{}' not defined", name),
+                        })
+                    }
+                    _ => {
+                        Err(EvalError {
+                            message: "Function calls not yet supported".to_string(),
+                        })
+                    }
+                }
+            }
+            Expr::Let { name, value, body } => {
+                // Evaluate value
+                let val = self.eval(value)?;
+
+                // Bind in environment
+                self.env.bind(name, val);
+
+                // Evaluate body
+                self.eval(body)
             }
         }
     }

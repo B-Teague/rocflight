@@ -2,6 +2,7 @@
 //!
 //! Phase 1: String literals
 //! Phase 2: Numbers, identifiers
+//! Phase 3: Lambdas, calls, let bindings
 
 use std::fmt;
 
@@ -18,6 +19,17 @@ pub enum Expr<'a> {
     Float(f64),
     /// Identifier: x, main
     Ident(&'static str),
+    /// Function call: f(x) or add(1, 2)
+    Call {
+        func: Box<Expr<'a>>,
+        args: Vec<Expr<'a>>,
+    },
+    /// Let binding: let x = value in body
+    Let {
+        name: &'static str,
+        value: Box<Expr<'a>>,
+        body: Box<Expr<'a>>,
+    },
 }
 
 /// Part of a string interpolation
@@ -46,6 +58,19 @@ impl<'a> fmt::Display for Expr<'a> {
             Expr::Int(n) => write!(f, "{}", n),
             Expr::Float(n) => write!(f, "{}", n),
             Expr::Ident(name) => write!(f, "{}", name),
+            Expr::Call { func, args } => {
+                write!(f, "{}(", func)?;
+                for (i, arg) in args.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", arg)?;
+                }
+                write!(f, ")")
+            }
+            Expr::Let { name, value, body } => {
+                write!(f, "let {} = {} in {}", name, value, body)
+            }
         }
     }
 }

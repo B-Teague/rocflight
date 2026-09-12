@@ -1,6 +1,7 @@
 //! Type checking and inference
 //!
 //! Bidirectional type checking: synthesis (infer) + checking (verify)
+//! Phase 3: Lambdas, calls, let bindings
 
 use crate::ast::Expr;
 use crate::error::TypeError;
@@ -37,8 +38,41 @@ impl TypeChecker {
             Expr::Float(_) => Ok(Type::F64),     // Float literals default to F64
             Expr::Ident(_) => {
                 // For now, return a fresh type var for identifiers
-                // Phase 3 will add environment lookup
+                // Phase 4 will add environment lookup with actual types
                 Ok(self.fresh_var())
+            }
+            Expr::Call { func, args } => {
+                // Function type must be a function
+                let func_type = self.synth(func)?;
+
+                // For each argument, check it unifies with parameter type
+                let mut current_type = func_type;
+                for arg in args {
+                    match current_type {
+                        Type::Function(param_type, return_type) => {
+                            let arg_type = self.synth(arg)?;
+                            self.unify(&arg_type, &param_type)?;
+                            current_type = *return_type;
+                        }
+                        _ => {
+                            return Err(TypeError {
+                                message: format!("Cannot call non-function type: {}", current_type),
+                                expected: "function type".to_string(),
+                                actual: current_type.to_string(),
+                                line: 0,
+                                col: 0,
+                            })
+                        }
+                    }
+                }
+
+                Ok(current_type)
+            }
+            Expr::Let { value, body, .. } => {
+                // Type of let is the type of the body
+                // The value type must be compatible with how it's used in body
+                let _ = self.synth(value)?;
+                self.synth(body)
             }
         }
     }
