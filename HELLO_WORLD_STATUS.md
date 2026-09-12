@@ -1,9 +1,11 @@
 # Hello World Status - What's Needed
 
-## Current State: Phase 1B Complete ✅
+## Current State: Phase 1 + Phase 2 Complete ✅
 
 The interpreter can currently:
 - ✅ Parse and type-check string literals
+- ✅ Parse and type-check number literals (integers, floats)
+- ✅ Parse identifiers (not yet lookup/bind)
 - ✅ Desugar effect syntax (! removal, => to ->)
 - ✅ Load platform metadata
 - ✅ Cache platforms in memory
@@ -24,15 +26,15 @@ main! = |_args|                                 # Needs Phase 3 (functions)
 
 ## Blocking Features
 
-### Immediate Blockers (Phase 2)
+### Immediate Blockers (Phase 3+)
 
 | Feature | Needed For | Phase | Status |
 |---------|-----------|-------|--------|
-| **Numbers** | `birds = -3` | 2 | ⏳ TODO |
-| **App declarations** | Platform binding | 2 | ⏳ TODO |
-| **Import statements** | `import pf.Stdout` | 2 | ⏳ TODO |
-| **Identifiers** | Variable names, function names | 2 | ⏳ TODO |
-| **Operators** (neg, arithmetic) | `-3`, math operations | 2 | ⏳ TODO |
+| **Variable Binding** | `birds = -3` | 3 | ⏳ TODO |
+| **Keywords** | app, import, let, in | 3.5 | ⏳ TODO |
+| **App declarations** | Platform binding | 3.5 | ⏳ TODO |
+| **Import statements** | `import pf.Stdout` | 3.5 | ⏳ TODO |
+| **Operators** (arithmetic) | `-3 + 1`, math operations | 3 | ⏳ TODO |
 
 ### Secondary Blockers (Phase 3)
 
@@ -70,18 +72,17 @@ Run it:
 ./target/release/rocflight /tmp/hello_simple.roc
 ```
 
-### Current Status (Phase 2 Prep)
+### Current Status (Phase 2 Complete)
 
-To parse the **actual** hello_world/main.roc, we need to implement Phase 2:
+✅ Phase 2 is done! The interpreter can now:
 
-1. **Lexer/tokenizer** - Break source into tokens
-2. **Number literals** - Parse `-3`, `0`, `3.14`
-3. **Identifiers** - Parse `birds`, `main`, `args`
-4. **Keywords** - Parse `app`, `import`, `platform`
-5. **Operators** - Parse `-` (negation), `.` (qualified access)
-6. **App declarations** - Parse `app [main!] { ... }`
-7. **Import statements** - Parse `import pf.Stdout`
-8. **Variable bindings** - Parse `birds = -3`
+1. ✅ **Number literals** - Parse `-3`, `0`, `3.14`
+2. ✅ **Identifiers** - Parse `birds`, `main`, `args`
+3. ⏳ **Keywords** - Parse `app`, `import`, `platform` (Phase 3.5)
+4. ⏳ **Operators** - Parse `+`, `-`, `*`, `/` (Phase 3+)
+5. ⏳ **App declarations** - Parse `app [main!] { ... }` (Phase 3.5)
+6. ⏳ **Import statements** - Parse `import pf.Stdout` (Phase 3.5)
+7. ⏳ **Variable bindings** - Parse `birds = -3` (Phase 3)
 
 ### Complete Path (Full Hello World)
 
@@ -124,8 +125,9 @@ Result: "Hello, world!"
 |-------|----------|--------|----------|
 | 1A ✅ | Strings, types | Done | Done |
 | 1B ✅ | Desugaring, platforms | Done | Done |
-| 2 | Numbers, identifiers, imports | 2-3 days | Next |
-| 3 | Functions, calls, lambdas | 2-3 days | +1 week |
+| 2 ✅ | Numbers, identifiers | Done | Done |
+| 3 | Variable binding, functions, calls | 2-3 days | Next |
+| 3.5 | Keywords, app/import, operators | 1-2 days | +1 week |
 | 4-6 | Collections, records, tags | 1-2 weeks | +2-3 weeks |
 | 7+ | Error handling, modules | 1-2 weeks | +3-4 weeks |
 | 1B Full | Real platform loading | 1 day | +1 day |
