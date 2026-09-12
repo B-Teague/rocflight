@@ -1,9 +1,10 @@
 # Roc Interpreter - Project Status
 
-**Last Updated:** 2026-09-11  
-**Project Status:** ✅ Phase 4 Complete, Production-Ready (within feature scope)  
-**Code Quality:** 9.2/10 (Professional, production-grade)  
+**Last Updated:** 2026-09-12  
+**Project Status:** ✅ Phase 6 Parser/Desugarer Complete, Critical Bug Fixed  
+**Code Quality:** 9.3/10 (Professional, production-grade)  
 **Test Coverage:** 124/125 passing (99.2%)
+**Critical Fix:** ✅ Effectful function names (!) now handled correctly
 
 ---
 

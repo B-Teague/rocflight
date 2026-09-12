@@ -260,6 +260,30 @@ Result: Complete AST ready for type checking
 
 ---
 
+## Critical Fix: Effectful Function Names
+
+**Issue Found & Fixed (Phase 6):**
+The desugarer was incorrectly removing `!` from function names:
+- `echo!` was becoming `echo` (breaking code!)
+- `main!` was becoming `main` (syntax error!)
+
+**The Truth About `!` in Roc:**
+The `!` is **NOT syntactic sugar to be removed**. It's **part of the identifier name itself**.
+- Effectful functions are literally named with a `!` suffix
+- `echo!` is a different function from `echo`
+- `main!` is a different function from `main`
+- This is how Roc marks functions that perform effects (I/O, state, etc.)
+
+**Correct Desugaring:**
+Only convert effect type arrows: `=>` → `->`
+- ✅ `main! : Str => Result` becomes `main! : Str -> Result`
+- ✅ `echo!("hello")` stays as `echo!("hello")`
+- ❌ Never remove the `!` from identifiers
+
+This fix ensures effectful functions can be called correctly in Roc code.
+
+---
+
 ## Golden Rules Applied
 
 ### ✅ Rule 1: Handle Every Error Intentionally
