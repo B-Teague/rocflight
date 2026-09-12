@@ -4,6 +4,23 @@
 
 ---
 
+## 🏛️ Golden Rules for This Project
+
+These principles guide all code improvements and implementation:
+
+1. **Handle every error intentionally** — No silent failures, no unwrap() without justification
+2. **Clone only when you have a reason** — Avoid unnecessary allocations; use references when possible
+3. **Don't fight ownership; simplify the design instead** — If borrow checker is hard, redesign, don't hack
+4. **Make invalid states impossible to represent** — Use types and newtypes to prevent bugs at compile time
+5. **Let exhaustive matching protect your assumptions** — Match all cases; don't use unreachable!()
+6. **Borrow when you don't need ownership** — Prefer `&T` over `T` unless transfer is needed
+7. **Express intent rather than implementation mechanics** — Clear function names beat clever code
+8. **Understand and measure performance before optimizing** — No premature optimization; profile first
+9. **Keep unsafe code tiny and justified** — Current: transmute in lambda handling (1 place, marked with SAFETY comment)
+10. **Choose simple, boring code over clever abstractions** — Readability and maintainability > cleverness
+
+---
+
 ## PHASE 1: CRITICAL FIXES (Must Do)
 
 ### Fix 1: Enable Type Checking (30 min)
