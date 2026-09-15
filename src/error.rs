@@ -86,6 +86,43 @@ pub struct EvalError {
 }
 
 impl EvalError {
+    /// The message `break` unwinds with.
+    ///
+    /// `break` needs a non-local exit to the nearest enclosing loop. Riding the error
+    /// channel keeps the evaluator's signature as `Result<Value, EvalError>` instead
+    /// of threading a control-flow enum through every arm — a loop catches this and
+    /// stops, anything else propagates it, so a `break` outside a loop surfaces as an
+    /// ordinary error rather than vanishing.
+    ///
+    /// The leading NUL cannot collide with a real message: every other one is built
+    /// with `format!` from printable text.
+    const BREAK: &'static str = "\u{0}break";
+
+    /// The message `return` unwinds with. Same mechanism as `break`, but caught at the
+    /// function boundary rather than the loop. The returned VALUE travels on the
+    /// evaluator, since an error carries only a message.
+    const RETURN: &'static str = "\u{0}return";
+
+    /// The signal `break` raises.
+    pub fn break_signal() -> Self {
+        EvalError { message: Self::BREAK.to_string() }
+    }
+
+    /// The signal `return` raises.
+    pub fn return_signal() -> Self {
+        EvalError { message: Self::RETURN.to_string() }
+    }
+
+    /// Is this the `return` signal rather than a real failure?
+    pub fn is_return(&self) -> bool {
+        self.message == Self::RETURN
+    }
+
+    /// Is this the `break` signal rather than a real failure?
+    pub fn is_break(&self) -> bool {
+        self.message == Self::BREAK
+    }
+
     /// Create a new evaluation error
     pub fn new(message: impl Into<String>) -> Self {
         EvalError {

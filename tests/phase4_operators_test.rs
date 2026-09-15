@@ -89,7 +89,7 @@ mod phase4_tests {
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
         if let Value::Str(s) = result {
-            assert_eq!(s, "helloworld");
+            assert_eq!(&*s, "helloworld");
         } else {
             panic!("Expected string result");
         }
@@ -102,10 +102,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -115,10 +116,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 0); // False
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(!b, "expected false"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -128,10 +130,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -141,10 +144,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -154,10 +158,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 0); // False
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(!b, "expected false"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -167,10 +172,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -180,10 +186,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -193,10 +200,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -207,10 +215,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -220,10 +229,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 0); // False
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(!b, "expected false"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -233,10 +243,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -246,10 +257,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 0); // False
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(!b, "expected false"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -273,10 +285,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // (2 + 3) > 4 = 5 > 4 = true
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.  // (2 + 3) > 4 = 5 > 4 = true
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -286,10 +299,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // (2 < 3) && (4 < 5) = true && true = true
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1. (2 < 3) && (4 < 5) = true && true.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -313,10 +327,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -410,10 +425,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // All true
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1. All three comparisons hold.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -451,10 +467,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 
@@ -464,10 +481,11 @@ mod phase4_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        if let Value::Int(n) = result {
-            assert_eq!(n, 1); // True
-        } else {
-            panic!("Expected int result");
+        match result {
+            // Roc's comparison and logical operators yield Bool,
+            // not 0/1.
+            Value::Bool(b) => assert!(b, "expected true"),
+            other => panic!("expected Bool, got {:?}", other),
         }
     }
 }

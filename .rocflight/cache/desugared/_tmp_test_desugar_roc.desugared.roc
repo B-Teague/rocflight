@@ -1,1 +1,0 @@
-test = |_args| match Echo.line("hello") { Ok(v) => v, Err(e) => return Err(e) }

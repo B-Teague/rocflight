@@ -91,6 +91,31 @@ pub fn clear_cache() {
     cache.clear();
 }
 
+/// Serialises tests that touch the process-global cache.
+///
+/// `clear_cache()` wipes every entry, and cargo runs a test binary's tests on
+/// parallel threads — so one test's clear lands in the middle of another's
+/// assertions. That made `test_multiple_platforms_in_cache` fail about one run in
+/// three. Every test that reads or writes the global cache takes this lock;
+/// tests using `PlatformLoader::load()` (which does not cache) need nothing.
+///
+/// ponytail: a single global test lock, not per-URL isolation. Fine while the
+/// cache is one map and the tests are microseconds long. If these tests ever get
+/// slow, give each test its own URL namespace and drop the `clear_cache()` calls
+/// instead — then they need no lock at all.
+#[cfg(test)]
+static TEST_CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+/// Take the global-cache test lock, ignoring poisoning.
+///
+/// A failing test panics while holding the lock. Without recovering from poison,
+/// every subsequent test fails with `PoisonError` and hides which one actually
+/// broke.
+#[cfg(test)]
+pub(crate) fn lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_CACHE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +170,7 @@ mod tests {
 
     #[test]
     fn test_global_cache() {
+        let _guard = lock_for_test();
         clear_cache();
 
         let platform = create_test_platform();

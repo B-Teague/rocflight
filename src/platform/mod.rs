@@ -14,6 +14,9 @@
 pub mod loader;
 pub mod cache;
 pub mod module;
+pub mod host;
+pub mod real;
+pub mod resolve;
 
 pub use loader::PlatformLoader;
 pub use cache::PlatformCache;

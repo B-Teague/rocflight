@@ -31,12 +31,118 @@ pub enum Type {
     List(Box<Type>),
     /// Function type: (A -> B)
     Function(Box<Type>, Box<Type>),
+    /// Empty record `{}` — Roc's unit type.
+    Unit,
+    /// Record type: `{ x: I64, y: Str }`. Sorted by field name so two records with
+    /// the same fields in different source order unify.
+    /// Record type. `open` means "at least these fields" — `{ name: Str, .. }` — so
+    /// a record carrying extras still fits. A closed record is exactly its fields.
+    Record { fields: Vec<(String, Type)>, open: bool },
+    /// An OPTIONAL record field, declared `name ?: Type`.
+    ///
+    /// The field may genuinely be absent, so a record without it still matches. Read
+    /// with `.?name`, which yields `Ok(value)` or `Err(MissingField)`.
+    ///
+    /// Distinct from a DEFAULTED field (`name : Type ?? default`), which is filled in
+    /// at construction and is therefore always present.
+    Optional(Box<Type>),
+    /// A nominal type declared with `Name := backing`.
+    ///
+    /// Distinct from every OTHER nominal, even one with an identical backing type —
+    /// that distinctness is the whole point. It is not opaque, though: roc accepts the
+    /// backing type where the nominal is expected (`f({ x: 1 })` for `f : Point -> _`),
+    /// so unification falls through to the backing when only one side is nominal.
+    Nominal { name: String, backing: Box<Type> },
+    /// The type of a range expression. Opaque, like roc's.
+    Range,
+    /// Tuple type: `(Str, I64)`. Positional, so element order is part of the type.
+    Tuple(Vec<Type>),
+    /// Tag union type: `[Red, Green]`, `[Foo(I64, Str), Bar]`, `[Exit(I8), ..]`.
+    ///
+    /// Each entry is a tag name and its payload types (empty for a bare tag).
+    /// Sorted by tag name so declaration order does not affect unification.
+    ///
+    /// `open` distinguishes the two kinds that matter:
+    /// * **closed** (`open: false`) — written out in an annotation. A value may only
+    ///   use tags from the list, and a `match` must cover all of them.
+    /// * **open** (`open: true`) — inferred from a tag expression, or written with a
+    ///   trailing `..`. More tags may be added by unification, and a `match` needs a
+    ///   wildcard to be exhaustive.
+    TagUnion { tags: Vec<(String, Vec<Type>)>, open: bool },
+}
+
+impl Type {
+    /// A record whose fields are exactly these. The common case — an open record only
+    /// comes from an annotation that writes `..`.
+    pub fn closed_record(fields: Vec<(String, Type)>) -> Type {
+        Type::Record { fields, open: false }
+    }
+
+    /// Is this one of the integer types?
+    ///
+    /// Used for numeric-literal polymorphism: `255` may be a U8, an I64, or any other
+    /// integer, and only its context decides which.
+    pub fn is_integer(&self) -> bool {
+        matches!(
+            self,
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+                | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128
+        )
+    }
+
+    /// Is this one of the fractional types? `Dec` counts.
+    pub fn is_fractional(&self) -> bool {
+        matches!(self, Type::F32 | Type::F64 | Type::Dec)
+    }
+
+    /// Is this any numeric type at all?
+    pub fn is_numeric(&self) -> bool {
+        self.is_integer() || self.is_fractional()
+    }
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Type::Str => write!(f, "Str"),
+            Type::Unit => write!(f, "{{}}"),
+            Type::Range => write!(f, "Range"),
+            Type::Optional(inner) => write!(f, "{}?", inner),
+            Type::Nominal { name, .. } => write!(f, "{}", name),
+            Type::Tuple(items) => {
+                let rendered: Vec<String> = items.iter().map(|t| t.to_string()).collect();
+                write!(f, "({})", rendered.join(", "))
+            }
+            Type::TagUnion { tags, open } => {
+                let rendered: Vec<String> = tags
+                    .iter()
+                    .map(|(name, payload)| {
+                        if payload.is_empty() {
+                            name.clone()
+                        } else {
+                            let args: Vec<String> =
+                                payload.iter().map(|t| t.to_string()).collect();
+                            format!("{}({})", name, args.join(", "))
+                        }
+                    })
+                    .collect();
+                if *open {
+                    write!(f, "[{}, ..]", rendered.join(", "))
+                } else {
+                    write!(f, "[{}]", rendered.join(", "))
+                }
+            }
+            Type::Record { fields, open } => {
+                if fields.is_empty() {
+                    return write!(f, "{}", if *open { "{ .. }" } else { "{}" });
+                }
+                let mut rendered: Vec<String> =
+                    fields.iter().map(|(k, t)| format!("{}: {}", k, t)).collect();
+                if *open {
+                    rendered.push("..".to_string());
+                }
+                write!(f, "{{ {} }}", rendered.join(", "))
+            }
             Type::U8 => write!(f, "U8"),
             Type::U16 => write!(f, "U16"),
             Type::U32 => write!(f, "U32"),

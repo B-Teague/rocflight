@@ -266,7 +266,10 @@ Result: Complete AST ready for type checking
 Initial misunderstanding about `!` - it was thought to be part of the function name.
 
 **The Truth About `!` in Roc:**
-The `!` is **NOT part of the identifier name** - it's a **postfix operator** marking effectful functions.
+The `!` **IS part of the identifier name** — upstream's `chompIdentGeneral`
+(`roc-compiler/src/parse/tokenize.zig`) chomps it into the ident, so `echo!` is
+one token. It is not an operator. `parse_identifier` takes a trailing `!`,
+guarding only against `!=`.
 - `echo!("hello")` means "call echo and handle the Result it returns"
 - `main!` means "main returns a Try/Result type"
 - During desugaring, `!` is **REMOVED** and replaced with error handling
@@ -287,7 +290,7 @@ echo("hello")
 main = |_args| { ... }
 
 # After Pass 4 (full desugaring):
-match echo("hello") { Ok(v) => v, Err(e) => return Err(e) }
+echo!("hello")   # unchanged — `echo!` is the function's name
 main = |_args| { ... }
 ```
 
@@ -399,7 +402,7 @@ The Roc interpreter now features:
 - ✅ Pass 1: Type annotation removal - COMPLETE
 - ✅ Pass 2: Effect arrows + effectful call wrapping - COMPLETE
   - Converts `=>` to `->`
-  - Wraps `identifier!(args)` in `match expr { Ok(v) => v, Err(e) => return Err(e) }`
+  - Leaves `identifier!(args)` alone — `!` is part of the name, not sugar
   - Handles nested calls and module-qualified functions
 - ⏳ Passes 3-6: Error propagation `?`, defaults `??`, optional fields - Ready for implementation
 - ✅ Complete documentation in DESUGARING.md

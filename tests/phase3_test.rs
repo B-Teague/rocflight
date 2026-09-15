@@ -97,8 +97,10 @@ mod phase3_tests {
         let mut checker = TypeChecker::new();
         let ty = checker.synth(&expr).expect("Failed to infer type");
 
-        // Let binding has type of body
-        assert_eq!(ty.to_string(), "$0");
+        // The let's type is its body's type, and the body is `x` — which the type
+        // environment now knows is an I64. This used to be an opaque `$0`, because
+        // every identifier synthesised to a fresh variable.
+        assert_eq!(ty.to_string(), "I64");
     }
 
     #[test]

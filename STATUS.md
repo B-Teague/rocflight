@@ -39,12 +39,13 @@ The interpreter features:
 
 ## 🔄 Desugaring Pipeline
 
-Every Roc source file undergoes 7 transformation passes before parsing:
+Every Roc source file passes through the desugarer before parsing. The emitted file
+is written to `.rocflight/cache/desugared/` and must itself pass `roc check`.
 
 | Pass | Transformation | Status | Phase |
 |------|---|---|---|
-| 1 | Remove type annotations | ✅ Done | 1 |
-| 2 | Convert `=>` to `->` in types | ✅ Done | 1 |
+| 1 | Type annotations | ✅ **Preserved** — deleting them made the output un-compilable | 1 |
+| 2 | `=>` in types | ✅ **Left alone** — `=>` is the effect arrow and the `match` arm separator, never `->` | 1 |
 | 3 | Expand `??` operator to match | ⏳ Placeholder | 7 |
 | 4 | Expand `?` operator to match | ⏳ Placeholder | 7 |
 | 5 | Transform `.?` field access | ⏳ Placeholder | 9 |

@@ -44,7 +44,7 @@ mod phase5_tests {
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
         if let Value::Str(s) = result {
-            assert_eq!(s, "hello");
+            assert_eq!(&*s, "hello");
         } else {
             panic!("Expected string result from lambda call");
         }
@@ -86,7 +86,7 @@ mod phase5_tests {
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
         if let Value::Str(s) = result {
-            assert_eq!(s, "Value: test");
+            assert_eq!(&*s, "Value: test");
         } else {
             panic!("Expected string result from lambda with interpolation");
         }
@@ -124,7 +124,7 @@ mod phase5_tests {
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
         if let Value::Str(s) = result {
-            assert_eq!(s, "nested");
+            assert_eq!(&*s, "nested");
         } else {
             panic!("Expected string result");
         }
@@ -140,7 +140,7 @@ mod phase5_tests {
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
         if let Value::Str(s) = result {
-            assert_eq!(s, "test");
+            assert_eq!(&*s, "test");
         } else {
             panic!("Expected string result");
         }

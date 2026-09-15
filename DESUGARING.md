@@ -10,56 +10,87 @@ This keeps the parser simple and makes the AST clean and unambiguous.
 
 Every Roc source file undergoes desugaring in this order:
 
-1. **Type Annotations** — Remove type annotations on separate lines
-2. **Effect Type Arrows** — Convert `=>` to `->` in type signatures
-3. **Error Propagation** — Expand `expr?` to match expression
-4. **Default Values** — Expand `expr ?? default` to match expression  
-5. **Optional Field Access** — Expand `.?field` to Try-producing call
-6. **Optional Record Fields** — Mark fields with `?:` as optional
+1. **Type Annotations** — *preserved verbatim* (Rule 1). The parser skips them.
+2. **Effect Type Arrows** — `=>` *left alone* (Rule 2). It is never `->`.
+3. **Error Propagation** (`?`) and **Default Values** (`??`) — done in the PARSER,
+   not here. `??` needs its operand's extent; `?` has to move the rest of the block
+   into the `Ok` arm, which raw-text substitution cannot locate reliably. See
+   `Parser::propagate_error`.
+4. **Optional Field Access** (`.?`) — implemented in the parser as `Expr::OptionalField`;
+   yields `Ok(value)` or `Err(MissingField)`. It is NOT sugar for a match: the presence
+   test happens at run time.
+5. **Optional Record Fields** (`?:`) — implemented as `Type::Optional` on a nominal's
+   backing record. A record without the field still unifies.
 
-**Result:** Clean, verbose, unambiguous code ready for the parser.
+**Result:** valid Roc with its types explicit — code that passes `roc check` on its
+own, not merely something the parser can read. Passes 1 and 2 are deliberate
+no-ops; they are listed because both used to transform and both were wrong.
 
 ---
 
-## Rule 1: Type Annotations
+## Rule 1: Type Annotations — PRESERVED, not removed
 
-**Problem:** Roc allows type annotations on separate lines from bindings:
+Roc allows annotations on their own line:
 ```roc
 x : I64
 x = 42
 ```
 
-**Desugaring:** Remove the type annotation line, keep only the binding:
-```roc
-x = 42
-```
+**Desugaring: none. The annotation is kept verbatim.**
 
-**Why:** The type checker will infer the type. Annotations are metadata, not needed for AST construction.
+The desugared file is a real Roc program that must pass `roc check` on its own, with
+its types explicit — that is the whole reason the file exists (see
+PHASE_IMPLEMENTATION_GUIDE.md, "The golden-pair rule"). Deleting annotations made
+the emitted file un-compilable and threw away exactly the type information the
+desugared form is supposed to state.
 
-**Implementation:**
-- Remove lines matching pattern: `identifier : Type` when followed by `identifier = value`
-- Keep the binding line
+**Skipping annotations is the parser's job**, not the desugarer's:
+`Parser::skip_type_annotation`.
+
+### What this reversed
+
+Pass 0 used to delete `identifier : Type` whenever `identifier = value` followed. It
+is now a documented no-op. Two things learned when it changed:
+
+- An annotation is `name : Type` — whitespace before the colon. A record field is
+  `name: value`. The parser needs that distinction or it eats record fields.
+- A missed annotation line **truncates the top-level binding chain**: the binding
+  after it never gets parsed. This showed up as `main!` being an "Undefined
+  variable" whenever anything annotated sat above it. `Parser::skip_trivia` handles
+  whitespace, comments and annotations together so there is one place to get right.
 
 ---
 
-## Rule 2: Effect Type Arrows
+## Rule 2: Effect Type Arrows — NOT desugared
 
-**Problem:** Effect types use `=>` to indicate "returns an Effect":
+`=>` is the effectful-function arrow:
 ```roc
-main! : List(Str) => Try({}, [Exit(I32)])
+main! : List(Str) => Try({}, [Exit(I8), ..])
 ```
 
-**Desugaring:** Convert `=>` to `->` (effect info is in the return type):
+**Desugaring: none. `=>` is never rewritten to `->`.**
+
+This rule previously said to replace `=>` with `->` "because the parser only
+understands `->`". That is backwards: `=>` carries the effectfulness, and `->` means
+a pure function. Rewriting it discards the distinction the annotation exists to
+make, and contradicts Rule 7 below.
+
+`=>` also appears as the **arm separator in `match`**, so a blind text replacement
+corrupts every match expression in the file:
+
 ```roc
-main! : List(Str) -> Try({}, [Exit(I32)])
+match color {
+    Red => "red"        # not a function type
+}
 ```
 
-**Why:** The parser only understands `->` for function types. The `Try` type itself marks it as effectful.
+The parser skips annotations entirely (Rule 1), so it never needs to understand
+either arrow in a type position.
 
-**Implementation:**
-- Find `=>` outside strings
-- Replace with `->`
-- Only in type contexts (between `:` and `=`)
+**Note the entry-point type**: the default host requires
+`List(Str) => Try(_a, [Exit(I8), ..])` — `Exit(I8)`, not `Exit(I32)`, and `Try`, not
+`Result` (`Result` is not in scope at all). Verified with `roc check` on
+nightly-2026-09-03.
 
 ---
 
@@ -243,38 +274,50 @@ Config := {
 
 ---
 
-## Rule 7: Effectful Function Marker (!) - REMOVED
+## Rule 7: Effectful Function Marker (!) — NOT DESUGARING
 
-**Critical:** The `!` suffix is **NOT** part of the function name - it's a postfix operator!
+**Critical:** the `!` suffix **IS part of the function name.** It is not an
+operator and not sugar. There is nothing to desugar.
 
-**What it means:** Functions marked with `!` return a `Try/Result` type (they're effectful).
+Upstream (`roc-compiler/src/parse/tokenize.zig`, `chompIdentGeneral`) chomps
+`!` straight into the identifier — `echo!` is a single `LowerIdent` token.
+Naming an effectful binding without `!` is only a warning
+(`roc-compiler/src/check/problem/types.zig`, `EffectfulFunctionName`).
 
-**Desugaring:** Remove the `!` from all function names and calls:
 ```roc
-# Before:
+# Before and after desugaring — identical:
 echo!("hello")
 main! = |_args| { ... }
-
-# After (! removed):
-echo("hello")
-main = |_args| { ... }
 ```
 
-**Why:** The `!` is syntactic sugar that marks a function as performing effects. The actual function name doesn't include it. Full error handling wrapping happens in Pass 4.
+Do **not** strip the `!`, and do **not** wrap `!` calls in error handling.
+`!` says nothing about whether a call returns `Try`; effectfulness lives in the
+type (`=>`), and error propagation is the `?` operator's job (Rule 1).
 
-**Example:**
+### Related things that are also not this
+
+| Syntax | What it is | Handled where |
+|---|---|---|
+| `!foo` | unary logical not | upstream canonicalizes to a `Bool.not` call (`roc-compiler/src/base/mod.zig`, `CalledVia.unary_op`) |
+| `a != b` | not-equals operator | its own token (`OpNotEquals`) |
+| `=>` in an annotation | effectful function type | the type checker (`fn_effectful`); it is **not** `->` |
+| `=>` in a `match` arm | arm separator | the parser; also **not** `->` |
+
+### Regression this replaces
+
+An earlier version of Pass 2 scanned for `!` character by character and emitted
+Rust into `.roc` output:
+
 ```roc
-# Before desugaring:
-result = echo!("message")
-
-# After full desugaring (Pass 4 adds error wrapping):
-result = match echo("message") {
-    Ok(v) => v
-    Err(e) => return Err(e)
-}
+# What it produced for `echo!("hello")` — not Roc:
+match echo("hello") { Ok(v) => v, Err(e) => return Err(e) }
 ```
 
-The `!` tells the parser "this call returns Try, wrap it in error handling," but it's not part of the identifier itself.
+Roc's match arms are newline-separated, `echo!` has no `Ok`/`Err` to match on,
+and the same pass collapsed `a != b` into `a = b`, deleted unary `!` (inverting
+the logic), and rewrote every `match` arm's `=>` to `->`. When desugaring a
+construct, check what the Zig compiler actually does with it first — the target
+is always Roc source or a Roc builtin.
 
 ---
 
@@ -293,7 +336,7 @@ parse_config = |input| {
 
 **After Desugaring:**
 ```roc
-parse_config : Str -> Try(Config, ParseErr)
+parse_config : Str => Try(Config, ParseErr)   # `=>` is unchanged
 parse_config = |input| {
     host = match input.?host {
         Ok(v) => v
@@ -317,25 +360,10 @@ Wait, this is getting nested and complex. The actual desugaring needs careful se
 
 ## Implementation Notes
 
-### Parsing Order (Pass 2: Effect Arrows and ! Wrapping)
+### Pass 2 (removed)
 
-**Algorithm:**
-1. Scan input character by character
-2. When encountering `!`:
-   - Lookahead to see if `(` follows
-   - If YES: this is `identifier!(...)`
-     - Scan backwards to find identifier start
-     - Parse forward to find matching closing `)`
-     - Wrap the entire call: `match id(...) { Ok(v) => v, Err(e) => return Err(e) }`
-   - If NO: just a definition mark, remove `!`
-3. Simultaneously convert `=>` to `->`
-
-**Edge Cases Handled:**
-- Nested function calls: `func1!(func2!(x))`
-- Multiple arguments with commas
-- String literals and escapes inside arguments
-- Module-qualified calls: `Module.function!(args)`
-- Nested parens in arguments: `func!((1 + 2))`
+There is no effect-arrow or `!`-wrapping pass. `!` is part of the identifier and
+`=>` is meaningful where it appears, so both pass through untouched. See Rule 7.
 
 ### Remaining Passes
 
@@ -367,11 +395,18 @@ Each desugaring rule must have tests showing:
 3. Edge cases (multiple occurrences, nesting, etc.)
 4. Interaction with other rules
 
-Example test:
+Example test — note the Roc arm syntax: newline-separated, no commas:
 ```
 Input: "x = risky()?"
-Expected: "x = match risky() { Ok(v) => v, Err(e) => return Err(e) }"
+Expected:
+    x = match risky() {
+        Ok(v) => v
+        Err(e) => return Err(e)
+    }
 ```
+
+Every expected output must be valid Roc. If an expectation would not parse with
+the compiler in `roc-compiler/`, the expectation is the bug.
 
 ---
 
@@ -380,12 +415,12 @@ Expected: "x = match risky() { Ok(v) => v, Err(e) => return Err(e) }"
 | Rule | Status | Implementation |
 |------|--------|-----------------|
 | 1. Type Annotations | ✅ Done | `remove_type_annotations()` |
-| 2. Effect Arrows + ! Wrapping | ✅ Done | `desugar_effect_arrows()` - wraps `!` calls in match, converts `=>` to `->` |
+| 2. Effect Arrows + ! Wrapping | ⛔ Removed | Was never desugaring — see Rule 7 |
 | 3. Error Propagation `?` | ❌ Placeholder | Needs full implementation |
 | 4. Default Values `??` | ❌ Placeholder | Needs full implementation |
 | 5. Optional Field Access `.?` | ❌ Placeholder | Needs full implementation |
 | 6. Optional Record Fields | ❌ Placeholder | Needs full implementation |
-| 7. Effectful Calls `!` Wrapping | ✅ Done | Pattern: `id!(...) → match id(...) { Ok(v) => v, Err(e) => return Err(e) }` |
+| 7. Effectful Marker `!` | ⛔ Not desugaring | `!` is part of the identifier; pass it through |
 
 ---
 

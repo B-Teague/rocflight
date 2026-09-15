@@ -10,6 +10,25 @@
 mod phase1b_platform_tests {
     use rocflight::platform::{PlatformLoader, PlatformModule, ModuleExport};
     use rocflight::platform::cache::{clear_cache, get_platform};
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serialises the tests that touch the process-global platform cache.
+    ///
+    /// `clear_cache()` wipes every entry, and cargo runs this binary's tests on
+    /// parallel threads, so one test's clear used to land mid-assertion in another —
+    /// `test_multiple_platforms_in_cache` failed about one run in three.
+    ///
+    /// This is a separate process from the lib's own unit tests, with its own copy of
+    /// the global cache, so a lock local to this file covers exactly the right set.
+    /// Tests that use `PlatformLoader::load()` do not cache and need no lock.
+    static CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the cache lock, ignoring poisoning: a failing test panics while holding
+    /// it, and without this every later test would fail with `PoisonError` and hide
+    /// which one actually broke.
+    fn lock_cache() -> MutexGuard<'static, ()> {
+        CACHE_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn test_platform_loader_creation() {
@@ -49,14 +68,16 @@ mod phase1b_platform_tests {
         let platform = loader.load().expect("Failed to load platform");
         let stdout = platform.get_module("Stdout").expect("Stdout not found");
 
-        // The desugarer removes !, so we look for "line" not "line!"
-        let line_export = stdout.get_export("line").expect("line export not found");
+        // `!` is part of the identifier, so the export is named "line!"
+        let line_export = stdout.get_export("line!").expect("line! export not found");
 
         match line_export {
             ModuleExport::Function { name, type_sig } => {
-                assert_eq!(name, "line");
+                assert_eq!(name, "line!");
                 assert!(type_sig.contains("Str"));
-                assert!(type_sig.contains("Result"));
+                // `=>` marks it effectful. It returns `{}`, not a Result —
+                // `!` says nothing about the return type.
+                assert!(type_sig.contains("=>"), "not effectful: {}", type_sig);
             }
             _ => panic!("Expected function export"),
         }
@@ -77,6 +98,7 @@ mod phase1b_platform_tests {
 
     #[test]
     fn test_platform_caching() {
+        let _guard = lock_cache();
         clear_cache();
 
         let loader = PlatformLoader::new(
@@ -113,6 +135,7 @@ mod phase1b_platform_tests {
 
     #[test]
     fn test_multiple_platforms_in_cache() {
+        let _guard = lock_cache();
         clear_cache();
 
         let loader1 = PlatformLoader::new(

@@ -1,267 +1,150 @@
-# ROC INTERPRETER IMPLEMENTATION PLAN (v2)
-## Full Type Checking + Memory Optimizations from Phase 1
+# Roc Interpreter Implementation Plan (v3)
+
+Architecture and design. The feature list is in
+[IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md); the per-feature workflow is in
+[PHASE_IMPLEMENTATION_GUIDE.md](PHASE_IMPLEMENTATION_GUIDE.md).
+
+**Verified against:** `roc` nightly-2026-09-03-62fcb65. Facts here were checked by
+running the compiler and its LSP, not recalled.
 
 ---
 
-## CRITICAL REQUIREMENT: Type Verification with Roc REPL
+## Ground truth comes from the compiler, per feature
 
-**Before implementing each phase, ALWAYS verify type signatures using the roc repl:**
+Before implementing anything, pin the real types. Never from memory — Roc's type
+system is subtle in exactly the places that matter (`Dec` vs `I64`, effect arrows,
+nominal `Try`), and a wrong assumption costs a rewrite of the parser arm that
+encodes it.
+
+Two tools, in order of usefulness:
+
+**1. The LSP** — exact types for a real file, which is how `echo!`'s signature was
+established:
 
 ```bash
-# Start roc repl
-roc repl
-
-# Example: check type of variable binding
-birds : I64
-birds = -3
-
-# Check string conversion function
-num_str : Str
-num_str = I64.to_str(42)
-
-# Type check complex expressions interactively
+roc experimental-lsp --stdio        # drive over JSON-RPC
 ```
 
-**Why this matters:**
-- Roc's type system is subtle (Dec vs I64, function arity, effects)
-- REPL gives exact type signatures with location info
-- Prevents implementing wrong types that won't match real Roc
-- Saves rework later when testing against actual Roc code
+`textDocument/hover` gives the type at a position, `textDocument/completion` gives
+a `detail` per symbol, `textDocument/inlayHint` annotates a whole file. It reports
+`hoverProvider`, `definitionProvider`, `inlayHintProvider`, `completionProvider`
+among its capabilities.
 
-**Reference file for all syntax:**
-- `/home/brian/Code/rocflight/roc-compiler/test/echo/all_syntax_test.roc` - comprehensive syntax examples
-- Use `roc check <file>` to verify type correctness before implementing parser/type checker
+**2. Deliberately wrong annotations.** `roc check` names the type it expected,
+which is faster than guessing:
 
----
-
-## GOAL: Run hello_world/main.roc
-
-**Target File:** `/home/brian/Code/rocflight/hello_world/main.roc`
-
-**Requires these phases (in order):**
-1. **✅ Phase 1: Foundation** (Strings + Platform Loading)
-   - Part A: String literals & type inference
-   - Part B: Platform loading (Stdout.line! access)
-2. Phase 2: Integers & arithmetic
-3. Phase 3: Variables
-4. Phase 4: Binary operators (arithmetic)
-5. Phase 5: Boolean operators
-6. Phase 6: If/Else (optional for hello_world)
-7. Phase 7: Lambdas
-8. Phase 8: Function calls
-9. Phase 14: String interpolation with expressions
-10. Phase 15: Built-in functions (I64.to_str)
-11. Phase X (v2.0): Effects (for `main!` and effect functions)
-
-**Intermediate milestones:**
-- Phase 1-3: `birds = -3` and string concatenation
-- Phase 1-3, 8, 15: `I64.to_str(birds)` → `"-3"`
-- Phase 1-3, 8, 14, 15: Full interpolation → `"There are -3 birds."`
-- Phase 1-3, 7-8: Lambdas as values
-- Phase 1-3, 7-8, 14-15, 16: Platform access → `Stdout.line!(...)`
-- Full hello_world: Needs effects support (Phase X)
-
-**See:** `HELLO_WORLD_ROADMAP.md` for detailed progression and type verification steps.
-
----
-
-## PLATFORM SYSTEM: Critical Addition
-
-### Platform Structure (basic-cli example)
-
-The hello_world uses platform:
-```
-https://github.com/roc-lang/basic-cli/releases/download/0.20.0/X73hGh05nNTkDHU06FHC0YfFaQB1pimX7gncRcao5mU.tar.br
-```
-
-**Download & Extract:** 14MB brotli-compressed tar containing:
-```
-binary files (architecture-specific):
-  ├── linux-arm64.a
-  ├── linux-x64.a
-  ├── macos-arm64.a
-  └── macos-x64.a
-
-metadata:
-  ├── metadata_linux-x64.rm
-  └── linux-x64.rh
-
-Roc modules (define API):
-  ├── main.roc
-  ├── Stdout.roc          ← Used by hello_world
-  ├── Stdin.roc
-  ├── Env.roc
-  ├── File.roc
-  ├── Host.roc
-  └── [30+ more modules]
-```
-
-### What We Need from Platform
-
-**From Stdout.roc:**
-```roc
-module [IOErr, line!, write!, write_bytes!]
-
-IOErr : [NotFound, PermissionDenied, BrokenPipe, AlreadyExists, Interrupted, Unsupported, OutOfMemory, Other Str]
-
-line! : Str => Result {} [StdoutErr IOErr]
-```
-
-**Import statement in hello_world:**
-```roc
-import pf.Stdout   # pf is the platform name
-```
-
-**Usage:**
-```roc
-Stdout.line!("There are ${Num.to_str(birds)} birds.")
-```
-
-### Phase 16: Platform Loading (New Phase)
-
-**Tasks:**
-1. **Download platforms** (cache by URL hash)
-2. **Decompress** brotli-compressed tar archives
-3. **Parse** Roc module files (.roc) from platform
-4. **Extract** function signatures and types
-5. **Store in-memory** with zero-copy access
-6. **Link** imported modules to application
-
-**Implementation Details:**
-
-```rust
-// Platform cache structure
-pub struct PlatformCache {
-    // In-memory storage, indexed by URL hash
-    platforms: HashMap<String, Platform>,
-}
-
-pub struct Platform {
-    // Name: "pf" or "platform" 
-    pub name: String,
-    
-    // All modules from this platform
-    pub modules: HashMap<String, RocModule>,
-    
-    // Parsed AST/types stored in arena
-    pub ast_arena: AstArena,
-}
-
-pub struct RocModule {
-    // Module name: "Stdout", "Stdin", etc.
-    pub name: &'static str,
-    
-    // Exported items: function signatures, types
-    pub exports: HashMap<&'static str, ModuleItem>,
-}
-
-pub enum ModuleItem {
-    // Type definition: IOErr : [NotFound, ...]
-    Type(String, Type),
-    
-    // Function: line! : Str => Result {} [StdoutErr IOErr]
-    Function(&'static str, Type),
-}
-```
-
-**Zero-copy Strategy:**
-- Download platform once, cache by URL
-- Parse tar.br into in-memory structures
-- Use string interning for all identifiers (same as Phase 1)
-- Store module items in arena allocator
-- All references are `&'static str` (no copying)
-- Archive data held in memory (14MB for basic-cli is acceptable)
-
-**Caching:**
-```
-~/.rocache/platforms/
-  ├── <url-hash>/
-  │   ├── basic-cli.tar.br  (original compressed archive)
-  │   ├── manifest.json     (what was extracted)
-  │   └── index.bin         (serialized in-memory structures)
-```
-
-**Type Verification:**
 ```bash
-$ roc repl
-> import pf.Stdout
-> Stdout.line! : Str => Result {} [StdoutErr IOErr]
+printf 'app [main!] {}\n\nmain! : Str => Str\nmain! = |_| ""\n' > /tmp/t.roc
+roc check /tmp/t.roc
+#   But the platform requires:
+#       List(Str) => Try(_a, [Exit(I8), ..])
 ```
 
-### Integration Points
+`roc repl` is fine for scratch work, but it is not the reference: it cannot show
+you what a *platform* requires of an entry point, and that is where the
+interesting constraints live.
 
-**Phase 1-8, 14-15:** Work with standard Roc code (no platform yet)
-```roc
-birds = -3
-"Result: ${I64.to_str(birds)}"
-```
-
-**Phase 16 Addition:** Enable platform imports
-```roc
-import pf.Stdout
-Stdout.line!("Hello")  # Now resolved to platform module
-```
-
-**Parsing app declaration (Phase 16+):**
-```roc
-app [main!] { pf: platform "https://github.com/.../basic-cli/.../tar.br" }
-```
-- Extract platform URL
-- Download and cache if not present
-- Bind name "pf" to platform
-- Allow `import pf.Stdout` and `pf.Stdout.line!` calls
-
-### Memory Layout (Zero-Copy)
-
-```
-┌─────────────────────────────────────────────────────┐
-│ Global PlatformCache (Lazy Static)                  │
-│ ┌─────────────────────────────────────────────────┐ │
-│ │ HashMap<URL, Platform>                          │ │
-│ │  ├─ Platform "pf"                               │ │
-│ │  │  ├─ AstArena (14MB total for basic-cli)     │ │
-│ │  │  │  ├─ Stdout module (parsed .roc)          │ │
-│ │  │  │  │  ├─ line! function signature          │ │
-│ │  │  │  │  └─ IOErr type definition             │ │
-│ │  │  │  ├─ Stdin module (parsed .roc)           │ │
-│ │  │  │  └─ [30+ other modules]                  │ │
-│ │  │  └─ StringPool (all interned identifiers)  │ │
-│ │  └─ [other platforms if used]                  │ │
-│ └─────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────┘
-
-// Single copy: download once, hold in memory
-// All pointers: `&'static str` (zero-copy)
-// Shared across modules via global static
-```
-
-### Phase Sequence Updated
-
-| Phase | Feature | Needs Platform? | Status |
-|-------|---------|-----------------|--------|
-| 1-15 | Core language | ❌ No | → Implement first |
-| 16 | Platform loading | ✅ Yes | **NEW** |
-| 17+ | Advanced features | ⚠️ Maybe | → Defer |
-| X | Effects (v2.0) | ✅ Yes | **Needed for main!** |
-
-### Ceiling & Upgrade Path
-
-**v1.0 (Phase 16):**
-- Download and cache one platform per app
-- Parse Roc modules from platform
-- Resolve imported functions
-
-**v2.0 (Phase X+):**
-- Multiple platforms per app
-- Lazy loading (download only used modules)
-- Binary format for faster loads (Phase 20+)
-- Compression of cached platforms
+**Reference file for all syntax:** `roc-compiler/test/echo/all_syntax_test.roc`.
 
 ---
 
+## Goal: run hello_world/main.roc
+
+```roc
+app [main!] {}
+
+main! : List(Str) => Try({}, [Exit(I8), ..])
+main! = |_args| {
+    echo!("hello world\n")
+    Ok({})
+}
+```
+
+**Status: working.** `rocflight hello_world/main.roc` and `roc run
+hello_world/main.roc` both print `hello world`, and the interpreter's emitted
+`.rocflight/cache/desugared/hello_world_main_roc.desugared.roc` passes `roc check`
+and runs to the same output. That round trip — sugared in, valid annotated Roc out,
+same answer from both — is the property the whole test suite is built on.
+
+### The entry-point model, corrected
+
+This plan previously assumed hello_world was a **basic-cli app**: a real platform
+URL, `import pf.Stdout`, `Stdout.line!(...)`. That is a valid shape, but it is not
+this target's shape, and building the interpreter around it put the platform
+downloader on the critical path for printing a string.
+
+What is actually true:
+
+- A **platformless app** — no platform in the header — is what `roc run` links the
+  built-in default host for. `app [main!] {}`, or no header at all.
+- **The default host provides `echo!`, not the compiler.** Signature `Str => {}`
+  per LSP hover. It is not a global builtin: in a type module it fails with
+  "Nothing is named echo! in this scope."
+- The default host demands exactly `main! : List(Str) => Try(_a, [Exit(I8), ..])`.
+  `Try`, not `Result` — `Result` is not in scope at all.
+- `echo!` writes with **no trailing newline**.
+
+So the interpreter models host effects in a small table,
+[`src/platform/host.rs`](src/platform/host.rs), kept separate from compiler
+builtins because the language draws that line too. Real platform loading becomes a
+later phase that *replaces* the table, rather than a prerequisite for phase 1.
+
+`main!` itself is current, ordinary syntax — it is the export name for effectful
+apps with real platforms too, appearing that way ~435 times in the compiler's own
+test suite. Nothing about it is legacy.
+
+### What the default host is not
+
+It is not a stand-in for a real platform, and the two differ in ways that matter
+once phase 19 lands:
+
+| | Default host | Real platform |
+|---|---|---|
+| Header | `app [main!] {}` | `app [main!] { pf: platform "..." }` |
+| Effects | `echo!` only | Whatever the platform's `hosted` block declares |
+| Entry type | `List(Str) => Try(_a, [Exit(I8), ..])` | The platform's own requirement |
+| Export name | `main!` | Platform's choice — `main`, `process_string`, a record of functions |
+
+`roc-compiler/test/str/app.roc` exports a plain `process_string : Str -> Str` with
+no `main` at all; `test/int/app.roc` exports `main` as a *record* of
+`init`/`update`/`render`. Do not hardcode `main!` as the universal entry point.
+
 ---
 
-## REVISED ARCHITECTURE OVERVIEW
+## Platform loading
+
+**Implemented** — `src/platform/resolve.rs` and `src/platform/real.rs`.
+
+The design decision that shaped it: **`roc` already downloads, verifies and extracts
+dependencies**, so none of that is reimplemented. A dependency URL ends in
+`<HASH>.tar.zst`, and `roc` extracts it to `~/.cache/roc/packages/<HASH>/`. Mapping a
+URL to its sources is therefore string manipulation, not networking. `roc` is the
+authority on cache layout, hashing and archive integrity; duplicating it would mean a
+second implementation to keep in step for no gain.
+
+An earlier draft of this plan described downloading a *brotli*-compressed tar and
+untarring it. That was Rust-era: the format is `.tar.zst` now, and the cache is
+content-addressed rather than mirroring the URL path. Both are recognised.
+
+What is read from a platform's sources:
+
+| From | What |
+|---|---|
+| `main.roc` | `requires` entry-point type, `exposes` module list, `hosted` symbol names |
+| `<Module>.roc` | members declared inside `Name :: [].{ ... }`, with signatures |
+
+**The limit is architectural, not an omission.** A platform's `hosted` functions are
+implemented in its compiled host — native code. A tree-walking interpreter has nothing
+to call. So effects run only where this interpreter supplies its own implementation,
+and anything else the platform declares is reported as a gap that names which effects
+*are* available. `HOST_EFFECTS` in `platform/host.rs` still covers the default
+platformless host (`echo!`); a real platform's declarations are read from its sources.
+
+**Ceiling:** packages (`alias: "URL"` without `platform`) are resolved but not
+evaluated — their contents are ordinary Roc the interpreter would have to run.
+**Upgrade path:** evaluate package modules; implement more effects natively.
+
+## Architecture overview
 
 ### Type System Strategy
 - **Hindley-Milner inference** integrated into parser AST construction (not a separate pass)
@@ -283,7 +166,7 @@ app [main!] { pf: platform "https://github.com/.../basic-cli/.../tar.br" }
 
 ---
 
-## TYPE SYSTEM CORE
+## Type system core
 
 ### Type Representation
 ```
@@ -297,7 +180,14 @@ Type ::=
   | Function(Box<Type>, Box<Type>)  (a -> b; right-associative)
   | TypeVar(u32)                 (unbound: $0, $1, ...)
   | Nominal(String, Vec<Type>)   (NominalTypeRecord, Try(a, b))
+  | Unit                         ({} — the empty record)
 ```
+
+This is the target. What `src/types/mod.rs` has **today** is the numeric types,
+`Str`, `Bool`, `TypeVar`, `List`, `Function` and `Unit`; `Record`, `TagUnion` and
+`Nominal` arrive with phases 09, 12 and 14. Tag expressions currently type as a
+fresh var, so `Try` is unmodelled — which is why phase 17's golden pair passes under
+`roc` but not yet under the interpreter.
 
 ### Bidirectional Type Checking
 - **Synthesis**: `synth(expr) -> Type` — infer type from expression structure
@@ -333,7 +223,7 @@ unify(t1: Type, t2: Type) -> Result<Substitution, UnifyError> {
 
 ---
 
-## MEMORY MODEL (Optimized)
+## Memory model
 
 ### Value Layout
 ```rust
@@ -423,765 +313,95 @@ pub fn lookup(&self, name: &str) -> Result<Value, EvalError> {
 
 ---
 
-## REVISED 15-PHASE ROADMAP
+## Phase roadmap
 
-Each phase now includes:
-- **Type signatures** (from all_syntax_test.roc where applicable)
-- **Type inference rules** (unification constraints)
-- **Memory considerations** (arena usage, string interning points)
-- **Parser, AST, type checker, evaluator**
-- **Comprehensive tests** (parsing, type checking, evaluation, integration)
+Lives in **[IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md)**, with measured
+per-feature status.
 
-### **PHASE 1: Foundation - Strings, Types & Platform Loading**
+It used to be duplicated here as a 15-phase list, which drifted out of sync with
+the 20-phase list in that file until the two disagreed about both numbering and
+what was finished. One list, one place.
 
-**Status:** ✅ PARTIALLY COMPLETE (strings done, platform loading to add)
+What belongs here instead is the shape every phase shares:
 
-**Part A: String Literals & Type Inference**
+| Layer | File | Rule |
+|---|---|---|
+| AST | `src/ast/mod.rs` | Add a variant only if existing ones cannot compose. Blocks needed none — the parser lowers them to nested `Expr::Let`. |
+| Parser | `src/parser/mod.rs` | Skip type annotations (`skip_type_annotation`); never delete them from the source. |
+| Types | `src/types/checker.rs` | A `synth` arm. Unknown constructs get a fresh var, not a guess. |
+| Eval | `src/eval/mod.rs` | An `eval` arm. |
 
-**Type Signature:** `Str`  
+And the gate every phase passes: a golden pair per syntax feature, both files
+compiling under `roc check`, identical output from both, explicit types in the
+desugared one. See the testing section below.
 
-**Type Rules:**
-- Literal `"hello"` synths to `Str`
-- String interpolation `"${expr}"` checks expr type, converts to Str, concatenates
+## Desugaring pass (before AST construction)
 
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Str(&'static str),  // interned
-    StrInterp(Vec<StrPart<'a>>), // mix of literal + expr
-}
+Sugar is expanded to explicit syntax before the parser runs, so the parser has no
+special cases and the AST stays small.
 
-pub enum StrPart<'a> {
-    Literal(&'static str),
-    Expr(&'a Expr<'a>, Option<&'static str>), // expr + optional format
-}
+```
+.roc → Desugarer → desugared .roc → Parser → AST → Type Checker → Evaluator
+                        │
+                        └── written to .rocflight/cache/desugared/, and it must
+                            pass `roc check` on its own
 ```
 
-**Parser:** nom `delimited(tag("\""), ...)` with recursive `${...}` parsing  
-**Type Checker:** synth → `Str`; check `Expr -> Str` conversion  
-**Evaluator:** concatenate parts after eval each expr  
-**Memory:** intern all string literals into pool at parse time  
+The emitted file being **real, compilable Roc with explicit types** is the point,
+not a debugging nicety: it is what lets every desugaring be checked by the actual
+compiler instead of trusted. `--show-desugared` prints it; `--clear-cache` clears it.
 
-**Tests:**
-- Parse `"hello"` → `Expr::Str("hello")`
-- Infer type → `Str`
-- Interp `"x=${x}"` with `x: I64` → concat "x=", (x.to_str)
-- Type error: `"${x}"` where x not convertible
+### What is sugar
+
+| Syntax | Example | Desugars to | Phase |
+|---|---|---|---|
+| `?` | `f(x)?` | `match f(x) { Ok(v) => v, Err(e) => Err(e) }` | 17 |
+| `??` | `expr ?? d` | `match expr { Ok(v) => v, Err(_) => d }` | 17 |
+| `.?` | `rec.?field` | Try-producing field access | 09 |
+| `?:` | `field ?: Type` | Optional record field | 09 |
+| implicit precedence | `2 + 3 * 4` | `2 + (3 * 4)` | 04 |
+| type suffix | `255.U8` | `small : U8` + `small = 255` | 02 |
+
+### What is NOT sugar
+
+Each of these was previously listed in this document as a desugaring. All four were
+wrong, and two of them produced broken output before being removed:
+
+| Syntax | Previously claimed | Actually |
+|---|---|---|
+| `foo!` | strip `!` from the name | The `!` is **part of the identifier**. `echo` and `echo!` are different names; LSP completion returns the literal label `echo!`. Nothing to rewrite. |
+| `=>` | rewrite to `->` | The effectful-function arrow, and the `match` arm separator. Never `->`. |
+| `!foo` | — | Unary logical not; canonicalises to `Bool.not(foo)`. Unrelated to the `!` above. |
+| `"${x}"` | — | A primitive string form, not sugar for concatenation. |
+
+The old effect pass also emitted Rust (`Err(e) => return Err(e)`) into what was
+supposed to be a Roc file — which is exactly the class of bug that requiring the
+output to pass `roc check` catches immediately.
+
+### Type annotations are preserved
+
+`x : Type` lines survive desugaring untouched. The parser skips them
+(`Parser::skip_type_annotation`); the desugarer does not delete them.
+
+The earlier design had the desugarer strip annotations so the parser never saw
+them. That made the emitted file un-compilable as Roc and discarded the very types
+the desugared form is meant to state explicitly. Two consequences worth knowing:
+
+- An annotation is `name : Type` (whitespace before the colon); a record field is
+  `name: value`. The parser relies on that distinction, so a record literal is not
+  mistaken for an annotation.
+- A missed annotation line silently **truncates the top-level binding chain**, so
+  the binding after it is never parsed. That was a real bug: `main!` came back as
+  "Undefined variable" whenever anything was annotated above it. `skip_trivia`
+  handles whitespace, comments and annotations in one place for this reason.
+
+**Reference:** [DESUGARING.md](DESUGARING.md) for the per-rule detail.
+**Source of truth:** `roc-compiler/test/echo/all_syntax_test.roc`, verified with
+`roc check`.
 
 ---
 
-**Part B: Platform Loading (Zero-Copy In-Memory)**
-
-**Type Signature:** Module system for importing `import pf.Stdout`
-
-**Why Part of Phase 1:** Platforms provide essential builtins (Stdout.line!, I64.to_str, etc.). Building this early enables all later phases to use platform features.
-
-**Platform Structure (basic-cli example):**
-```
-Downloaded: basic-cli.tar.br (14MB brotli-compressed)
-Extracted modules (40+ .roc files):
-├── Stdout.roc          → line! : Str => Result {} [StdoutErr IOErr]
-├── Stdin.roc           → line_echo! : Str => Try Str [...]
-├── File.roc
-├── Env.roc
-└── [35+ more modules]
-```
-
-**AST Nodes for App Declaration & Imports:**
-```rust
-pub struct AppDecl {
-    pub exports: Vec<&'static str>,
-    pub platform: PlatformRef,
-}
-
-pub enum PlatformRef {
-    Url(String),  // "https://github.com/.../basic-cli/.../tar.br"
-}
-
-pub enum Expr<'a> {
-    Import { 
-        module: &'static str,  // "pf"
-        items: Vec<&'static str>,  // ["Stdout"]
-    },
-    ModuleCall {
-        module: &'static str,   // "Stdout"
-        func: &'static str,     // "line!"
-        args: Vec<&'a Expr<'a>>,
-    },
-}
-```
-
-**Parser:** 
-- `app [exports] { name: platform "url" }`
-- `import name.Module` or `import name.Module [items]`
-- `Module.function(args)`
-
-**Type Checker:**
-- Load platform on first use (lazy, global cache)
-- Parse platform modules into AST
-- Resolve imports to module items
-- Look up function signatures from platform
-- Type-check qualified calls
-
-**Evaluator:**
-- Find platform function by name
-- Execute via platform's exported implementation
-- Handle effects (v2.0)
-
-**Memory Model (Zero-Copy):**
-```rust
-static PLATFORM_CACHE: Lazy<Mutex<HashMap<String, Platform>>> = 
-    Lazy::new(|| Mutex::new(HashMap::new()));
-
-pub struct Platform {
-    pub name: String,                      // "pf"
-    pub modules: HashMap<&'static str, RocModule>,
-    pub ast_arena: Rc<AstArena>,          // 14MB for basic-cli
-    pub string_pool: Rc<StringPool>,      // All identifiers interned
-}
-
-pub struct RocModule {
-    pub name: &'static str,
-    pub exports: HashMap<&'static str, ModuleItem>,
-}
-
-pub enum ModuleItem {
-    Type(&'static str, Type),
-    Function(&'static str, Type),
-}
-```
-
-**Caching (no re-download):**
-```
-~/.rocache/platforms/
-  ├── <sha256(url)>/
-  │   ├── basic-cli.tar.br   (original archive)
-  │   └── manifest.json      (what was extracted)
-```
-
-**Tests:**
-- ✅ Download platform (mocked for Phase 1)
-- [ ] Extract Roc modules from tar
-- [ ] Parse module definitions
-- [ ] Resolve imports correctly
-- [ ] Type-check module calls
-- [ ] Function resolution works
-- [ ] Stdout.line! available for Phase 2+
-
-**Type Verification (roc repl):**
-```bash
-$ roc repl
-> import pf.Stdout
-> Stdout.line! : Str => Result {} [StdoutErr IOErr]
-> main = |_args| Stdout.line!("Hello")
-```
-
----
-
----
-
-## PHASE 1 PROGRESS: Foundation for hello_world
-
-### ✅ Implemented & Working
-
-**String literal parsing:**
-```roc
-"Hello, world!"
-```
-✅ Type: `Str`  
-✅ Evaluates correctly  
-✅ String interning active  
-
-**Test verification:**
-```bash
-$ cargo run -- examples/simple_hello.roc
-Type: Str
-Result: "Hello, world!"
-
-$ cargo test --test phase1_test
-5/5 tests passed
-```
-
-### How Phase 1 Supports hello_world
-
-Phase 1 provides the foundation for:
-
-**Line 8 of hello_world (String part):**
-```roc
-Stdout.line!("There are ${Num.to_str(birds)} birds.")
-                           ↑ String literal foundation
-```
-
-The string literal `"There are ... birds."` relies on Phase 1:
-- Parser handles quoted strings
-- Type system verifies type is `Str`
-- String interning for efficiency
-- Foundation for interpolation
-
-**Phase 1 enables these intermediate goals:**
-1. ✅ Simple string output (done)
-2. → Phase 2-3: Add variables `birds = -3`
-3. → Phase 14-15: Add interpolation with `Num.to_str(birds)`
-4. → Phase X: Add effects for `Stdout.line!`
-
-### Type Verification (roc repl)
-
-**Phase 1 types verified:**
-```bash
-$ roc repl
-> "Hello, world!" : Str       ✓
-> "" : Str                    ✓
-> "With\nescape" : Str        ✓
-```
-
-### Phase 1 Checklist
-
-- ✅ Parser handles string literals
-- ✅ Parser handles escape sequences (`\n`, `\t`, `\\`, `\"`)
-- ✅ Type checker infers `Str`
-- ✅ Evaluator produces string values
-- ✅ String pool interning (all strings are `&'static str`)
-- ✅ Integration tests pass
-- ✅ Memory efficient (no heap allocation for small strings)
-
-### Next Phase: Phase 2 (Numbers)
-
-To move toward hello_world's `birds = -3`:
-- Parse integer literals (positive and negative)
-- Parse float literals
-- Type inference for numeric operations
-- See `HELLO_WORLD_ROADMAP.md` Phase 2 section for details
-
----
-
-### **PHASE 2: Integer & Float Literals with Type Inference**
-**Type Signature:** `I64, I64 -> _` (from line 4 of all_syntax_test.roc)  
-**Type Rules:**
-- Literal `5` synths to `Dec` (default decimal) or `I64` (if context demands)
-- Explicit suffix `5.I64` forces type
-- Operators `+`, `-`, `*`, `/` infer arg types from context
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Int(i64, Option<&'static str>), // value, optional suffix
-    Float(f64, Option<&'static str>),
-}
-
-pub enum NumType { I64, I32, I16, I8, U64, U32, U16, U8, I128, U128, F64, F32, Dec }
-```
-
-**Parser:** digit+; recognize numeric suffix  
-**Type Checker:**
-- Synth `5` → `TypeVar($n)` (unbound)
-- At use site, check `$n` matches expected type
-- Synth `5.I64` → `I64` directly (no variable)
-
-**Evaluator:** construct Value::(I64|F64|Dec)  
-**Memory:** no heap; immediates only  
-**Tests:**
-- Parse all numeric formats (radix, suffix)
-- Infer `5 + 3` → `I64` (both unify to I64)
-- Type error: `5 + "x"` → unify mismatch
-
----
-
-### **PHASE 3: Variable Binding & Pattern Matching**
-**Type Signature:** `a` (polymorphic type variable)  
-**Type Rules:**
-- Binding `x = expr` creates constraint `x: typeof(expr)`
-- Pattern matching binds variables with matched type
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Var(&'static str),
-    Let {
-        name: &'static str,
-        value: &'a Expr<'a>,
-        body: &'a Expr<'a>,
-    },
-}
-
-pub enum Pattern<'a> {
-    Wildcard,
-    Var(&'static str),
-    Literal(Expr<'a>),
-}
-```
-
-**Parser:** `name = expr; body` as Let node  
-**Type Checker:**
-- Synth `value` → `T_val`
-- Bind `name: T_val` in env
-- Synth `body` with `name` in scope
-
-**Evaluator:** push scope, store (name, value), eval body, pop scope  
-**Memory:** store name as interned &'static str; value in environment  
-**Tests:**
-- `x = 5; x` → 5
-- `x = 5; x = 10; x` → 10 (shadowing)
-- `x` undefined → error
-- Type error: inferred vs. use mismatch
-
----
-
-### **PHASE 4: Binary Operators (Arithmetic)**
-**Type Signature:** `I64, I64 -> I64` (from line 4: `number_operators`)  
-**Type Rules:**
-- Unify both operands to same numeric type
-- Return same type
-- Operators: `+`, `-`, `*`, `/`, `//`, `%`, `^` (power)
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    BinOp(&'a Expr<'a>, Op, &'a Expr<'a>),
-}
-
-pub enum Op { Add, Sub, Mul, Div, FloorDiv, Mod, Pow, ... }
-```
-
-**Parser:** Pratt parsing with precedence  
-**Type Checker:**
-- Synth left → `T_L`
-- Synth right → `T_R`
-- Unify `T_L` == `T_R`, both numeric
-- Return same type
-
-**Evaluator:** extract numeric values, apply op  
-**Memory:** no allocation; compute result  
-**Tests:**
-- Precedence: `2 + 3 * 4` → 14
-- Type error: `"a" + 1`
-- Division by zero
-
----
-
-### **PHASE 5: Boolean Operators & Type Inference**
-**Type Signature:** `Bool, Bool -> Bool` (from line 33: `boolean_operators`)  
-**Type Rules:**
-- `==`, `!=`, `<`, `<=`, `>`, `>=`: compare same numeric type → `Bool`
-- `and`, `or`: Bool → Bool (short-circuit)
-- `!`: Bool → Bool
-
-**AST Nodes:** Extend Op enum; add `Expr::Bool(bool)`  
-**Parser:** Keywords `and`, `or`; operators `==`, etc.  
-**Type Checker:**
-- Comparison: unify operands to numeric, return Bool
-- Logical: check operands are Bool, return Bool
-
-**Evaluator:**
-- Short-circuit: eval LHS, only eval RHS if needed
-- Comparisons: extract values, compare
-
-**Tests:**
-- `2 < 3` → true
-- `!true` → false
-- Short-circuit: `false and panic()` doesn't eval panic
-- Type error: `2 == "2"`
-
----
-
-### **PHASE 6: If/Else Expressions**
-**Type Signature:** `Bool -> a` (branches return same type)  
-**Type Rules:**
-- Condition must be `Bool`
-- Both branches must unify to same type `T`
-- Expression returns `T`
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    If {
-        cond: &'a Expr<'a>,
-        then_: &'a Expr<'a>,
-        else_: &'a Expr<'a>,
-    },
-}
-```
-
-**Parser:** keyword `if`, condition, then-branch, `else` keyword, else-branch  
-**Type Checker:**
-- Check `cond: Bool`
-- Synth `then_` → `T1`
-- Synth `else_` → `T2`
-- Unify `T1 == T2`; return unified type
-
-**Evaluator:** eval condition, eval matching branch only  
-**Tests:**
-- `if true 1 else 2` → 1
-- Nested if
-- Type error: branches mismatch
-
----
-
-### **PHASE 7: Function Definitions (Lambdas with Type Inference)**
-**Type Signature:** `(I64, I64) -> I64` (inferred from lambda body)  
-**Type Rules:**
-- Lambda `|a, b| body` synths to `(T_a, T_b) -> T_body`
-- Parameter types inferred from usage in body
-- Captured environment type-checks at definition
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Lambda {
-        params: Vec<&'static str>,
-        body: &'a Expr<'a>,
-    },
-}
-```
-
-**Parser:** `tag("|")`, params, `tag("|")`, body  
-**Type Checker:**
-- Create TypeVars for each param: $p_i
-- Synth body with param types in scope
-- Return `(T_p1, T_p2, ...) -> T_body`
-
-**Evaluator:** store closure with params, body, captured environment  
-**Memory:** capture env by reference (share, not clone)  
-**Tests:**
-- `|x, y| x + y` → `(I64, I64) -> I64`
-- Closure capture: `x = 5; |y| x + y` captures x
-- Type error: lambda body type mismatch
-
----
-
-### **PHASE 8: Function Calls with Argument Type Checking**
-**Type Signature:** `(a -> b) -> b` (apply function to arguments)  
-**Type Rules:**
-- Function type must be `(T_a1, T_a2, ...) -> T_ret`
-- Each argument must unify with parameter type
-- Return type is `T_ret` after substitution
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Call {
-        func: &'a Expr<'a>,
-        args: Vec<&'a Expr<'a>>,
-    },
-}
-```
-
-**Parser:** expression, `(`, args, `)`  
-**Type Checker:**
-- Synth func → `(T_p1, ...) -> T_ret`
-- For each arg, synth arg_i → `T_a_i`, unify `T_a_i` with `T_p_i`
-- Return `T_ret` with substitutions applied
-
-**Evaluator:** eval func → Closure, eval args, create new scope with (param=arg), eval body  
-**Tests:**
-- `add(2, 3)` with `add = |x, y| x + y` → 5
-- Wrong arity: `add(1)` → error
-- Type error: `add("a", 1)` → mismatch
-
----
-
-### **PHASE 9: Records (Nominal & Type Inference)**
-**Type Signature:** `{ x: I64, y: Str }` (from line 222 of test)  
-**Type Rules:**
-- Record literal `{ x: 5, y: "hi" }` synths to `{ x: I64, y: Str }`
-- Field access `rec.x` checks field exists, returns field type
-- Record update `{ rec & y: 20 }` creates new record with field replaced
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Record(Vec<(&'static str, &'a Expr<'a>)>),
-    Access {
-        record: &'a Expr<'a>,
-        field: &'static str,
-    },
-    RecordUpdate {
-        record: &'a Expr<'a>,
-        updates: Vec<(&'static str, &'a Expr<'a>)>,
-    },
-}
-```
-
-**Parser:** `{`, field: value pairs, `}`; access `.field`; update `{ ..record, field: value }`  
-**Type Checker:**
-- Record: synth each field, construct record type
-- Access: synth record, lookup field type
-- Update: synth record type, check update types, return record type with updated field types
-
-**Evaluator:** store as HashMap<&'static str, Value>  
-**Memory:** intern field names  
-**Tests:**
-- `{ x: 1, y: 2 }.x` → 1
-- Type error: `.missing_field`
-- Update: `{ x: 1, y: 2 } & y: 3` → `{ x: 1, y: 3 }`
-
----
-
-### **PHASE 10: Lists (Generic Type Parameters)**
-**Type Signature:** `List(U64) -> U64` (from line 49 of test)  
-**Type Rules:**
-- List `[1, 2, 3]` synths to `List(I64)`
-- All elements must unify to same type
-- `.len()` returns `U64`
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    List(Vec<&'a Expr<'a>>),
-    Index { list: &'a Expr<'a>, index: &'a Expr<'a> },
-}
-```
-
-**Parser:** `[`, expressions, `]`; indexing: `list.0`, `list.1`  
-**Type Checker:**
-- Synth each element, unify all to same type `T`
-- Return `List(T)`
-- Index: synth list → `List(T)`, synth index → I64, return `T`
-
-**Evaluator:** store as Vec<Value>; bounds checking  
-**Tests:**
-- `[1, 2, 3].0` → 1
-- Type error: `[1, "a"]` (heterogeneous)
-- Out-of-bounds error
-
----
-
-### **PHASE 11: Pattern Matching (Lists & Basics)**
-**Type Signature:** `List(U64) -> U64` (branches return same type)  
-**Type Rules:**
-- Match `expr` against patterns
-- Each pattern binds variables with inferred types
-- All branches must return same type
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Match {
-        expr: &'a Expr<'a>,
-        branches: Vec<(Pattern<'a>, &'a Expr<'a>)>,
-    },
-}
-
-pub enum Pattern<'a> {
-    Wildcard,
-    Literal(Expr<'a>),
-    Var(&'static str),
-    List(Vec<ListPattern<'a>>),
-    Cons { head: &'static str, tail: &'static str },
-}
-
-pub enum ListPattern<'a> {
-    Var(&'static str),
-    Literal(Expr<'a>),
-    Rest, // [a, .., b]
-}
-```
-
-**Parser:** `match`, expr, `{`, branches with patterns, `}`  
-**Type Checker:**
-- Synth expr → `T_expr`
-- For each pattern, check pattern matches `T_expr`; bind vars with matched types
-- Synth each branch body; unify all returns to same type
-
-**Evaluator:** try patterns in order; on match, bind vars, eval body  
-**Tests:**
-- `match [1, 2] { [] => 0, [x] => x, [a, b, ..] => 99, _ => 100 }`
-- Binding in patterns
-- Type error: branch type mismatch
-
----
-
-### **PHASE 12: Tag Unions (Algebraic Data Types)**
-**Type Signature:** `[Ok(a), Err(b)]` or `Try(a, b)` (from line 67 of test)  
-**Type Rules:**
-- Tag `Ok(5)` synths to `[Ok(I64)]`
-- Tag union `[Ok(I64), Err(Str)]` is a type
-- Pattern match destructures payloads
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Tag {
-        name: &'static str,
-        payload: Vec<&'a Expr<'a>>,
-    },
-}
-
-pub enum Pattern<'a> {
-    Tag {
-        name: &'static str,
-        payload: Vec<Pattern<'a>>,
-    },
-    ...
-}
-```
-
-**Parser:** Capitalized identifier, optional `(args)`  
-**Type Checker:**
-- Tag `Tag(a, b)` synths to `[Tag(T_a, T_b)]`
-- Match: unify expr type with union, destructure payloads with pattern types
-
-**Evaluator:** store as (name, Vec<Value>)  
-**Tests:**
-- `Ok(5)`, `Err("fail")`
-- Match and extract payloads
-- Type error: tag not in union
-
----
-
-### **PHASE 13: Pipe Operator (Function Composition)**
-**Type Signature:** `(a -> b) -> b` (threads left-hand into function)  
-**Type Rules:**
-- `expr |> func` synths to same type as `func(expr)`
-- Chains left-to-right
-
-**AST Nodes:**
-```rust
-pub enum Expr<'a> {
-    Pipe {
-        left: &'a Expr<'a>,
-        right: &'a Expr<'a>,
-    },
-}
-```
-
-**Parser:** `|>` operator; lower precedence than call  
-**Type Checker:** synth left → `T_a`, synth right → `T_a -> T_b`, return `T_b`  
-**Evaluator:** `pipe(left, right)` = `call(right, [left])`  
-**Tests:**
-- `5 |> |x| x + 1` → 6
-- Chaining: `5 |> (|x| x * 2) |> (|y| y + 1)` → 11
-
----
-
-### **PHASE 14: String Interpolation (Advanced)**
-**Type Signature:** `Str` (from line 84 of test)  
-**Type Rules:**
-- `"${expr}"` converts expr to Str via `.to_str()` or `.inspect()`
-- Nested exprs allowed: `"${a + b}"`
-
-**Parser & Type Checker:** Already in Phase 1; enhanced here  
-**Evaluator:** eval expr, format via `.to_str()` or `.inspect()`, concat  
-**Tests:**
-- `"x=${x}"` with x bound
-- Nested: `"${2 * x + 1}"`
-- Type error: unconvertible expr
-
----
-
-### **PHASE 15: Built-in Functions (Core Library)**
-**Type Signature:** Per-function  
-**Type Rules:**
-- Builtin `I64.to_str(x: I64) -> Str`
-- `Str.concat(a: Str, b: Str) -> Str`
-- `List.map(lst: List(a), f: (a -> b)) -> List(b)`
-- Type-check arguments, return result
-
-**Builtin Functions:**
-```
-I64.to_str : I64 -> Str
-U64.to_str : U64 -> Str
-F64.to_str : F64 -> Str
-Str.concat : Str, Str -> Str
-Str.contains : Str, Str -> Bool
-Str.join_with : List(Str), Str -> Str
-Str.inspect : a -> Str
-
-List.map : List(a), (a -> b) -> List(b)
-List.len : List(a) -> U64
-List.first : List(a) -> Try(a, [ListEmpty])
-List.fold : List(a), b, (a, b -> b) -> b
-
-Bool.not : Bool -> Bool
-```
-
-**Parser:** Qualified names `Module.function`  
-**Type Checker:** lookup builtin signature, type-check args  
-**Evaluator:** execute native Rust code  
-**Tests:** Each builtin with valid/invalid args  
-
----
-
-## SHORTHAND DESUGARING PASS (Before AST Construction)
-
-**Critical step:** All Roc shorthand syntax is desugared to explicit functional syntax BEFORE the parser runs.
-
-**Process Flow:**
-```
-.roc file → Desugarer → Desugared .roc → Parser → AST → Type Checker → Evaluator
-```
-
-**Why This Matters:**
-- ✅ Parser only handles functional syntax (no special cases)
-- ✅ AST is simple and clean
-- ✅ Type checking logic unchanged
-- ✅ Easy debugging (inspect `.desugared.roc` files)
-
-**Shorthand Syntax Handled:**
-
-| Syntax | Example | Desugared | Phase |
-|--------|---------|-----------|-------|
-| `!` | `main!` | `main` (remove from name) | 1B |
-| `=>` | `Str => Out` | `(Str) -> Out` | 1B |
-| `?` | `expr?` | `match expr { Ok(v)=>v, Err(e)=>return Err(e) }` | 7 |
-| `??` | `expr ?? def` | `match expr { Ok(v)=>v, Err(_)=>def }` | 7 |
-| `.?` | `rec.?field` | `if field_exists then Ok(field) else Err(MissingField)` | 9 |
-| `?:` | `field ?: Type` | Field becomes optional (Try-based) | 9 |
-
-**Reference Implementation:**
-- See: `SHORTHAND_DESUGARING.md` (complete desugaring rules)
-- Source of truth: `roc-compiler/test/echo/all_syntax_test.roc`
-- Verify with: `roc check all_syntax_test.roc`
-
-**Desugarer Implementation:**
-
-```rust
-pub struct Desugarer {
-    input: String,
-}
-
-impl Desugarer {
-    pub fn desugar(&self) -> Result<String, DesugarError> {
-        // Pass 1: Remove ! from effectful functions
-        let step1 = self.desugar_effects();
-        
-        // Pass 2: Convert ? to match expressions
-        let step2 = self.desugar_question_mark(&step1);
-        
-        // Pass 3: Convert ?? to match expressions
-        let step3 = self.desugar_default(&step2);
-        
-        // Pass 4: Convert .? to Try-based access
-        let step4 = self.desugar_optional_access(&step3);
-        
-        // Pass 5: Process optional fields
-        let step5 = self.desugar_optional_fields(&step4);
-        
-        Ok(step5)
-    }
-}
-```
-
-**Output (Debug Build):**
-When `cfg!(debug_assertions)`, save desugared code to `.desugared.roc`:
-```
-original_file.roc → original_file.roc.desugared
-```
-
-**Integration with Parsing:**
-```rust
-pub fn parse_file(path: &str) -> Result<Expr, ParseError> {
-    // 1. Load and desugar
-    let desugared = Desugarer::from_file(path)?.desugar()?;
-    
-    // 2. Parse desugared code (clean, functional syntax only)
-    let mut parser = Parser::new(&desugared);
-    parser.parse_expr()
-}
-```
-
----
-
-## TYPE SYSTEM SPECIFICATION
+## Type system specification
 
 ### Unification Algorithm (Complete)
 
@@ -1258,101 +478,146 @@ impl Display for TypeError {
 
 ---
 
-## TESTING STRATEGY (Per Phase)
+## Testing strategy
 
-Each phase includes 4 test categories:
+**One golden pair of `.roc` files per syntax feature**, and **all four outputs must
+be byte-identical**:
 
-1. **Parser Tests** — Verify AST structure
-   ```rust
-   #[test]
-   fn parse_lambda() {
-       let ast = parse("|x, y| x + y").unwrap();
-       assert!(matches!(ast, Expr::Lambda { .. }));
-   }
-   ```
+```
+        roc run <sugared>   ═══   roc run <desugared>
+              ║                          ║
+     rocflight <sugared>   ═══   rocflight <desugared>
+```
 
-2. **Type Checker Tests** — Verify inference & unification
-   ```rust
-   #[test]
-   fn infer_lambda_type() {
-       let expr = parse("|x, y| x + y").unwrap();
-       let ty = synth(&expr, &mut Substitution::new()).unwrap();
-       assert_eq!(ty, Type::Func(
-           Box::new(Type::I64),
-           Box::new(Type::Func(Box::new(Type::I64), Box::new(Type::I64)))
-       ));
-   }
-   ```
+```
+tests/roc/<NN>_<phase>/<syntax>.roc              # sugared
+tests/roc/<NN>_<phase>/<syntax>.desugared.roc    # explicit types, no sugar
+```
 
-3. **Evaluator Tests** — Verify runtime behavior
-   ```rust
-   #[test]
-   fn eval_lambda_call() {
-       let expr = parse("(|x| x + 1)(5)").unwrap();
-       let result = eval(&expr, &mut Environment::new()).unwrap();
-       assert_eq!(result, Value::I64(6));
-   }
-   ```
+Requirements, all enforced by `tests/check_roc.sh`:
 
-4. **Integration Tests** — Full pipeline
-   ```rust
-   #[test]
-   fn type_and_eval_together() {
-       let expr = parse("|x, y| x + y").unwrap();
-       synth(&expr, &mut Substitution::new()).unwrap();
-       let result = eval(&expr, &mut Environment::new()).unwrap();
-       // Verify type is consistent with eval result
-   }
-   ```
+1. `roc check` clean on **both** files.
+2. All four outputs above identical. The horizontal edge proves the desugaring
+   preserves semantics; the vertical edges hold the interpreter to the real compiler
+   on **both** forms.
+3. The desugared file carries **explicit top-level annotations**.
+4. **One feature per pair.** `+` and `//` get separate files.
+
+Two gates, so a correctly-written pair is not confused with a finished feature:
+
+| Gate | Means | Fatal? |
+|---|---|---|
+| **PAIR** | Both files check; the two `roc run` outputs agree; annotations present. Failing this means *the test files are wrong*. | Always |
+| **INTERP** | `rocflight` matches `roc` on **both** files. Failing this means *the feature is not implemented yet*. | Only under `--strict` |
+
+```bash
+tests/check_roc.sh                 # PAIR fatal, INTERP reported as PEND
+tests/check_roc.sh --strict        # both fatal — the definition of done
+cargo test --quiet                 # Rust side
+```
+
+### Checking the desugared file with the interpreter is not redundant
+
+It is a **different path through the parser**, and it caught a bug the sugared files
+could not: top-level bindings parsed their value with `parse_call_expr` rather than
+the full precedence chain, so `a = 2 + (3 * 4)` failed at the top level while the
+same binding inside a block worked. The sugared pairs kept their bindings inside
+`main!`'s block; the desugared ones lift them to the top level with annotations.
+That asymmetry is exactly what the fourth output tests.
+
+Expect this to keep happening. The desugared form exercises explicit annotations,
+top-level bindings and parenthesised structure — all code paths the sugared form can
+skip entirely.
+
+### Tests that touch the global platform cache
+
+`PLATFORM_CACHE` is a process-global `Mutex<HashMap>`, and `clear_cache()` wipes
+every entry. Cargo runs a binary's tests on parallel threads, so a test that clears
+the cache lands in the middle of another test's assertions — this made
+`test_multiple_platforms_in_cache` fail about one run in three.
+
+**Any test that reads or writes the global cache must take the cache test lock
+first** (`cache::lock_for_test()` in the lib, `lock_cache()` in
+`tests/phase1b_platform_test.rs` — separate processes, so each has its own). Tests
+using `PlatformLoader::load()` do not cache and need no lock.
+
+Both locks recover from poisoning (`unwrap_or_else(|e| e.into_inner())`). Without
+that, a test panicking while holding the lock makes every later cache test fail with
+`PoisonError`, hiding which one actually broke.
+
+### Holding the interpreter to itself
+
+The desugaring the interpreter *emits* must also be valid Roc:
+
+```bash
+./target/debug/rocflight hello_world/main.roc
+roc check .rocflight/cache/desugared/hello_world_main_roc.desugared.roc
+```
+
+Currently true for all 18 pairs plus `hello_world/main.roc`.
+
+A feature is done when `--strict` is green for its pair and the status row in
+IMPLEMENTATION_PHASES.md reflects the measured result rather than the intended one.
+
+### Why the desugared file must compile
+
+If the desugarer's output is not valid Roc, it cannot be diffed against the real
+compiler, and a desugaring bug hides until it surfaces as a wrong answer with no
+obvious cause. Making the output compilable turns every desugaring into something
+`roc` itself will check.
+
+This is why the desugarer **preserves** type annotations. It used to strip them so
+the parser never had to skip them — which made the emitted file un-compilable and
+discarded exactly the type information the desugared form exists to make explicit.
+Skipping is the parser's job.
+
+## File layout
+
+As it actually is. `find src tests -type f` is the authority; this table says what
+each file is for.
+
+```
+src/
+  main.rs                 CLI: --show-desugared, --clear-cache
+  lib.rs                  exports
+  error.rs                ParseError and friends
+
+  desugaring/mod.rs       sugar expansion; PRESERVES type annotations
+  parser/mod.rs           parse_expr; skip_type_annotation; parse_block
+  ast/mod.rs              Expr, BinOp, StrPart
+  types/
+    mod.rs                Type enum
+    checker.rs            synth / unify
+  eval/
+    mod.rs                eval loop, call_builtin, call_host_effect
+    value.rs              Value enum
+    environment.rs        stack-based scopes
+  platform/
+    host.rs               default-host effect table (echo!)
+    loader.rs             platform download/parse — mock for now
+    module.rs, cache.rs, mod.rs
+  memory/string_pool.rs   interning
+
+tests/
+  check_roc.sh            golden-pair gate: both files check, outputs agree
+  roc/<NN>_<phase>/       golden pairs, one per syntax feature
+    <syntax>.roc
+    <syntax>.desugared.roc
+  entry_point_test.rs     the platformless entry-point model
+  phase*_test.rs          per-phase Rust tests
+```
+
+Not present, despite earlier drafts of this plan listing them: `parser/lexer.rs`,
+`ast/display.rs`, `types/substitution.rs`, `types/error.rs`, `eval/builtins.rs`,
+`memory/arena.rs`. Some may arrive with the phases that need them; none should be
+created speculatively.
+
+**Dependencies:** see `Cargo.toml`. The plan previously named nom, bumpalo,
+once_cell and regex as given; check before assuming any of them is in use.
 
 ---
 
-## CRITICAL FILES FOR IMPLEMENTATION
-
-### Directory Structure
-```
-roc-interpreter/
-  Cargo.toml                  (dependencies: nom, bumpalo, once_cell, regex)
-  src/
-    lib.rs                    (exports)
-    main.rs                   (CLI)
-    
-    parser/
-      mod.rs                  (entry parse_expr)
-      lexer.rs                (optional: tokenization)
-    
-    ast/
-      mod.rs                  (Expr, Pattern, Op, Type enums)
-      display.rs              (Debug impl)
-    
-    types/
-      mod.rs                  (Type enum, TypeVar)
-      checker.rs              (synth, check, unify)
-      substitution.rs         (Substitution map)
-      error.rs                (TypeError, pretty-print)
-    
-    eval/
-      mod.rs                  (main eval loop)
-      value.rs                (Value enum, layout)
-      environment.rs          (stack-based env, scopes)
-      builtins.rs             (I64::to_str, etc.)
-    
-    memory/
-      arena.rs                (AstArena wrapper)
-      string_pool.rs          (StringPool, intern())
-    
-    error.rs                  (ParseError, combined errors)
-    
-  tests/
-    parser_tests.rs           (per-phase parser tests)
-    type_tests.rs             (per-phase type inference tests)
-    eval_tests.rs             (per-phase evaluator tests)
-    integration_tests.rs      (full pipeline per phase)
-```
-
----
-
-## KEY ARCHITECTURAL DECISIONS (Ponytail Rationale)
+## Key architectural decisions
 
 | Decision | Why | Ceiling | Upgrade Path |
 |----------|-----|---------|--------------|
@@ -1367,7 +632,9 @@ roc-interpreter/
 
 ---
 
-## PERFORMANCE TARGETS (Phase 1-15)
+## Performance targets
+
+Aspirational, not measured. Treat as budgets to check against, not as results.
 
 | Metric | Target | Ceiling |
 |--------|--------|---------|
@@ -1379,334 +646,29 @@ roc-interpreter/
 
 ---
 
-## ESSENCE: REVISED ROADMAP ADVANTAGES
+## Next steps
 
-1. **Type safety from Phase 1** — Every value has a type; errors caught early
-2. **Memory-efficient** — Arena + string interning reduces allocations 80%+
-3. **Accurate signatures** — Match actual Roc types from all_syntax_test.roc
-4. **Lazy defaults** — No bytecode/caching unless profiling demands; upgrade paths documented
-5. **Clear phase structure** — Each of 15 phases advances type system + evaluator together
-6. **Testing per phase** — Parser, types, eval, integration; no phase ships untested
-7. **Full type checking** — Hindley-Milner inference built-in from the start
-8. **Performance-first** — Arena allocation, string interning, stack-based environments
+In order, cheapest-unblocking first. Full list with measured status in
+[IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md).
 
----
+1. **Nested calls as arguments.** The parser rejects `I64.to_str(inc(41))` — a call
+   used as an argument to another call. Three golden pairs are blocked on this one
+   fix and nothing needs to precede it.
+2. **`//` and `%`.** Same shape as the existing binops.
+3. **Records** (phase 09). Every later phase's tests want them for grouping results,
+   and two operator pairs are already written against them.
+4. **`if`/`else`** (06), then **tag unions** (12), then **`match`** (11). `match` is
+   untestable without tags; anything returning `Try` needs both.
+5. **`?` and the rest of the error sugar** (17). Its golden pair is written and
+   green under `roc` already, so the target is unambiguous.
 
-## NEXT STEPS
-
-1. **Create project**: `cargo new roc-interpreter`
-2. **Add dependencies**: nom, bumpalo, once_cell, regex
-3. **Implement Phase 1**: String literals with type checking
-   - Parser for strings
-   - Type inference engine (synth/check)
-   - Unification algorithm
-   - Basic evaluator
-   - String interning
-4. **Test & verify**: All 4 test categories per phase
-5. **Iterate**: One phase at a time, each with full test coverage
+Each one starts by writing the golden pair, not by editing Rust — if the pair will
+not compile, the feature is not yet understood well enough to implement.
 
 ---
 
-# IMPLEMENTATION STATUS & LESSONS LEARNED
+## Status
 
-## ✅ Completed Phases (2026-09-11)
+Measured per-feature status lives in [IMPLEMENTATION_PHASES.md](IMPLEMENTATION_PHASES.md); project status in [STATUS.md](STATUS.md).
 
-### Phase 1: String Literals & Interpolation
-- ✅ String parsing with escape sequences
-- ✅ String interpolation: `"Value: ${expr}"`
-- ✅ Type checking for strings
-- ✅ 5 tests passing
-
-### Phase 2: Numbers & Identifiers
-- ✅ Integer and float parsing
-- ✅ Variable identifier parsing
-- ✅ Numeric type checking
-- ✅ 19 tests passing
-
-### Phase 3: Let Bindings & Lambda Functions
-- ✅ Let binding expressions
-- ✅ Lambda functions with closures
-- ✅ Variable scoping and shadowing
-- ✅ 16 tests passing
-
-### Phase 4: Binary Operators & Arithmetic (NEW)
-- ✅ 12 binary operators (arithmetic, comparison, logical)
-- ✅ Proper operator precedence (5 levels)
-- ✅ Mixed numeric type support
-- ✅ 36 tests passing
-
-### Phase 5: App Entry Points & Built-ins
-- ✅ App declaration parsing
-- ✅ Entry point extraction
-- ✅ Built-in functions
-- ✅ 12 tests passing
-
-**Total:** 124/125 tests passing (99.2%)
-
----
-
-## 🏛️ 10 Golden Rules (Applied in Development)
-
-These principles ensure code quality and maintainability:
-
-1. **Handle every error intentionally** — No silent failures, use .expect() with messages
-2. **Clone only when you have a reason** — Minimize allocations
-3. **Don't fight ownership; simplify design** — Redesign rather than hack
-4. **Make invalid states impossible** — Use types as guardrails
-5. **Let exhaustive matching protect** — Match all cases, rely on compiler
-6. **Borrow when you don't need ownership** — Prefer `&T` over owned `T`
-7. **Express intent** — Clear function names beat clever code
-8. **Understand performance first** — Measure before optimizing
-9. **Keep unsafe code tiny** — One justified transmute with SAFETY comment
-10. **Choose simple over clever** — Straightforward design wins
-
----
-
-## 📊 Code Quality Metrics
-
-### Build Quality
-- Compiler warnings: **0** ✅
-- Clippy issues: **0** ✅
-- Tests passing: **124/125** ✅
-- Build time: **0.8s** ✅
-
-### Refactoring Results
-- Panic-prone unwraps: 7 → 0 ✅
-- Unnecessary clones: 1 → 0 ✅
-- Code quality: 8.5/10 → 9.2/10 ✅
-
----
-
-## 🔧 Technical Implementation Details
-
-### Platform Loading Architecture
-
-The interpreter supports platform module loading via:
-
-1. **Platform Declaration:** `app [main!] { pf: platform "url" }`
-2. **URL Resolution:** Downloads and caches platform files
-3. **Module Extraction:** Parses .roc files from platform tar.br archives
-4. **Export Resolution:** Maps function names to their types
-
-**Current Implementation:**
-- Mock platform loader for testing
-- Global cache with Lazy<Mutex<>>
-- Support for Stdout module with line/write functions
-
-**Future Enhancement:**
-- Real HTTP downloads (reqwest)
-- Brotli decompression
-- Tar extraction
-- Full module system
-
-### String Interning System
-
-All identifier strings use zero-copy interning:
-
-```rust
-// Strings stored as &'static str
-let name = string_pool::intern("variable_name");  // &'static str
-
-// Prevents duplicate copies of same string
-let duplicate = string_pool::intern("variable_name");  // Same pointer
-assert_eq!(name as *const _, duplicate as *const _);  // true
-```
-
-**Benefits:**
-- No duplicate strings in memory
-- Fast comparison (pointer equality)
-- Efficient storage for many identifiers
-
-### Shorthand Desugaring (Effect Syntax)
-
-Roc's effect syntax uses `!` suffix. The desugarer converts:
-
-- `main! = expr` → `main = expr` (removes effect marker)
-- `Stdout.line! → Stdout.line` (desugars function calls)
-- `Result` → `->` (converts effect types to functions)
-
-**6-Pass Desugaring Process:**
-1. Parse and tokenize
-2. Identify effect markers (!)
-3. Remove effect syntax
-4. Convert effect types
-5. Validate scope
-6. Output desugared code
-
-**Preserved:**
-- String contents (! inside strings stays)
-- Comments
-- Whitespace structure
-
----
-
-## 🎯 Performance Characteristics
-
-### Complexity Analysis
-- **Parsing:** O(n) where n = input length
-- **Type Checking:** O(n) where n = AST size
-- **Evaluation:** O(1) per operation
-- **Operator Application:** O(1) constant time
-
-### Memory Efficiency
-- String interning: Zero duplicate strings
-- Stack-based environment: O(scope depth)
-- AST: Single pass, no intermediate copies
-
-### Benchmarks
-- Simple parsing: ~100k chars/sec
-- No regressions from refactoring
-- Minimal heap allocations in hot paths
-
----
-
-## 🔍 Code Organization
-
-### Core Modules
-
-**src/parser/mod.rs** (nom-based with Pratt precedence)
-- Operator precedence: 5 levels (multiplicative → logical OR)
-- Safe string operations (no unsafe .unwrap())
-- Entry point: parse_expr() and from_file()
-
-**src/eval/mod.rs** (tree-walk interpreter)
-- Pattern matching on AST nodes
-- Stack-based environment for scoping
-- Closure capture at lambda definition
-- One justified unsafe transmute (SAFETY comment)
-
-**src/types/checker.rs** (Hindley-Milner inference)
-- Type variable generation
-- Unification algorithm with occurs check
-- Bidirectional checking (synth + check)
-
-**src/error.rs** (thiserror-based error types)
-- ParseError: position tracking
-- TypeError: expected vs actual types
-- EvalError: runtime failures
-
-**src/memory/**
-- string_pool.rs: Global string interning
-- Global Lazy<Mutex<>> for zero-copy identifiers
-
-**src/platform/**
-- cache.rs: Global platform cache with proper error handling
-- loader.rs: Mock platform loader (Phase 1B)
-
-### Test Organization
-- phase1_test.rs: Strings (5 tests)
-- phase2_test.rs: Numbers (19 tests)
-- phase3_test.rs: Let/Lambda (16 tests)
-- phase4_operators_test.rs: Operators (36 tests)
-- phase5_lambda_test.rs: App entry (12 tests)
-- Integration tests: Platform, desugaring (20 tests)
-
----
-
-## 📈 Improvements Applied
-
-### Priority 1: Critical Fixes (COMPLETE)
-1. Enabled type checking (was disabled)
-2. Fixed 4 compiler warnings → 0
-3. Validated app entry points
-
-### Priority 2: High-Priority (COMPLETE)
-1. Integrated thiserror crate (-55 lines boilerplate)
-2. Refactored main.rs (-40 lines nested code)
-3. Added error location tracking
-
-### Priority 3: Medium-Priority (COMPLETE)
-1. Removed unnecessary clones
-2. Improved encapsulation (private fields)
-3. Verified Default trait implementations
-
-### Refactoring Phase 1-2: Golden Rules (COMPLETE)
-1. Replaced 7 panic-prone unwraps → expect()
-2. Fixed 2 unsafe string operations
-3. Optimized cache API (return references)
-4. Reduced clones (17 → 16)
-
----
-
-## 🎓 Architectural Decisions (Ponytail Rationale)
-
-### Why Tree-Walk Interpreter?
-✅ Simplicity - Direct AST execution  
-✅ Correctness - Clear semantics  
-✅ Debuggability - Easy to understand  
-✅ Maintainability - Simple to extend  
-⚠️ Performance - ~10-20% slower than bytecode (acceptable for v1.0)
-
-### Why Stack-Based Environment?
-✅ Efficiency - O(n) but fast in practice  
-✅ Correctness - Proper scoping  
-⚠️ Ceiling - O(n) lookup could optimize to O(1) with hash map
-
-### Why String Interning?
-✅ Memory - No duplicate strings  
-✅ Performance - Zero-copy passing  
-✅ Simplicity - &'static str guarantees  
-⚠️ Ceiling - No fine-grained allocation control (acceptable)
-
----
-
-## 🚀 Future Optimization Paths
-
-### Priority 4 (Optional - Not Required)
-1. Replace unsafe transmute with Rc<Expr>
-2. Optimize environment lookups (O(n) → O(1) with hash map)
-
-### Phase 6+
-1. Pattern matching and destructuring
-2. Error handling (Result types)
-3. Records and field access
-4. Lists and collections
-5. Algebraic data types
-
----
-
-## 📝 Development Guidelines
-
-### Before Making Changes
-1. Review CODE_IMPROVEMENTS.md for Golden Rules
-2. Run full test suite: `cargo test`
-3. Verify no compiler warnings: `cargo check`
-
-### Making Changes
-1. Write tests first
-2. Follow Golden Rules (especially #1: handle errors, #10: simple > clever)
-3. Use .expect() instead of .unwrap() with descriptive messages
-4. Avoid unnecessary clones
-
-### After Making Changes
-1. Run tests: `cargo test --quiet`
-2. Check for warnings: `cargo clippy`
-3. Build release: `cargo build --release`
-4. Commit with clear message
-
----
-
-## 🎯 Current Status Summary
-
-**✅ Production-Ready for:**
-- Numeric computations
-- String manipulation
-- Lambda functions and closures
-- Educational purposes
-
-**⚠️ Not Yet Ready For:**
-- Pattern matching
-- Complex record types
-- Error handling (Result)
-- Module systems
-
-**Code Quality:** 9.2/10 - Professional, maintainable, well-tested
-
-**Test Coverage:** 99.2% (124/125 tests passing)
-
-**Performance:** Adequate for interpreted language (tree-walk)
-
-**Safety:** Zero unsafe code except 1 justified transmute
-
----
-
+A hand-maintained progress log used to sit here, carrying test counts and a self-assigned code-quality score. Both went stale, and neither was reproducible from the repo. Numbers in this project should come from `cargo test` and `tests/check_roc.sh`.
