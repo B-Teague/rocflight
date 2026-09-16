@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 mod phase3_tests {
-    use rocflight::{Parser, TypeChecker, Evaluator};
+    use rocflight::{Parser, TypeChecker};
 
     #[test]
     fn test_parse_let_binding() {
@@ -35,8 +35,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let x = 42 in x");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "42");
     }
@@ -46,8 +45,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let msg = \"hello\" in msg");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "\"hello\"");
     }
@@ -57,8 +55,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let x = 42 in 99");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         // Body result is 99, not 42
         assert_eq!(val.to_string(), "99");
@@ -69,8 +66,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let x = 1 in let y = 2 in x");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         // Inner body uses x from outer scope
         assert_eq!(val.to_string(), "1");
@@ -81,8 +77,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let x = 1 in let x = 2 in x");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         // Inner x shadows outer x, so result is 2
         // (Note: linear search finds most recent binding)
@@ -129,8 +124,7 @@ mod phase3_tests {
         let mut parser = Parser::new("f(42)");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let result = eval.eval(&expr);
+        let result = rocflight::vm::eval(&expr);
 
         // Should error - function not defined
         assert!(result.is_err());
@@ -141,8 +135,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let   x   =   42   in   x");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "42");
     }
@@ -152,8 +145,7 @@ mod phase3_tests {
         let mut parser = Parser::new("let x = 3.14 in x");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "3.14");
     }

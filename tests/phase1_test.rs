@@ -2,7 +2,6 @@
 
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
-use rocflight::eval::Evaluator;
 use rocflight::types::Type;
 
 #[test]
@@ -29,8 +28,7 @@ fn test_eval_string() {
     let mut parser = Parser::new("\"hello\"");
     let expr = parser.parse_expr().expect("Failed to parse");
 
-    let mut evaluator = Evaluator::new();
-    let value = evaluator.eval(&expr).expect("Failed to evaluate");
+    let value = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
     println!("Evaluated to: {}", value);
 }
@@ -56,7 +54,6 @@ fn test_string_with_escapes() {
 
     assert_eq!(ty, Type::Str);
 
-    let mut evaluator = Evaluator::new();
-    let value = evaluator.eval(&expr).expect("Failed to evaluate");
+    let value = rocflight::vm::eval(&expr).expect("Failed to evaluate");
     println!("String with escapes: {}", value);
 }

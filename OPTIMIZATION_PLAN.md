@@ -15,9 +15,10 @@ See [The new direction](#the-new-direction) for what changed and why.
 ([round 3d](#round-3d-v2-aggregates-and-matching)) and **V3**
 ([round 3e](#round-3e-v3-var-loops-and-one-refusal)) and **V4**
 ([round 3f](#round-3f-v4-builtins-and-the-first-real-gate)) and **V5**
-([round 3g](#round-3g-v5-both-engines-pass-every-gate)). **Every gate now passes on both
-engines** — 98 golden pairs, 12 examples, 196 of 196 files byte-identical. What is left
-is V6: make the VM the default, delete the tree-walker, delete `--vm`.
+([round 3g](#round-3g-v5-both-engines-pass-every-gate)) and **V6**
+([round 3h](#round-3h-v6-one-engine)). **The tree-walker is gone and the VM is the
+engine.** Round 3 is finished; what is left has numbers attached and is listed in
+[After V6](#after-v6).
 
 Everything in the history sections below is measured. Everything in the VM sections is
 a **target**, labelled as such, and lands only when `tests/bench.sh` agrees.
@@ -830,6 +831,98 @@ called for, and V6 is where to add it if a real program wants it.
 
 ---
 
+## Round 3h: V6, one engine
+
+The tree-walker is deleted. The VM is not a mode any more — there is no `--vm` flag,
+because there is nothing to choose between.
+
+```
+ 38 files changed, 1127 insertions(+), 2352 deletions(-)
+```
+
+A net deletion of **1,225 lines**, and `src/eval/mod.rs` went from 1,795 lines to 1,119:
+what survives is the part a compiled program still calls into — the forty-odd builtins,
+the operator table, `Str.inspect`, and the statement forms that do something to the
+world. They take and return `Value`s and hold no interpreter state, which is why they
+survived the switch unchanged.
+
+Gone with it: `Environment` (the scope chain), `Value::Lambda` and `LambdaData` (a
+closure holding an AST body and a captured environment), `pattern_matches` (matching by
+walking a pattern at run time), the `Evaluator` struct itself, and the **256 MB stack
+reservation** — `main` no longer spawns a thread, because Roc recursion is heap frames
+now.
+
+### What it cost to check
+
+Nothing was deleted on the strength of an argument. The switch happened in four steps,
+each with the gates run in between:
+
+1. `vm::eval` added, and all 22 test files pointed at it — **493 tests** then ran on the
+   VM with the tree-walker still present and passing.
+2. `main.rs` made the VM the only path. 98 pairs and 12 examples, **on the default 8 MB
+   stack**.
+3. The tree-walker deleted, the builtins unwrapped from `impl Evaluator` into free
+   functions, and the two that dispatch on a user's own method (`Str.inspect` looking
+   for a `to_inspect`, operator dispatch looking for `plus`) pointed at
+   `vm::methods_named`, which scans the compiled chunk table instead of a scope chain.
+4. The harnesses' `--vm` plumbing removed, `vm_coverage.sh` deleted (it existed to
+   compare engines), and the VM's baseline became *the* baseline.
+
+### The differential suite, frozen
+
+`tests/vm_test.rs` was differential for six phases: every program ran on both engines
+and the two answers had to match. With one engine that is not possible, so its
+expectations are **what the two engines agreed on, frozen** — including every error
+message, which is now asserted exactly rather than compared. The commit where both
+engines still ran is `172da7c`; the parity is in its history.
+
+This is a real loss of a gate, and worth being explicit about: the safety net that
+caught three wrong answers in V4 is gone. What remains above it is the one that always
+mattered more — `tests/check_roc.sh --strict` checks 98 golden pairs against the **real
+`roc` binary**, which is the only authority on what Roc means.
+
+### Where it ended up
+
+```
+benchmark        tree-walker, first   tree-walker, tuned   register VM
+calls                          80ms                 12ms           6ms
+closure_capture               516ms                  3ms           2ms
+closure_in_loop                75ms                 29ms           8ms
+loop                           27ms                 22ms           9ms
+matching                      224ms                 52ms          22ms
+records                        32ms                 16ms           8ms
+strings                        30ms                  5ms           5ms
+```
+
+`Value` is 32 bytes, `Op` is 16, and the crate is `#![forbid(unsafe_code)]`.
+
+## After V6
+
+Everything here has a number attached or a named cause. Nothing is speculative.
+
+- **Operand-shape dispatch** in `Bin` — worth about **24%** on `fib`, priced in
+  [round 3c](#round-3c-v1-closures-and-the-clone-that-was-costing-40) with a throwaway
+  fast path. Needs the checker's types threaded through the compiler so `AddInt` can be
+  emitted where both sides are known to be `Int`.
+- **Field access by slot** instead of by name. A record is a `Vec<(&str, Value)>` and
+  `GetField` compares strings; resolving a field to an index needs the record's type at
+  the access site. The other half of the `matching`/`records` gap.
+- **The callback boundary.** A builtin's callback re-enters the VM through
+  `eval::call_function`, which nests a Rust frame — the last place the Rust stack bounds
+  a Roc program. Lowering the callback-taking builtins (`List.map`, `fold`, `filter`)
+  into bytecode removes it.
+- **Lazy iterators** (item 11). Still the only thing that addresses `strings` at 18.9×
+  roc's memory, and still orthogonal to everything else.
+- **A shared cell for a captured `var`**, which is what the four deliberate refusals
+  need. Nothing in roc's suite wants it yet.
+- **`Value` to 16 bytes** by boxing `Range` and shrinking `Builtin`'s owned `String` to
+  a `&'static str`. `Value` is moved on every register write, so the width is a tax on
+  everything.
+- **A JIT.** Cranelift takes the same IR. It is a strictly larger correctness surface
+  and the VM had to exist first; now it does.
+
+---
+
 ## The new direction
 
 The old plan said: *"A bytecode VM or a JIT. Every problem found so far is
@@ -1097,12 +1190,12 @@ engine ran this?".
 | ~~**V3**~~ **done** | `var`, `for`, `while`, `break`, ranges (lazily, as now) | `vm_test` (42 cases), `vm_coverage.sh` clear of `var` | **met**: `loop` 21ms → **8ms** |
 | ~~**V4**~~ **done** | strings and interpolation, builtins, host effects, qualified names, method dispatch | `check_roc.sh --vm`: **96 of 98**, the 2 pending being V5's; `vm_test` (50 cases) | **met**: every benchmark runs, `strings` and `list_ops` unchanged |
 | ~~**V5**~~ **done** | `expect`, `dbg`, `crash`, local modules, `ingest`, `--test` under `--vm` | **met**: `check_roc.sh --strict --vm` 98 of 98, `check_examples.sh` with `VM_FLAG=--vm` 12 of 12, `vm_coverage.sh` 196 identical and 0 refused | — |
-| **V6** | **flip the default, delete the tree-walker, delete `--vm`** | all four gates | drop the 256 MB stack reservation |
+| ~~**V6**~~ **done** | the tree-walker, `Environment`, `Value::Lambda`, `pattern_matches`, the `Evaluator` and `--vm` all deleted | **met**: 98 pairs, 12 examples, 493 tests, on the default stack | **met**: 1,225 lines net deleted, 256 MB reservation gone |
 
-**V6 is not optional.** Two engines for the same language is the expensive failure mode:
-every feature gets built twice, every bug gets diagnosed twice, and the gates stop
-telling you which one is wrong. The `--vm` flag exists to make V0–V5 committable, and it
-is deleted in the same commit that makes the VM the default.
+**V6 was not optional.** Two engines for the same language is the expensive failure
+mode: every feature gets built twice, every bug gets diagnosed twice, and the gates stop
+telling you which one is wrong. The `--vm` flag existed to make V0–V5 committable, and
+[round 3h](#round-3h-v6-one-engine) deleted it along with the engine it selected.
 
 **Two gate corrections, both the same mistake.** V0's row said "every `tests/bench/`
 program runs under `--vm`" and V1's said "`check_roc.sh --strict` under `--vm`". Neither

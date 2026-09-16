@@ -6,7 +6,7 @@
 //!   `exposes` module list, the `hosted` symbol names, and each exposed module's
 //!   declared members with their signatures.
 //! * It CANNOT execute a platform's effects. A `hosted` function is implemented in the
-//!   platform's compiled host (`.a` / `.rh` files next to the sources); a tree-walking
+//!   platform's compiled host (`.a` / `.rh` files next to the sources); an
 //!   interpreter has nothing to call. So an effect runs only where this interpreter
 //!   supplies its own implementation, and otherwise reports exactly which one is
 //!   missing. That limit is architectural, not an oversight.
@@ -268,7 +268,7 @@ pub fn load(alias: &str, url: &str) -> Result<RealPlatform, String> {
 /// Where a platform's compiled host lives, if it is present.
 ///
 /// Only used to explain why an effect cannot run: the host is native code, so finding
-/// it does not make it callable from a tree-walking interpreter.
+/// it does not make it callable from an interpreter.
 pub fn host_artifacts(sources: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(sources) else {
         return Vec::new();

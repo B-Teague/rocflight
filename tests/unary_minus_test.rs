@@ -14,7 +14,6 @@
 //! direction, and no golden pair can rely on it because every pair passes `roc check`.
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::Evaluator;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -26,7 +25,7 @@ fn build(src: &str) -> rocflight::ast::Expr {
 fn value(src: &str) -> String {
     let ast = build(src);
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed").to_string()
+    rocflight::vm::eval(&ast).expect("eval failed").to_string()
 }
 
 const DEFS: &str = "n : I64\nn = 5\nm : I64\nm = 3\ninc : I64 -> I64\ninc = |x| x + 1\nscale : I64 -> I64\nscale = |x| x * 10\n";
@@ -81,7 +80,7 @@ fn negating_a_non_number_is_an_error() {
     // roc reports this as a missing `negate` method, not a syntax error.
     let ast = build("s : Str\ns = \"x\"\n-s");
     let _ = TypeChecker::new().synth(&ast);
-    assert!(Evaluator::new().eval(&ast).is_err(), "negating a Str should fail");
+    assert!(rocflight::vm::eval(&ast).is_err(), "negating a Str should fail");
 }
 
 // --- precedence -----------------------------------------------------------

@@ -1,8 +1,6 @@
 //! Runtime values for the evaluator
 
 use std::fmt;
-use crate::ast::Expr;
-use crate::eval::Environment;
 
 /// Runtime value
 #[derive(Clone)]
@@ -21,21 +19,11 @@ pub enum Value {
     Float(f64),
     /// Builtin function marker: name + arity
     Builtin(String, usize),
-    /// A closure. Boxed, because this variant is what decides `size_of::<Value>()`.
+    /// A function value: a chunk to run, and the values it captured.
     ///
-    /// Inline it was four fields wide — 56 bytes, of which 32 was the `Environment` —
-    /// and every OTHER variant paid for it, since an enum is as big as its widest arm.
-    /// `Value` is moved constantly (every binding, argument, list element and return),
-    /// so the width is a tax on the whole interpreter and not just on closures. Behind
-    /// an `Rc` the arm is 8 bytes and a closure clone is a refcount bump.
-    Lambda(std::rc::Rc<LambdaData>),
-    /// A function value produced by the register VM.
-    ///
-    /// A separate variant from `Lambda` because the two engines represent a function
-    /// differently and deliberately: the tree-walker's holds an AST body and a captured
-    /// `Environment`, while this holds a chunk id and the values it captured, decided
-    /// at compile time. Only the VM constructs it, and only the VM calls it; it renders
-    /// identically so that a program's OUTPUT cannot tell which engine ran it.
+    /// Boxed, because this is otherwise the variant that would decide
+    /// `size_of::<Value>()` — and `Value` is moved on every binding, argument, list
+    /// element and return, so its width is a tax on the whole interpreter.
     Closure(std::rc::Rc<crate::vm::Closure>),
     /// Empty record `{}` — Roc's unit value.
     Unit,
@@ -65,34 +53,6 @@ pub enum Value {
     Tag(&'static str, std::rc::Rc<Vec<Value>>),
 }
 
-/// The body of a closure. See `Value::Lambda`.
-pub struct LambdaData {
-    /// Shared with the `Expr::Lambda` node this closure came from.
-    pub params: std::rc::Rc<Vec<&'static str>>,
-    /// Shared with the AST, not cloned: see `Expr::Lambda`.
-    pub body: std::rc::Rc<Expr>,
-    pub env: Environment,
-    /// The name this closure was bound to, when it was bound by a `let`.
-    ///
-    /// A closure captures its environment as it was BEFORE its own binding existed, so
-    /// a recursive call cannot find itself there. `apply` rebinds the closure under
-    /// this name in the call frame, which ties the knot without making the environment
-    /// shared and mutable.
-    pub self_name: Option<&'static str>,
-}
-
-impl LambdaData {
-    /// The same closure, bound to `name` so its body can call itself.
-    pub fn with_self_name(&self, name: &'static str) -> Self {
-        LambdaData {
-            params: self.params.clone(),
-            body: self.body.clone(),
-            env: self.env.clone(),
-            self_name: Some(name),
-        }
-    }
-}
-
 impl Value {
     /// A tag value. Wraps the payload so call sites stay readable.
     pub fn tag(name: &'static str, payload: Vec<Value>) -> Value {
@@ -107,7 +67,6 @@ impl fmt::Debug for Value {
             Value::Int(n) => write!(f, "Int({})", n),
             Value::Float(n) => write!(f, "Float({})", n),
             Value::Builtin(name, arity) => write!(f, "Builtin({}, {})", name, arity),
-            Value::Lambda(l) => write!(f, "Lambda(|{}| ...)", l.params.join(", ")),
             Value::Closure(c) => write!(f, "Closure(|{}| ...)", c.params.join(", ")),
             Value::Unit => write!(f, "Unit"),
             Value::Bool(b) => write!(f, "Bool({})", b),
@@ -158,7 +117,6 @@ impl fmt::Display for Value {
                 write!(f, "{}", n)
             }
             Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
-            Value::Lambda(l) => write!(f, "<lambda |{}|>", l.params.join(", ")),
             Value::Closure(c) => write!(f, "<lambda |{}|>", c.params.join(", ")),
             Value::Unit => write!(f, "{{}}"),
             Value::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),

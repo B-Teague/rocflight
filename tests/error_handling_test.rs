@@ -12,7 +12,7 @@
 //!   * `?:` optional record fields — type-level only, and needs nominal types
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -24,7 +24,7 @@ fn parse(src: &str) -> Result<rocflight::ast::Expr, rocflight::error::ParseError
 fn eval(src: &str) -> Value {
     let ast = parse(src).expect("parse failed");
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed")
+    rocflight::vm::eval(&ast).expect("eval failed")
 }
 
 fn as_str(src: &str) -> String {

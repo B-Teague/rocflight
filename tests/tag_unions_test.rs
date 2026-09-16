@@ -8,7 +8,7 @@
 //!     binding: `c : [Red, Green, ..]` still rejects `c = Blue`
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -24,7 +24,7 @@ fn ty(src: &str) -> String {
 fn eval(src: &str) -> Value {
     let ast = build(src);
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed")
+    rocflight::vm::eval(&ast).expect("eval failed")
 }
 
 fn as_str(src: &str) -> String {

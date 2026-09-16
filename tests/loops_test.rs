@@ -12,7 +12,6 @@
 //! can be written against it.
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::Evaluator;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -24,13 +23,13 @@ fn build(src: &str) -> rocflight::ast::Expr {
 fn value(src: &str) -> String {
     let ast = build(src);
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed").to_string()
+    rocflight::vm::eval(&ast).expect("eval failed").to_string()
 }
 
 fn eval_error(src: &str) -> String {
     let ast = build(src);
     let _ = TypeChecker::new().synth(&ast);
-    Evaluator::new().eval(&ast).expect_err("expected an eval error").message
+    rocflight::vm::eval(&ast).expect_err("expected an eval error").message
 }
 
 // --- var and assignment ---------------------------------------------------

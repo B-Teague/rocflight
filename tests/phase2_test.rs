@@ -113,8 +113,7 @@ mod phase2_tests {
         let mut parser = Parser::new("42");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = rocflight::Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "42");
     }
@@ -124,8 +123,7 @@ mod phase2_tests {
         let mut parser = Parser::new("-3");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = rocflight::Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "-3");
     }
@@ -135,8 +133,7 @@ mod phase2_tests {
         let mut parser = Parser::new("3.14");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = rocflight::Evaluator::new();
-        let val = eval.eval(&expr).expect("Failed to evaluate");
+        let val = rocflight::vm::eval(&expr).expect("Failed to evaluate");
 
         assert_eq!(val.to_string(), "3.14");
     }
@@ -146,8 +143,7 @@ mod phase2_tests {
         let mut parser = Parser::new("birds");
         let expr = parser.parse_expr().expect("Failed to parse");
 
-        let mut eval = rocflight::Evaluator::new();
-        let result = eval.eval(&expr);
+        let result = rocflight::vm::eval(&expr);
 
         // Should error - Phase 3 adds proper variable lookup
         assert!(result.is_err());

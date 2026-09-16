@@ -4,7 +4,7 @@
 //! implemented, not inferred.
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -13,7 +13,7 @@ fn eval(src: &str) -> Value {
     let mut parser = Parser::new(&desugared);
     let ast = parser.parse_expr().expect("parse failed");
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed")
+    rocflight::vm::eval(&ast).expect("eval failed")
 }
 
 fn as_str(src: &str) -> String {
@@ -102,7 +102,7 @@ fn missing_field_is_an_error() {
     let desugared = Desugarer::new("r = { a: 1 }\nr.nope".to_string()).desugar().unwrap();
     let mut parser = Parser::new(&desugared);
     let ast = parser.parse_expr().unwrap();
-    assert!(Evaluator::new().eval(&ast).is_err(), "missing field should fail at eval");
+    assert!(rocflight::vm::eval(&ast).is_err(), "missing field should fail at eval");
 }
 
 #[test]
@@ -184,7 +184,7 @@ fn int_div_by_zero_is_an_error() {
     let desugared = Desugarer::new("7 // 0".to_string()).desugar().unwrap();
     let mut parser = Parser::new(&desugared);
     let ast = parser.parse_expr().unwrap();
-    assert!(Evaluator::new().eval(&ast).is_err(), "division by zero should fail");
+    assert!(rocflight::vm::eval(&ast).is_err(), "division by zero should fail");
 }
 
 #[test]

@@ -15,8 +15,6 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 ROC=${ROC:-roc}
 ROCFLIGHT=${ROCFLIGHT:-$PWD/target/debug/rocflight}
-# VM_FLAG=--vm runs the examples on the register VM instead of the tree-walker.
-VM_FLAG=${VM_FLAG:-}
 ROOT=tests/roc/examples
 
 # name entry mode
@@ -112,8 +110,8 @@ while read -r name entry mode; do
   roc_out=$(printf '%s\n' "$roc_out" | sed -E 's/ in [0-9.]+ m?s\.?( \(cached\))?$//')
 
   # `--test` makes rocflight report its `expect` tally the way `roc test` does.
-  int_flags="$VM_FLAG"
-  [ "$mode" = test ] && int_flags="$int_flags --test"
+  int_flags=""
+  [ "$mode" = test ] && int_flags=--test
   int_out=$(cd "$dir" && timeout 120 "$ROCFLIGHT" $int_flags "$entry" 2>&1 </dev/null | grep -v '^\[Desugaring\]')
   int_out=$(printf '%s\n' "$int_out" | sed -E 's/ in [0-9.]+ m?s\.?( \(cached\))?$//')
 

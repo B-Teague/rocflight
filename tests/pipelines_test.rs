@@ -9,7 +9,7 @@
 //!     `2 * inc(3)` = 8
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -21,7 +21,7 @@ fn build(src: &str) -> rocflight::ast::Expr {
 fn as_str(src: &str) -> String {
     let ast = build(src);
     TypeChecker::new().synth(&ast).expect("type check failed");
-    match Evaluator::new().eval(&ast).expect("eval failed") {
+    match rocflight::vm::eval(&ast).expect("eval failed") {
         Value::Str(s) => s.to_string(),
         other => panic!("expected Str, got {:?}", other),
     }

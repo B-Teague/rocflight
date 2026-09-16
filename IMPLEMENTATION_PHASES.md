@@ -301,7 +301,7 @@ someone who was not thinking about this interpreter:
 | `expect`s ran in source order | roc loads the whole module first, so an `expect` may call a function declared below it |
 | Block-local recursion | A closure captured its environment before its own binding existed, so `go` could not call `go` |
 | The top level was not order-independent | A closure captured a deep copy, freezing the top level as it stood; now the outermost scope is SHARED |
-| 8 MB of stack | A tree-walker spends many Rust frames per Roc call and died at ~200 levels; the LeastSquares example recurses 501 |
+| 8 MB of stack | A tree-walker spent many Rust frames per Roc call and died at ~200 levels; the LeastSquares example recurses 501. The register VM's frames are a `Vec`, so the reservation is gone |
 | An annotated function could not see its own annotation while its body was checked | `hanoi` calling itself produced an unresolved type |
 | `concat` was hardcoded to `Str` | `List.concat` returns a List; the receiver decides |
 | Multi-byte characters in string literals | `byte as char` turned `σ` into mojibake |
@@ -745,7 +745,7 @@ type error. `List.len` returns U64, and the annotation has to say so.
   something to fetch — it resolves to no archive and is skipped.
 
 **The architectural limit, stated plainly:** a platform's `hosted` functions live in
-its **compiled host**, which a tree-walking interpreter cannot call. So an effect runs
+its **compiled host**, which an interpreter cannot call. So an effect runs
 only where this interpreter supplies its own implementation (`Stdout.line!`,
 `Stdout.write!`, `Stderr.line!`, `Stderr.write!`). Anything else the platform declares
 is reported as *"provided by the platform's compiled host, which this interpreter

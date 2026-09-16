@@ -5,7 +5,6 @@
 //! enough to be worth stating outright.
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::Evaluator;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -21,7 +20,7 @@ fn value(src: &str) -> String {
     checker.allow_dispatch(parser.where_methods());
     checker.synth(&ast).expect("type check failed");
 
-    Evaluator::new().eval(&ast).expect("eval failed").to_string()
+    rocflight::vm::eval(&ast).expect("eval failed").to_string()
 }
 
 // --- grapheme literals ----------------------------------------------------

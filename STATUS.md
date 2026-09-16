@@ -140,14 +140,20 @@ AST (Expression trees with binary operators)
     ↓
 Type Checker (Hindley-Milner inference with unification)
     ↓
-Evaluator (Tree-walk interpreter with stack-based environment)
+Compiler (AST → bytecode: names resolved to registers, slots and chunk ids)
     ↓
-Value (Runtime representation with closure support)
+Register VM (flat opcodes, one register file, heap-allocated call frames)
+    ↓
+Value (Runtime representation, 32 bytes, with closure support)
 ```
 
 ### Key Design Decisions
-- **Tree-walk interpreter:** Simple, direct execution model
-- **Stack-based environment:** Efficient variable lookups
+- **Register VM in safe Rust:** no `unsafe`, so a wrong opcode is a message rather
+  than memory corruption. It replaced a tree-walker; `OPTIMIZATION_PLAN.md` has the
+  phases and the measurements
+- **Names resolved at compile time:** a local is a register, a captured variable an
+  index, a top-level name a slot, a top-level function a chunk id — nothing compares a
+  string at run time
 - **String interning:** Zero-copy identifier storage
 - **Lazy initialization:** Global caches for platforms and strings
 - **Closure capture:** Environment snapshot at lambda definition
@@ -339,10 +345,12 @@ src/
 ├── main.rs              — Entry point with error handling
 ├── ast/                 — Abstract syntax tree definitions
 ├── parser/              — Precedence-climbing parser
-├── eval/                — Tree-walk evaluator
+├── vm/                  — the register VM
+│   ├── mod.rs           — opcodes and the machine
+│   └── compile.rs       — AST → bytecode
+├── eval/                — builtins, operators and runtime helpers
 │   ├── mod.rs
-│   ├── value.rs         — Runtime value representation
-│   └── environment.rs   — Stack-based environment
+│   └── value.rs         — Runtime value representation
 ├── types/               — Type checking and inference
 │   ├── mod.rs
 │   └── checker.rs       — Hindley-Milner checker
@@ -471,18 +479,19 @@ multiply_by(5)(3)  # 15
 
 ## 🎓 Architecture Highlights
 
-### Why Tree-Walk Interpreter?
-- **Simplicity:** Direct AST execution, easy to understand
-- **Correctness:** Clear semantics, fewer bugs
-- **Debuggability:** Straightforward execution model
-- **Performance:** Adequate for interpreted languages
-- **Maintainability:** Easy to extend with new features
+### Why a Register VM?
+- **Speed:** 2 to 8× the tree-walker it replaced, on the same programs
+- **No name lookup at run time:** the compiler resolves every name to an index
+- **Bounded memory:** call frames are a `Vec`, so deep recursion costs heap rather
+  than a reserved 256 MB stack, and a tail call reuses its frame
+- **Fewer instructions than a stack machine:** `Add r3, r1, r2` rather than
+  push/push/add/pop, which matters when a `Value` is 32 bytes to move
 
-### Why Stack-Based Environment?
-- **Efficiency:** O(n) lookup, but fast in practice
-- **Correctness:** Proper scoping and shadowing
-- **Simplicity:** Easy to implement and understand
-- **Future:** Can optimize with hash map later
+### Why Safe Rust Throughout?
+- **A wrong opcode is a panic with a message**, not a silent wrong answer — which is
+  what caught a mis-patched jump target during development
+- **The cost is known:** no NaN-boxing, no computed goto, bounds-checked registers.
+  `OPTIMIZATION_PLAN.md` prices each one and names the safe substitute taken instead
 
 ### Why String Interning?
 - **Memory:** No duplicate strings in memory

@@ -8,7 +8,7 @@
 //!   * `..` may sit at the end, middle, or start of a list pattern
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -20,7 +20,7 @@ fn parse(src: &str) -> Result<rocflight::ast::Expr, rocflight::error::ParseError
 fn eval(src: &str) -> Value {
     let ast = parse(src).expect("parse failed");
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed")
+    rocflight::vm::eval(&ast).expect("eval failed")
 }
 
 fn type_error(src: &str) -> String {
@@ -93,7 +93,7 @@ fn list_fold_accumulates_with_acc_first() {
 #[test]
 fn unknown_list_builtin_is_reported() {
     let ast = parse("List.nope([1])").unwrap();
-    let err = Evaluator::new().eval(&ast).expect_err("should fail");
+    let err = rocflight::vm::eval(&ast).expect_err("should fail");
     assert!(err.message.contains("List.nope"), "got {}", err.message);
 }
 
@@ -199,6 +199,6 @@ fn lambdas_still_work_in_both_call_positions() {
 #[test]
 fn calling_a_non_function_reports_the_value() {
     let ast = parse("f = |x| x\nList.map([1], 5)").unwrap();
-    let err = Evaluator::new().eval(&ast).expect_err("should fail");
+    let err = rocflight::vm::eval(&ast).expect_err("should fail");
     assert!(err.message.contains("non-function"), "got {}", err.message);
 }

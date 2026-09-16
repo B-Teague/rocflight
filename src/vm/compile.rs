@@ -5,10 +5,10 @@
 //! enclosing function's values a closure needs, where a branch lands. Doing it once is
 //! the entire point.
 //!
-//! **Coverage is explicit.** An expression this phase does not handle is an `Err`
-//! naming it, never a fall-through to the tree-walker. Two engines that quietly
-//! disagree about which one ran a program is the failure mode that makes a VM
-//! expensive, so the only way to find out the VM cannot run something is to be told.
+//! **Refusals are explicit.** Anything this cannot lower is an `Err` naming it. There
+//! is no fallback interpreter to quietly take over, which is the point of there being
+//! one engine: a program either compiles or says why. The `expr` match is exhaustive
+//! over `Expr` on purpose, so a variant added to the AST is a compile error here.
 
 use super::{Chunk, ChunkId, CondKind, Op, Program, Reg};
 use crate::ast::{Expr, MatchArm, Pattern, StrPart};

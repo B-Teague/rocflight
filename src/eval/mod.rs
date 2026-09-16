@@ -1,1312 +1,761 @@
-//! Expression evaluator (tree-walk interpreter)
+//! Roc's builtins, operators and runtime helpers.
 //!
-//! Phase 1: String evaluation
-//! Phase 2: Numbers, identifiers (partial)
-//! Phase 3: Lambdas, calls, let bindings
+//! What is left of what used to be a tree-walking interpreter. The walker itself is
+//! gone — the register VM in `crate::vm` runs every program now — and these are the
+//! parts a compiled program still calls into: the forty-odd builtins, the operator
+//! table, `Str.inspect`, and the handful of statement forms that do something to the
+//! world (`expect`, `dbg`, `crash`, the host's `echo!`).
+//!
+//! They take and return `Value`s and hold no interpreter state, which is why they
+//! survived the switch unchanged.
 
-use crate::ast::{Expr, BinOp, Pattern};
+use crate::ast::{BinOp, Pattern};
 use crate::error::EvalError;
 
 pub mod value;
-pub mod environment;
 
 pub use value::{str_value, Value};
-pub use environment::Environment;
 
-/// Tree-walk interpreter
-pub struct Evaluator {
-    pub env: Environment,
-    /// The value a `return` is carrying, if one is unwinding.
-    ///
-    /// The signal itself rides the error channel; an error carries only a message, so
-    /// the value travels here and `apply` picks it up at the function boundary.
-    returning: Option<Value>,
+
+/// A nominal's own `to_inspect`, if it defines one.
+fn custom_inspect(value: &Value) -> Option<Value> {
+    for (_, func) in crate::vm::methods_named("to_inspect") {
+        if let Ok(shown @ Value::Str(_)) = call_function(func, vec![value.clone()]) {
+            return Some(shown);
+        }
+    }
+    None
 }
 
-impl Evaluator {
-    /// Create new evaluator
-    pub fn new() -> Self {
-        Evaluator {
-            env: Environment::new(),
-            returning: None,
-        }
-    }
 
-    /// Evaluate expression to value
-    pub fn eval(&mut self, expr: &Expr) -> Result<Value, EvalError> {
-        match expr {
-            Expr::Str(s) => Ok(str_value(*s)),
-            Expr::Unit => Ok(Value::Unit),
-            Expr::Bool(b) => Ok(Value::Bool(*b)),
-            Expr::Range { start, end, inclusive } => {
-                let bound = |v: Value| -> Result<i64, EvalError> {
-                    match v {
-                        Value::Int(n) => Ok(n),
-                        other => Err(EvalError {
-                            message: format!("A range needs whole numbers, got {}", other),
-                        }),
-                    }
-                };
-                Ok(Value::Range {
-                    start: bound(self.eval(start)?)?,
-                    end: bound(self.eval(end)?)?,
-                    inclusive: *inclusive,
-                })
-            }
-            Expr::Tuple(items) => {
-                let mut values = Vec::with_capacity(items.len());
-                for item in items {
-                    values.push(self.eval(item)?);
-                }
-                Ok(Value::Tuple(values))
-            }
-            Expr::TupleIndex { tuple, index } => {
-                match self.eval(tuple)? {
-                    Value::Tuple(items) => items.get(*index).cloned().ok_or_else(|| EvalError {
-                        message: format!(
-                            "Tuple has {} element(s), so .{} is out of range",
-                            items.len(),
-                            index
-                        ),
-                    }),
-                    other => Err(EvalError {
-                        message: format!("Cannot index .{} on {}", index, other),
-                    }),
-                }
-            }
-            Expr::RecordUpdate { base, fields } => {
-                let mut record = match self.eval(base)? {
-                    Value::Record(fields) => fields,
-                    other => {
-                        return Err(EvalError {
-                            message: format!("Cannot update `{}`: it is not a record", other),
-                        })
-                    }
-                };
-                for (name, value) in fields {
-                    let new_value = self.eval(value)?;
-                    match record.iter_mut().find(|(field, _)| field == name) {
-                        Some(slot) => slot.1 = new_value,
-                        None => {
-                            return Err(EvalError {
-                                message: format!("Record has no field `{}` to update", name),
-                            })
-                        }
-                    }
-                }
-                Ok(Value::Record(record))
-            }
-            Expr::List(items) => {
-                let mut values = Vec::with_capacity(items.len());
-                for item in items {
-                    values.push(self.eval(item)?);
-                }
-                Ok(Value::List(values))
-            }
-            Expr::Match { scrutinee, arms } => {
-                let value = self.eval(scrutinee)?;
+/// The methods every `Try` answers: `Ok(v)` and `Err(e)` are just tags, so these
+/// cannot come from the builtin table, which is keyed by module.
+///
+/// `None` means the method is not one of these, and the caller carries on.
+/// The `Try` methods — `Ok`/`Err` answer these whatever module they came from.
+///
+/// Takes VALUES: it always evaluated every argument up front anyway, and the VM's
+/// dispatch opcode has nothing else to give it.
+pub fn try_method(
+    tag: &str,
+    payload: &[Value],
+    method: &str,
+    evaluated: Vec<Value>,
+) -> Result<Option<Value>, EvalError> {
+    let is_ok = tag == "Ok";
+    let inner = payload.first().cloned().unwrap_or(Value::Unit);
+    let first = || evaluated.first().cloned().unwrap_or(Value::Unit);
 
-                // Arms are tried in order; the first whose pattern matches AND whose
-                // guard holds wins. Bindings live only for that arm.
-                for arm in arms {
-                    for pattern in &arm.patterns {
-                        let mut bindings = Vec::new();
-                        if !pattern_matches(pattern, &value, &mut bindings) {
-                            continue;
-                        }
-
-                        self.env.push_scope();
-                        for (name, bound) in bindings {
-                            self.env.bind(name, bound);
-                        }
-
-                        // The guard sees the pattern's bindings, and a false guard
-                        // means this arm is skipped rather than the match failing.
-                        if let Some(guard) = &arm.guard {
-                            let passed = match self.eval(guard) {
-                                Ok(Value::Bool(b)) => b,
-                                Ok(other) => {
-                                    self.env.pop_scope();
-                                    return Err(EvalError {
-                                        message: format!(
-                                            "A match guard must be a Bool, got {}",
-                                            other
-                                        ),
-                                    });
-                                }
-                                Err(e) => {
-                                    self.env.pop_scope();
-                                    return Err(e);
-                                }
-                            };
-                            if !passed {
-                                self.env.pop_scope();
-                                continue;
-                            }
-                        }
-
-                        let result = self.eval(&arm.body);
-                        self.env.pop_scope();
-                        return result;
-                    }
-                }
-
-                // Unreachable for a program roc accepted, since roc requires the arms
-                // to be exhaustive. The interpreter cannot verify that itself (it
-                // never sees the type annotations), so it reports it here instead of
-                // silently returning something wrong.
-                Err(EvalError {
-                    message: format!("No match arm matched {}", value),
-                })
-            }
-            Expr::If { condition, then_branch, otherwise } => {
-                // Only the taken branch is evaluated.
-                match self.eval(condition)? {
-                    Value::Bool(true) => self.eval(then_branch),
-                    Value::Bool(false) => self.eval(otherwise),
-                    other => Err(EvalError {
-                        message: format!(
-                            "An if condition must be a Bool, got {}",
-                            other
-                        ),
-                    }),
-                }
-            }
-            Expr::VarDecl { name, value, body } => {
-                let val = self.eval(value)?;
-                self.env.bind(name, val);
-                self.eval(body)
-            }
-            Expr::Assign { name, value, body } => {
-                let val = self.eval(value)?;
-                // Update in place. Binding instead would shadow, and a loop body's
-                // scope is popped on the way out — the update would be lost.
-                if !self.env.assign(name, val) {
-                    return Err(EvalError {
-                        message: format!(
-                            "Cannot assign to `{}`: it is not declared with `var`",
-                            name
-                        ),
-                    });
-                }
-                self.eval(body)
-            }
-            Expr::For { name, iterable, body } => {
-                // A range is iterated WITHOUT being built: `for i in 0..<10_000_000`
-                // would otherwise allocate ten million `Value`s before the first
-                // iteration. Handled separately from a list rather than by collecting
-                // into one.
-                let iterable_value = self.eval(iterable)?;
-                if let Value::Range { start, end, inclusive } = iterable_value {
-                    let last = if inclusive { end } else { end - 1 };
-                    let mut current = start;
-                    while current <= last {
-                        self.env.push_scope();
-                        self.env.bind(name, Value::Int(current));
-                        let outcome = self.eval(body);
-                        self.env.pop_scope();
-                        match outcome {
-                            Ok(_) => {}
-                            Err(e) if e.is_break() => return Ok(Value::Unit),
-                            Err(e) => return Err(e),
-                        }
-                        current += 1;
-                    }
-                    return Ok(Value::Unit);
-                }
-
-                let items = match iterable_value {
-                    Value::List(items) => items,
-                    other => {
-                        return Err(EvalError {
-                            message: format!(
-                                "`for` needs a List or a range to iterate, got {}",
-                                other
-                            ),
-                        })
-                    }
-                };
-
-                for item in items {
-                    self.env.push_scope();
-                    self.env.bind(name, item);
-                    let outcome = self.eval(body);
-                    self.env.pop_scope();
-                    match outcome {
-                        Ok(_) => {}
-                        Err(e) if e.is_break() => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-                // A loop is a statement: its value is unit.
-                Ok(Value::Unit)
-            }
-            Expr::While { condition, body } => {
-                loop {
-                    match self.eval(condition)? {
-                        Value::Bool(true) => {}
-                        Value::Bool(false) => break,
-                        other => {
-                            return Err(EvalError {
-                                message: format!(
-                                    "A `while` condition must be a Bool, got {}",
-                                    other
-                                ),
-                            })
-                        }
-                    }
-
-                    self.env.push_scope();
-                    let outcome = self.eval(body);
-                    self.env.pop_scope();
-                    match outcome {
-                        Ok(_) => {}
-                        Err(e) if e.is_break() => break,
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(Value::Unit)
-            }
-            Expr::Return(value) => {
-                // Evaluated first: the value must be ready before the unwind starts.
-                self.returning = Some(self.eval(value)?);
-                Err(EvalError::return_signal())
-            }
-            Expr::Crash(message) => Err(crash_error(&self.eval(message)?)),
-            Expr::Expect(condition) => {
-                let value = self.eval(condition)?;
-                run_expect(&value)?;
-                Ok(Value::Unit)
-            }
-            Expr::Dbg(value) => {
-                let shown = self.eval(value)?;
-                run_dbg(&shown);
-                Ok(Value::Unit)
-            }
-            Expr::Break => Err(EvalError::break_signal()),
-            Expr::Dispatch { receiver, method, args } => {
-                let receiver_value = self.eval(receiver)?;
-
-                // A nominal's method block. Tried before the builtins so a type can
-                // define its own `show` without colliding with one.
-                let candidates = self.env.methods_named(method);
-                if !candidates.is_empty() {
-                    if candidates.len() > 1 {
-                        return Err(EvalError {
-                            message: format!(
-                                "`{}` is ambiguous: {} all define it. Call it explicitly.",
-                                method,
-                                candidates
-                                    .iter()
-                                    .map(|(n, _)| *n)
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                        });
-                    }
-                    let (_, func) = candidates.into_iter().next().expect("checked len");
-                    let mut values = Vec::with_capacity(args.len() + 1);
-                    values.push(receiver_value);
-                    for arg in args {
-                        values.push(self.eval(arg)?);
-                    }
-                    return apply(func, values);
-                }
-
-                let mut values = Vec::with_capacity(args.len());
-                for arg in args {
-                    values.push(self.eval(arg)?);
-                }
-                dispatch_builtin(self, receiver_value, method, values)
-            }
-            Expr::OptionalField { record, field } => {
-                match self.eval(record)? {
-                    Value::Record(fields) => Ok(match fields.iter().find(|(f, _)| f == field) {
-                        Some((_, value)) => Value::tag("Ok", vec![value.clone()]),
-                        // Absent, which is the point of an optional field.
-                        None => Value::tag("Err", vec![Value::tag("MissingField", vec![])]),
-                    }),
-                    other => Err(EvalError {
-                        message: format!("Cannot read optional field `{}` on {}", field, other),
-                    }),
-                }
-            }
-            Expr::FieldAccess { record, field } => {
-                let val = self.eval(record)?;
-                match val {
-                    Value::Record(fields) => fields
-                        .iter()
-                        .find(|(name, _)| name == field)
-                        .map(|(_, v)| v.clone())
-                        .ok_or_else(|| EvalError {
-                            message: format!("Record has no field '{}'", field),
-                        }),
-                    other => Err(EvalError {
-                        message: format!("Cannot access field '{}' on {}", field, other),
-                    }),
-                }
-            }
-            Expr::Record(fields) => {
-                let mut vals = Vec::with_capacity(fields.len());
-                for (name, value) in fields {
-                    vals.push((*name, self.eval(value)?));
-                }
-                Ok(Value::Record(vals))
-            }
-            Expr::Tag { name, args } => {
-                let vals = args
-                    .iter()
-                    .map(|a| self.eval(a))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::tag(name, vals))
-            }
-            Expr::StrInterp(parts) => {
-                let mut result = String::new();
-                for part in parts {
-                    match part {
-                        crate::ast::StrPart::Literal(s) => result.push_str(s),
-                        crate::ast::StrPart::Expr(e) => {
-                            // Evaluate nested expression and convert to string
-                            match self.eval(e) {
-                                Ok(v) => result.push_str(&interpolated(&v)),
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    }
-                }
-                Ok(str_value(result))
-            }
-            Expr::Int(n) => Ok(Value::Int(*n)),
-            Expr::Float(f) => Ok(Value::Float(*f)),
-            Expr::Ident(name) => {
-                // Look up variable in environment
-                match self.env.lookup(name) {
-                    Some(val) => Ok(val),
-                    None => Err(EvalError {
-                        message: format!("Undefined variable: {}", name),
-                    }),
-                }
-            }
-            Expr::Qualified { module, name } => {
-                // A nominal method block binds `Type.method` as an ordinary name, so a
-                // bare reference like `Counter.start` resolves from the environment.
-                if let Some(value) = self.env.lookup(&format!("{}.{}", module, name)) {
-                    return Ok(value);
-                }
-
-                // `Bool.True` / `Bool.False` are values, not calls.
-                if *module == "Bool" {
-                    match *name {
-                        "True" => return Ok(Value::Bool(true)),
-                        "False" => return Ok(Value::Bool(false)),
-                        _ => {}
-                    }
-                }
-
-                // Handle builtin functions from modules
-                match (*module, *name) {
-                    ("Num", "to_str") => {
-                        // Return a builtin function marker
-                        // We'll handle it in Call evaluation
-                        Err(EvalError {
-                            message: "Num.to_str requires arguments".to_string(),
-                        })
-                    }
-                    ("Stdout", "line!") => {
-                        Err(EvalError {
-                            message: "Stdout.line! requires arguments".to_string(),
-                        })
-                    }
-                    // `xs.map(Str.inspect)` passes a builtin as a value. Arity is 1:
-                    // every builtin used this way takes its subject and nothing else.
-                    _ => Ok(Value::Builtin(format!("{}.{}", module, name), 1)),
-                }
-            }
-            Expr::BinOp { left, op, right } => {
-                let left_val = self.eval(left)?;
-                let right_val = self.eval(right)?;
-                if let Some(result) = self.dispatch_operator(*op, &left_val, &right_val)? {
-                    return Ok(result);
-                }
-                Self::apply_binop(*op, &left_val, &right_val)
-            }
-            Expr::Lambda { params, body } => {
-                // A closure over the current environment. Both halves are shared with
-                // the AST node rather than copied: the body used to be deep-cloned
-                // here, every node of it, on every closure creation.
-                Ok(Value::Lambda(std::rc::Rc::new(crate::eval::value::LambdaData {
-                    params: params.clone(),
-                    body: body.clone(),
-                    env: self.env.clone(),
-                    // Filled in by the `let` that binds it, if any.
-                    self_name: None,
-                })))
-            }
-            Expr::Call { func, args } => {
-                // Handle builtin functions and calls
-                match &**func {
-                    Expr::Qualified { module, name } => {
-                        // A nominal's method block binds `Type.method` as an ordinary
-                        // name, so check the environment before the builtins.
-                        let qualified = format!("{}.{}", module, name);
-                        if let Some(func @ Value::Lambda(..)) = self.env.lookup(&qualified) {
-                            let mut arg_vals = Vec::with_capacity(args.len());
-                            for arg in args {
-                                arg_vals.push(self.eval(arg)?);
-                            }
-                            return apply(func, arg_vals);
-                        }
-                        self.call_builtin(module, name, args)
-                    }
-                    Expr::Ident(name) => {
-                        // First check if it's a variable bound to a lambda
-                        if let Some(val) = self.env.lookup(name) {
-                            match val {
-                                // A builtin bound to a name — `my_concat = Str.concat`
-                                // — is callable the same way a lambda is.
-                                callable @ (Value::Lambda(..) | Value::Builtin(..)) => {
-                                    let mut arg_vals = Vec::with_capacity(args.len());
-                                    for arg in args {
-                                        arg_vals.push(self.eval(arg)?);
-                                    }
-                                    return apply(callable, arg_vals);
-                                }
-                                _ => {}  // Not callable, fall through
-                            }
-                        }
-
-                        // Effects from the default host. `!` is part of the name.
-                        if crate::platform::host::lookup(name).is_some() {
-                            return self.call_host_effect(name, args);
-                        }
-
-                        // Try to call as builtin without module
-                        match *name {
-                            "to_str" => {
-                                // Num.to_str(value)
-                                if args.len() != 1 {
-                                    return Err(EvalError {
-                                        message: format!("to_str expects 1 argument, got {}", args.len()),
-                                    });
-                                }
-                                let val = self.eval(&args[0])?;
-                                Ok(str_value(val.to_string()))
-                            }
-                            _ => {
-                                Err(EvalError {
-                                    message: format!("Function '{}' not defined", name),
-                                })
-                            }
-                        }
-                    }
-                    _ => {
-                        // Evaluate the function expression (e.g., for chained calls like f()(x))
-                        let func_val = self.eval(func)?;
-                        match func_val {
-                            lambda @ Value::Lambda(..) => {
-                                let mut arg_vals = Vec::with_capacity(args.len());
-                                for arg in args {
-                                    arg_vals.push(self.eval(arg)?);
-                                }
-                                apply(lambda, arg_vals)
-                            }
-                            _ => {
-                                Err(EvalError {
-                                    message: "Attempted to call a non-function value".to_string(),
-                                })
-                            }
-                        }
-                    }
-                }
-            }
-            Expr::Let { name, value, body, .. } => {
-                // Evaluate value
-                let val = self.eval(value)?;
-
-                // A lambda bound by a `let` may call itself. Record the name on the
-                // closure so `apply` can put it back in scope for the body.
-                let val = match val {
-                    Value::Lambda(l) => {
-                        Value::Lambda(std::rc::Rc::new(l.with_self_name(name)))
-                    }
-                    other => other,
-                };
-
-                // Bind in environment
-                self.env.bind(name, val);
-
-                // Evaluate body
-                self.eval(body)
-            }
-        }
-    }
-
-    /// A nominal's own `to_inspect`, if one applies to this value.
-    ///
-    /// roc erases the nominal at runtime, so there is no tag saying which type a value
-    /// belongs to and no way to pick the right method by type. Each candidate is tried
-    /// in turn and the first that returns a Str without erroring wins.
-    // ponytail: a heuristic. Two nominals whose `to_inspect` both accept the same
-    // runtime shape cannot be told apart; resolving it needs the checker to record the
-    // method at each call site, which it already knows.
-    fn custom_inspect(&mut self, value: &Value) -> Option<Value> {
-        for (_, func) in self.env.methods_named("to_inspect") {
-            if let Ok(shown @ Value::Str(_)) = apply(func, vec![value.clone()]) {
-                return Some(shown);
-            }
-        }
-        None
-    }
-
-    /// The methods every `Try` answers: `Ok(v)` and `Err(e)` are just tags, so these
-    /// cannot come from the builtin table, which is keyed by module.
-    ///
-    /// `None` means the method is not one of these, and the caller carries on.
-    /// The `Try` methods — `Ok`/`Err` answer these whatever module they came from.
-    ///
-    /// Takes VALUES: it always evaluated every argument up front anyway, and the VM's
-    /// dispatch opcode has nothing else to give it.
-    pub fn try_method(
-        tag: &str,
-        payload: &[Value],
-        method: &str,
-        evaluated: Vec<Value>,
-    ) -> Result<Option<Value>, EvalError> {
-        let is_ok = tag == "Ok";
-        let inner = payload.first().cloned().unwrap_or(Value::Unit);
-        let first = || evaluated.first().cloned().unwrap_or(Value::Unit);
-
-        Ok(Some(match method {
-            "is_ok" => Value::Bool(is_ok),
-            "is_err" => Value::Bool(!is_ok),
-            // Rebuild the same tag around the mapped payload; the other side passes
-            // through untouched.
-            "map_ok" if is_ok => Value::tag("Ok", vec![apply(first(), vec![inner])?]),
-            "map_err" if !is_ok => Value::tag("Err", vec![apply(first(), vec![inner])?]),
-            "map_ok" | "map_err" => Value::tag(
-                if is_ok { "Ok" } else { "Err" },
-                payload.to_vec(),
-            ),
-            "with_default" => {
-                if is_ok {
-                    inner
-                } else {
-                    first()
-                }
-            }
-            "on_err" if !is_ok => apply(first(), vec![inner])?,
-            "on_err" => Value::tag("Ok", payload.to_vec()),
-            _ => return Ok(None),
-        }))
-    }
-
-    /// `List.*` builtins.
-    ///
-    /// Argument order follows roc: the list comes first, and `fold` takes
-    /// `(list, initial, fn)` with the accumulator as the callback's first parameter.
-    /// `List.len` returns a U64 in roc — worth remembering, since mixing it with I64
-    /// arms in a match is a type error.
-    fn call_list_builtin(&mut self, name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
-        let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
-            if wanted == got {
-                Ok(())
+    Ok(Some(match method {
+        "is_ok" => Value::Bool(is_ok),
+        "is_err" => Value::Bool(!is_ok),
+        // Rebuild the same tag around the mapped payload; the other side passes
+        // through untouched.
+        "map_ok" if is_ok => Value::tag("Ok", vec![call_function(first(), vec![inner])?]),
+        "map_err" if !is_ok => Value::tag("Err", vec![call_function(first(), vec![inner])?]),
+        "map_ok" | "map_err" => Value::tag(
+            if is_ok { "Ok" } else { "Err" },
+            payload.to_vec(),
+        ),
+        "with_default" => {
+            if is_ok {
+                inner
             } else {
-                Err(EvalError {
-                    message: format!("List.{} expects {} argument(s), got {}", name, wanted, got),
-                })
+                first()
             }
-        };
+        }
+        "on_err" if !is_ok => call_function(first(), vec![inner])?,
+        "on_err" => Value::tag("Ok", payload.to_vec()),
+        _ => return Ok(None),
+    }))
+}
 
-        let as_list = |v: Value| -> Result<Vec<Value>, EvalError> {
-            match v {
-                Value::List(items) => Ok(items),
-                other => Err(EvalError {
-                    message: format!("List.{} needs a List, got {}", name, other),
-                }),
-            }
-        };
+/// `List.*` builtins.
+///
+/// Argument order follows roc: the list comes first, and `fold` takes
+/// `(list, initial, fn)` with the accumulator as the callback's first parameter.
+/// `List.len` returns a U64 in roc — worth remembering, since mixing it with I64
+/// arms in a match is a type error.
+fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+    let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
+        if wanted == got {
+            Ok(())
+        } else {
+            Err(EvalError {
+                message: format!("List.{} expects {} argument(s), got {}", name, wanted, got),
+            })
+        }
+    };
 
-        match name {
-            "len" => {
-                expect(1, args.len())?;
-                let items = as_list(args[0].clone())?;
-                Ok(Value::Int(items.len() as i64))
-            }
-            "is_empty" => {
-                expect(1, args.len())?;
-                let items = as_list(args[0].clone())?;
-                Ok(Value::Bool(items.is_empty()))
-            }
-            "map" => {
-                expect(2, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let func = args[1].clone();
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    out.push(apply(func.clone(), vec![item])?);
-                }
-                Ok(Value::List(out))
-            }
-            "fold" => {
-                expect(3, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let mut acc = args[1].clone();
-                let func = args[2].clone();
-                for item in items {
-                    acc = apply(func.clone(), vec![acc, item])?;
-                }
-                Ok(acc)
-            }
-            "concat" => {
-                expect(2, args.len())?;
-                let mut items = as_list(args[0].clone())?;
-                items.extend(as_list(args[1].clone())?);
-                Ok(Value::List(items))
-            }
-            "append" => {
-                expect(2, args.len())?;
-                let mut items = as_list(args[0].clone())?;
-                items.push(args[1].clone());
-                Ok(Value::List(items))
-            }
-            "prepend" => {
-                expect(2, args.len())?;
-                let mut items = vec![args[1].clone()];
-                items.extend(as_list(args[0].clone())?);
-                Ok(Value::List(items))
-            }
-            "reverse" => {
-                expect(1, args.len())?;
-                let mut items = as_list(args[0].clone())?;
-                items.reverse();
-                Ok(Value::List(items))
-            }
-            // `Ok(first)` or `Err(ListWasEmpty)`, matching roc.
-            "first" | "last" => {
-                expect(1, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let picked = if name == "first" { items.first() } else { items.last() };
-                Ok(match picked {
-                    Some(v) => Value::tag("Ok", vec![v.clone()]),
-                    None => Value::tag("Err", vec![Value::tag("ListWasEmpty", vec![])]),
-                })
-            }
-            "get" => {
-                expect(2, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let index = match args[1] {
-                    Value::Int(n) if n >= 0 => n as usize,
-                    _ => usize::MAX,
-                };
-                Ok(match items.get(index) {
-                    Some(v) => Value::tag("Ok", vec![v.clone()]),
-                    None => Value::tag("Err", vec![Value::tag("OutOfBounds", vec![])]),
-                })
-            }
-            "keep_if" | "drop_if" => {
-                expect(2, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let func = args[1].clone();
-                let keep = name == "keep_if";
-                let mut out = Vec::new();
-                for item in items {
-                    if matches!(apply(func.clone(), vec![item.clone()])?, Value::Bool(b) if b == keep)
-                    {
-                        out.push(item);
-                    }
-                }
-                Ok(Value::List(out))
-            }
-            "take_first" | "take_last" | "drop_first" | "drop_last" => {
-                expect(2, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let n = match args[1] {
-                    Value::Int(n) if n >= 0 => (n as usize).min(items.len()),
-                    _ => 0,
-                };
-                let taken = match name {
-                    "take_first" => items[..n].to_vec(),
-                    "take_last" => items[items.len() - n..].to_vec(),
-                    "drop_first" => items[n..].to_vec(),
-                    _ => items[..items.len() - n].to_vec(),
-                };
-                Ok(Value::List(taken))
-            }
-            // `fold_try` stops at the first `Err`, which is the whole point: the
-            // accumulator is a Try and the fold short-circuits.
-            "fold_try" => {
-                expect(3, args.len())?;
-                let items = as_list(args[0].clone())?;
-                let mut acc = args[1].clone();
-                let func = args[2].clone();
-                for item in items {
-                    match apply(func.clone(), vec![acc.clone(), item])? {
-                        Value::Tag("Ok", payload) => {
-                            acc = payload.first().cloned().unwrap_or(Value::Unit)
-                        }
-                        stop @ Value::Tag("Err", _) => return Ok(stop),
-                        other => acc = other,
-                    }
-                }
-                Ok(Value::tag("Ok", vec![acc]))
-            }
-            // An iterator is already a list here, so collecting one is a no-op.
-            "from_iter" => {
-                expect(1, args.len())?;
-                Ok(Value::List(as_list(args[0].clone())?))
-            }
-            "contains" => {
-                expect(2, args.len())?;
-                let items = as_list(args[0].clone())?;
-                Ok(Value::Bool(items.iter().any(|v| values_equal(v, &args[1]))))
-            }
-            _ => Err(EvalError {
-                message: format!("Unknown function List.{}", name),
+    let as_list = |v: Value| -> Result<Vec<Value>, EvalError> {
+        match v {
+            Value::List(items) => Ok(items),
+            other => Err(EvalError {
+                message: format!("List.{} needs a List, got {}", name, other),
             }),
         }
-    }
+    };
 
-    /// Call an effect provided by the default (platformless) host.
-    ///
-    /// `echo!` writes its argument to stdout with no trailing newline — matching
-    /// `roc run`, which is why the test .roc files spell newlines explicitly.
-    fn call_host_effect(&mut self, name: &str, args: &[Expr]) -> Result<Value, EvalError> {
-        let mut values = Vec::with_capacity(args.len());
-        for arg in args {
-            values.push(self.eval(arg)?);
+    match name {
+        "len" => {
+            expect(1, args.len())?;
+            let items = as_list(args[0].clone())?;
+            Ok(Value::Int(items.len() as i64))
         }
-        host_effect(name, values)
-    }
-
-    /// Call builtin function from a module
-    /// Call a builtin, evaluating its arguments first.
-    fn call_builtin(&mut self, module: &str, name: &str, args: &[Expr]) -> Result<Value, EvalError> {
-        let mut values = Vec::with_capacity(args.len());
-        for arg in args {
-            values.push(self.eval(arg)?);
+        "is_empty" => {
+            expect(1, args.len())?;
+            let items = as_list(args[0].clone())?;
+            Ok(Value::Bool(items.is_empty()))
         }
-        self.call_builtin_values(module, name, values)
+        "map" => {
+            expect(2, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let func = args[1].clone();
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                out.push(call_function(func.clone(), vec![item])?);
+            }
+            Ok(Value::List(out))
+        }
+        "fold" => {
+            expect(3, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let mut acc = args[1].clone();
+            let func = args[2].clone();
+            for item in items {
+                acc = call_function(func.clone(), vec![acc, item])?;
+            }
+            Ok(acc)
+        }
+        "concat" => {
+            expect(2, args.len())?;
+            let mut items = as_list(args[0].clone())?;
+            items.extend(as_list(args[1].clone())?);
+            Ok(Value::List(items))
+        }
+        "append" => {
+            expect(2, args.len())?;
+            let mut items = as_list(args[0].clone())?;
+            items.push(args[1].clone());
+            Ok(Value::List(items))
+        }
+        "prepend" => {
+            expect(2, args.len())?;
+            let mut items = vec![args[1].clone()];
+            items.extend(as_list(args[0].clone())?);
+            Ok(Value::List(items))
+        }
+        "reverse" => {
+            expect(1, args.len())?;
+            let mut items = as_list(args[0].clone())?;
+            items.reverse();
+            Ok(Value::List(items))
+        }
+        // `Ok(first)` or `Err(ListWasEmpty)`, matching roc.
+        "first" | "last" => {
+            expect(1, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let picked = if name == "first" { items.first() } else { items.last() };
+            Ok(match picked {
+                Some(v) => Value::tag("Ok", vec![v.clone()]),
+                None => Value::tag("Err", vec![Value::tag("ListWasEmpty", vec![])]),
+            })
+        }
+        "get" => {
+            expect(2, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let index = match args[1] {
+                Value::Int(n) if n >= 0 => n as usize,
+                _ => usize::MAX,
+            };
+            Ok(match items.get(index) {
+                Some(v) => Value::tag("Ok", vec![v.clone()]),
+                None => Value::tag("Err", vec![Value::tag("OutOfBounds", vec![])]),
+            })
+        }
+        "keep_if" | "drop_if" => {
+            expect(2, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let func = args[1].clone();
+            let keep = name == "keep_if";
+            let mut out = Vec::new();
+            for item in items {
+                if matches!(call_function(func.clone(), vec![item.clone()])?, Value::Bool(b) if b == keep)
+                {
+                    out.push(item);
+                }
+            }
+            Ok(Value::List(out))
+        }
+        "take_first" | "take_last" | "drop_first" | "drop_last" => {
+            expect(2, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let n = match args[1] {
+                Value::Int(n) if n >= 0 => (n as usize).min(items.len()),
+                _ => 0,
+            };
+            let taken = match name {
+                "take_first" => items[..n].to_vec(),
+                "take_last" => items[items.len() - n..].to_vec(),
+                "drop_first" => items[n..].to_vec(),
+                _ => items[..items.len() - n].to_vec(),
+            };
+            Ok(Value::List(taken))
+        }
+        // `fold_try` stops at the first `Err`, which is the whole point: the
+        // accumulator is a Try and the fold short-circuits.
+        "fold_try" => {
+            expect(3, args.len())?;
+            let items = as_list(args[0].clone())?;
+            let mut acc = args[1].clone();
+            let func = args[2].clone();
+            for item in items {
+                match call_function(func.clone(), vec![acc.clone(), item])? {
+                    Value::Tag("Ok", payload) => {
+                        acc = payload.first().cloned().unwrap_or(Value::Unit)
+                    }
+                    stop @ Value::Tag("Err", _) => return Ok(stop),
+                    other => acc = other,
+                }
+            }
+            Ok(Value::tag("Ok", vec![acc]))
+        }
+        // An iterator is already a list here, so collecting one is a no-op.
+        "from_iter" => {
+            expect(1, args.len())?;
+            Ok(Value::List(as_list(args[0].clone())?))
+        }
+        "contains" => {
+            expect(2, args.len())?;
+            let items = as_list(args[0].clone())?;
+            Ok(Value::Bool(items.iter().any(|v| values_equal(v, &args[1]))))
+        }
+        _ => Err(EvalError {
+            message: format!("Unknown function List.{}", name),
+        }),
+    }
+}
+
+/// Call an effect provided by the default (platformless) host.
+///
+/// `echo!` writes its argument to stdout with no trailing newline — matching
+/// `roc run`, which is why the test .roc files spell newlines explicitly.
+pub fn call_builtin_values(
+    module: &str,
+    name: &str,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    // `to_str` is dispatched on the numeric type, so it is spelled `I64.to_str`,
+    // `F64.to_str`, `U8.to_str`, ... — not only `Num.to_str`. All of them
+    // stringify the same way here; the interpreter does not yet track which
+    // numeric type a value has (see IMPLEMENTATION_PHASES.md, numeric types).
+    if name == "to_str" && is_numeric_module(module) {
+        if args.len() != 1 {
+            return Err(EvalError {
+                message: format!("{}.to_str expects 1 argument, got {}", module, args.len()),
+            });
+        }
+        let val = args[0].clone();
+        return Ok(str_value(val.to_string()));
     }
 
-    pub fn call_builtin_values(
-        &mut self,
-        module: &str,
-        name: &str,
-        args: Vec<Value>,
-    ) -> Result<Value, EvalError> {
-        // `to_str` is dispatched on the numeric type, so it is spelled `I64.to_str`,
-        // `F64.to_str`, `U8.to_str`, ... — not only `Num.to_str`. All of them
-        // stringify the same way here; the interpreter does not yet track which
-        // numeric type a value has (see IMPLEMENTATION_PHASES.md, numeric types).
-        if name == "to_str" && is_numeric_module(module) {
+    // `from_str` is dispatched on the numeric type too: `I64.from_str`, and so on.
+    // It returns a Try, which is the tag union [Ok(a), Err(b)] — so the result is
+    // an ordinary tag value. roc names the failure `BadNumStr`.
+    if name == "from_str" && is_numeric_module(module) {
+        if args.len() != 1 {
+            return Err(EvalError {
+                message: format!("{}.from_str expects 1 argument, got {}", module, args.len()),
+            });
+        }
+        let text = match args[0].clone() {
+            Value::Str(s) => s,
+            other => {
+                return Err(EvalError {
+                    message: format!("{}.from_str needs a Str, got {}", module, other),
+                })
+            }
+        };
+        return Ok(match text.trim().parse::<i64>() {
+            Ok(n) => Value::tag("Ok", vec![Value::Int(n)]),
+            Err(_) => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
+        });
+    }
+
+    // Width conversions: `I64.to_f64(n)`, `n.to_dec()`, `x.to_i64()`. Integer
+    // widths are not modelled separately here, so every integer target is the same
+    // conversion — only int/float actually changes the representation.
+    if is_numeric_module(module) {
+        if let Some(target) = name.strip_prefix("to_") {
+            let value = args.first().cloned().unwrap_or(Value::Unit);
+            let as_float = matches!(target, "f32" | "f64" | "dec" | "frac");
+            let known = as_float
+                || matches!(
+                    target,
+                    "u8" | "u16" | "u32" | "u64" | "u128"
+                        | "i8" | "i16" | "i32" | "i64" | "i128"
+                );
+            if known {
+                return match (value, as_float) {
+                    (Value::Int(n), true) => Ok(Value::Float(n as f64)),
+                    (Value::Int(n), false) => Ok(Value::Int(n)),
+                    (Value::Float(f), true) => Ok(Value::Float(f)),
+                    (Value::Float(f), false) => Ok(Value::Int(f as i64)),
+                    (other, _) => Err(EvalError {
+                        message: format!("Cannot convert {} to {}", other, target),
+                    }),
+                };
+            }
+        }
+    }
+
+    // Checked arithmetic. This interpreter uses f64/i64 throughout and does not
+    // model saturation, so `*_try` always succeeds and `*_saturated` is the plain
+    // operation. SafeMath's own Overflow branch is therefore never taken — which
+    // matches roc for the inputs it uses.
+    // ponytail: real saturation needs per-width arithmetic in the evaluator.
+    if is_numeric_module(module) {
+        let checked = name
+            .strip_suffix("_try")
+            .map(|op| (op, true))
+            .or_else(|| name.strip_suffix("_saturated").map(|op| (op, false)));
+        if let Some((op, wraps)) = checked {
+            let numeric = |v: &Value| match v {
+                Value::Int(n) => Some(*n as f64),
+                Value::Float(f) => Some(*f),
+                _ => None,
+            };
+            if let (Some(a), Some(b)) =
+                (args.first().and_then(numeric), args.get(1).and_then(numeric))
+            {
+                let ints = matches!(
+                    (args.first(), args.get(1)),
+                    (Some(Value::Int(_)), Some(Value::Int(_)))
+                );
+                let result = match op {
+                    // The subject comes first, so `a.minus_try(b)` is `a - b`.
+                    "plus" => Some(a + b),
+                    "minus" => Some(a - b),
+                    "times" => Some(a * b),
+                    "div" => (b != 0.0).then(|| a / b),
+                    _ => None,
+                };
+                if let Some(value) = result {
+                    let value = if ints && op != "div" {
+                        Value::Int(value as i64)
+                    } else {
+                        Value::Float(value)
+                    };
+                    return Ok(if wraps { Value::tag("Ok", vec![value]) } else { value });
+                }
+            }
+        }
+    }
+
+    // `negate` is what unary minus lowers to, dispatched on the numeric type.
+    if name == "negate" && is_numeric_module(module) {
+        if args.len() != 1 {
+            return Err(EvalError {
+                message: format!("{}.negate expects 1 argument, got {}", module, args.len()),
+            });
+        }
+        return match &args[0] {
+            Value::Int(n) => Ok(Value::Int(-n)),
+            Value::Float(f) => Ok(Value::Float(-f)),
+            other => Err(EvalError {
+                message: format!("Cannot negate {}", other),
+            }),
+        };
+    }
+
+    if module == "List" {
+        return call_list_builtin(name, args);
+    }
+
+    match (module, name) {
+        ("Bool", "not") => {
             if args.len() != 1 {
                 return Err(EvalError {
-                    message: format!("{}.to_str expects 1 argument, got {}", module, args.len()),
+                    message: format!("Bool.not expects 1 argument, got {}", args.len()),
+                });
+            }
+            match args[0].clone() {
+                Value::Bool(b) => Ok(Value::Bool(!b)),
+                other => Err(EvalError {
+                    message: format!("Bool.not needs a Bool, got {}", other),
+                }),
+            }
+        }
+        // Effects from a real platform. `Stdout.line!` and friends are declared by
+        // the platform but implemented in its compiled host, so the ones this
+        // interpreter can run are implemented here and the rest are reported as a
+        // gap rather than as an unknown name.
+        ("Stdout", "line!") | ("Stderr", "line!") => {
+            if args.len() != 1 {
+                return Err(EvalError {
+                    message: format!("{}.{} expects 1 argument, got {}", module, name, args.len()),
+                });
+            }
+            let text = match &args[0] {
+                Value::Str(s) => s.to_string(),
+                other => other.to_string(),
+            };
+            if module == "Stderr" {
+                eprintln!("{}", text);
+            } else {
+                println!("{}", text);
+            }
+            // `line! : Str => Try({}, [StdoutErr(IOErr), ..])`
+            Ok(Value::tag("Ok", vec![Value::Unit]))
+        }
+        ("Stdout", "write!") | ("Stderr", "write!") => {
+            if args.len() != 1 {
+                return Err(EvalError {
+                    message: format!("{}.{} expects 1 argument, got {}", module, name, args.len()),
+                });
+            }
+            let text = match &args[0] {
+                Value::Str(s) => s.to_string(),
+                other => other.to_string(),
+            };
+            use std::io::Write;
+            if module == "Stderr" {
+                eprint!("{}", text);
+                let _ = std::io::stderr().flush();
+            } else {
+                print!("{}", text);
+                let _ = std::io::stdout().flush();
+            }
+            Ok(Value::tag("Ok", vec![Value::Unit]))
+        }
+        ("Str", "is_empty") => {
+            if args.len() != 1 {
+                return Err(EvalError {
+                    message: format!("Str.is_empty expects 1 argument, got {}", args.len()),
+                });
+            }
+            match &args[0] {
+                Value::Str(text) => Ok(Value::Bool(text.is_empty())),
+                other => Err(EvalError {
+                    message: format!("Str.is_empty needs a Str, got {}", other),
+                }),
+            }
+        }
+        ("Str", "inspect") => {
+            if args.len() != 1 {
+                return Err(EvalError {
+                    message: format!("Str.inspect expects 1 argument, got {}", args.len()),
                 });
             }
             let val = args[0].clone();
-            return Ok(str_value(val.to_string()));
-        }
-
-        // `from_str` is dispatched on the numeric type too: `I64.from_str`, and so on.
-        // It returns a Try, which is the tag union [Ok(a), Err(b)] — so the result is
-        // an ordinary tag value. roc names the failure `BadNumStr`.
-        if name == "from_str" && is_numeric_module(module) {
-            if args.len() != 1 {
-                return Err(EvalError {
-                    message: format!("{}.from_str expects 1 argument, got {}", module, args.len()),
-                });
+            // A nominal may define `to_inspect` to control how it is shown.
+            if let Some(custom) = custom_inspect(&val) {
+                return Ok(custom);
             }
-            let text = match args[0].clone() {
-                Value::Str(s) => s,
-                other => {
+            Ok(str_value(inspect(&val)))
+        }
+        // `haystack.split_first(needle)` → `Ok({ before, after })`, or
+        // `Err(NotFound)`. Splits at the FIRST occurrence only.
+        ("Str", "split_first") => {
+            let (text, needle) = match (args.first(), args.get(1)) {
+                (Some(Value::Str(t)), Some(Value::Str(n))) => (&**t, &**n),
+                _ => {
                     return Err(EvalError {
-                        message: format!("{}.from_str needs a Str, got {}", module, other),
+                        message: "Str.split_first needs two Str arguments".to_string(),
                     })
                 }
             };
-            return Ok(match text.trim().parse::<i64>() {
-                Ok(n) => Value::tag("Ok", vec![Value::Int(n)]),
-                Err(_) => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
-            });
+            Ok(match text.find(needle) {
+                Some(i) => Value::tag(
+                    "Ok",
+                    vec![Value::Record(vec![
+                        ("before", str_value(text[..i].to_string())),
+                        (
+                            "after",
+                            str_value(text[i + needle.len()..].to_string()),
+                        ),
+                    ])],
+                ),
+                None => Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
+            })
         }
-
-        // Width conversions: `I64.to_f64(n)`, `n.to_dec()`, `x.to_i64()`. Integer
-        // widths are not modelled separately here, so every integer target is the same
-        // conversion — only int/float actually changes the representation.
-        if is_numeric_module(module) {
-            if let Some(target) = name.strip_prefix("to_") {
-                let value = args.first().cloned().unwrap_or(Value::Unit);
-                let as_float = matches!(target, "f32" | "f64" | "dec" | "frac");
-                let known = as_float
-                    || matches!(
-                        target,
-                        "u8" | "u16" | "u32" | "u64" | "u128"
-                            | "i8" | "i16" | "i32" | "i64" | "i128"
-                    );
-                if known {
-                    return match (value, as_float) {
-                        (Value::Int(n), true) => Ok(Value::Float(n as f64)),
-                        (Value::Int(n), false) => Ok(Value::Int(n)),
-                        (Value::Float(f), true) => Ok(Value::Float(f)),
-                        (Value::Float(f), false) => Ok(Value::Int(f as i64)),
-                        (other, _) => Err(EvalError {
-                            message: format!("Cannot convert {} to {}", other, target),
-                        }),
-                    };
+        // `Str.join_with(list, separator)`, the subject first as always.
+        ("Str", "join_with") => {
+            let (items, sep) = match (args.first(), args.get(1)) {
+                (Some(Value::List(items)), Some(Value::Str(sep))) => (items, &**sep),
+                _ => {
+                    return Err(EvalError {
+                        message: "Str.join_with needs a List and a Str".to_string(),
+                    })
                 }
-            }
+            };
+            let rendered: Vec<String> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Str(text) => text.to_string(),
+                    other => other.to_string(),
+                })
+                .collect();
+            Ok(str_value(rendered.join(sep)))
         }
-
-        // Checked arithmetic. This interpreter uses f64/i64 throughout and does not
-        // model saturation, so `*_try` always succeeds and `*_saturated` is the plain
-        // operation. SafeMath's own Overflow branch is therefore never taken — which
-        // matches roc for the inputs it uses.
-        // ponytail: real saturation needs per-width arithmetic in the evaluator.
-        if is_numeric_module(module) {
-            let checked = name
-                .strip_suffix("_try")
-                .map(|op| (op, true))
-                .or_else(|| name.strip_suffix("_saturated").map(|op| (op, false)));
-            if let Some((op, wraps)) = checked {
-                let numeric = |v: &Value| match v {
-                    Value::Int(n) => Some(*n as f64),
-                    Value::Float(f) => Some(*f),
+        ("Str", "trim") | ("Str", "trim_start") | ("Str", "trim_end")
+        | ("Str", "with_ascii_uppercased") | ("Str", "with_ascii_lowercased") => {
+            let text = match args.first() {
+                Some(Value::Str(t)) => &**t,
+                _ => {
+                    return Err(EvalError {
+                        message: format!("Str.{} needs a Str", name),
+                    })
+                }
+            };
+            let out = match name {
+                "trim" => text.trim().to_string(),
+                "trim_start" => text.trim_start().to_string(),
+                "trim_end" => text.trim_end().to_string(),
+                "with_ascii_uppercased" => text.to_ascii_uppercase(),
+                _ => text.to_ascii_lowercase(),
+            };
+            Ok(str_value(out))
+        }
+        ("Str", "starts_with") | ("Str", "ends_with") | ("Str", "contains") => {
+            let (text, needle) = match (args.first(), args.get(1)) {
+                (Some(Value::Str(t)), Some(Value::Str(n))) => (&**t, &**n),
+                _ => {
+                    return Err(EvalError {
+                        message: format!("Str.{} needs two Str arguments", name),
+                    })
+                }
+            };
+            Ok(Value::Bool(match name {
+                "starts_with" => text.starts_with(needle),
+                "ends_with" => text.ends_with(needle),
+                _ => text.contains(needle),
+            }))
+        }
+        ("Str", "len") | ("Str", "count_utf8_bytes") => {
+            let text = match args.first() {
+                Some(Value::Str(t)) => &**t,
+                _ => {
+                    return Err(EvalError {
+                        message: format!("Str.{} needs a Str", name),
+                    })
+                }
+            };
+            Ok(Value::Int(text.len() as i64))
+        }
+        ("Str", "split_on") => {
+            let (text, sep) = match (args.first(), args.get(1)) {
+                (Some(Value::Str(t)), Some(Value::Str(sep))) => (&**t, &**sep),
+                _ => {
+                    return Err(EvalError {
+                        message: "Str.split_on needs two Str arguments".to_string(),
+                    })
+                }
+            };
+            Ok(Value::List(
+                text.split(sep)
+                    .map(|part| str_value(part.to_string()))
+                    .collect(),
+            ))
+        }
+        ("Str", "from_utf8") => {
+            let bytes = match args.first() {
+                Some(Value::List(items)) => items,
+                _ => {
+                    return Err(EvalError {
+                        message: "Str.from_utf8 needs a List of bytes".to_string(),
+                    })
+                }
+            };
+            let raw: Vec<u8> = bytes
+                .iter()
+                .filter_map(|v| match v {
+                    Value::Int(n) if (0..=255).contains(n) => Some(*n as u8),
                     _ => None,
-                };
-                if let (Some(a), Some(b)) =
-                    (args.first().and_then(numeric), args.get(1).and_then(numeric))
-                {
-                    let ints = matches!(
-                        (args.first(), args.get(1)),
-                        (Some(Value::Int(_)), Some(Value::Int(_)))
-                    );
-                    let result = match op {
-                        // The subject comes first, so `a.minus_try(b)` is `a - b`.
-                        "plus" => Some(a + b),
-                        "minus" => Some(a - b),
-                        "times" => Some(a * b),
-                        "div" => (b != 0.0).then(|| a / b),
-                        _ => None,
-                    };
-                    if let Some(value) = result {
-                        let value = if ints && op != "div" {
-                            Value::Int(value as i64)
-                        } else {
-                            Value::Float(value)
-                        };
-                        return Ok(if wraps { Value::tag("Ok", vec![value]) } else { value });
-                    }
-                }
-            }
+                })
+                .collect();
+            Ok(match String::from_utf8(raw) {
+                Ok(text) => Value::tag("Ok", vec![str_value(text)]),
+                Err(_) => Value::tag("Err", vec![Value::tag("BadUtf8", vec![])]),
+            })
         }
-
-        // `negate` is what unary minus lowers to, dispatched on the numeric type.
-        if name == "negate" && is_numeric_module(module) {
-            if args.len() != 1 {
-                return Err(EvalError {
-                    message: format!("{}.negate expects 1 argument, got {}", module, args.len()),
-                });
-            }
-            return match &args[0] {
-                Value::Int(n) => Ok(Value::Int(-n)),
-                Value::Float(f) => Ok(Value::Float(-f)),
-                other => Err(EvalError {
-                    message: format!("Cannot negate {}", other),
-                }),
+        ("Str", "to_utf8") => {
+            let text = match args.first() {
+                Some(Value::Str(t)) => &**t,
+                _ => {
+                    return Err(EvalError {
+                        message: "Str.to_utf8 needs a Str".to_string(),
+                    })
+                }
             };
+            Ok(Value::List(
+                text.as_bytes().iter().map(|b| Value::Int(*b as i64)).collect(),
+            ))
         }
-
-        if module == "List" {
-            return self.call_list_builtin(name, args);
+        ("Str", "concat") => {
+            let mut result = String::new();
+            for val in &args {
+                match val {
+                    Value::Str(text) => result.push_str(text),
+                    other => result.push_str(&other.to_string()),
+                }
+            }
+            Ok(str_value(result))
         }
-
-        match (module, name) {
-            ("Bool", "not") => {
-                if args.len() != 1 {
-                    return Err(EvalError {
-                        message: format!("Bool.not expects 1 argument, got {}", args.len()),
-                    });
-                }
-                match args[0].clone() {
-                    Value::Bool(b) => Ok(Value::Bool(!b)),
-                    other => Err(EvalError {
-                        message: format!("Bool.not needs a Bool, got {}", other),
-                    }),
-                }
-            }
-            // Effects from a real platform. `Stdout.line!` and friends are declared by
-            // the platform but implemented in its compiled host, so the ones this
-            // interpreter can run are implemented here and the rest are reported as a
-            // gap rather than as an unknown name.
-            ("Stdout", "line!") | ("Stderr", "line!") => {
-                if args.len() != 1 {
-                    return Err(EvalError {
-                        message: format!("{}.{} expects 1 argument, got {}", module, name, args.len()),
-                    });
-                }
-                let text = match &args[0] {
-                    Value::Str(s) => s.to_string(),
-                    other => other.to_string(),
-                };
-                if module == "Stderr" {
-                    eprintln!("{}", text);
-                } else {
-                    println!("{}", text);
-                }
-                // `line! : Str => Try({}, [StdoutErr(IOErr), ..])`
-                Ok(Value::tag("Ok", vec![Value::Unit]))
-            }
-            ("Stdout", "write!") | ("Stderr", "write!") => {
-                if args.len() != 1 {
-                    return Err(EvalError {
-                        message: format!("{}.{} expects 1 argument, got {}", module, name, args.len()),
-                    });
-                }
-                let text = match &args[0] {
-                    Value::Str(s) => s.to_string(),
-                    other => other.to_string(),
-                };
-                use std::io::Write;
-                if module == "Stderr" {
-                    eprint!("{}", text);
-                    let _ = std::io::stderr().flush();
-                } else {
-                    print!("{}", text);
-                    let _ = std::io::stdout().flush();
-                }
-                Ok(Value::tag("Ok", vec![Value::Unit]))
-            }
-            ("Str", "is_empty") => {
-                if args.len() != 1 {
-                    return Err(EvalError {
-                        message: format!("Str.is_empty expects 1 argument, got {}", args.len()),
-                    });
-                }
-                match &args[0] {
-                    Value::Str(text) => Ok(Value::Bool(text.is_empty())),
-                    other => Err(EvalError {
-                        message: format!("Str.is_empty needs a Str, got {}", other),
-                    }),
-                }
-            }
-            ("Str", "inspect") => {
-                if args.len() != 1 {
-                    return Err(EvalError {
-                        message: format!("Str.inspect expects 1 argument, got {}", args.len()),
-                    });
-                }
-                let val = args[0].clone();
-                // A nominal may define `to_inspect` to control how it is shown.
-                if let Some(custom) = self.custom_inspect(&val) {
-                    return Ok(custom);
-                }
-                Ok(str_value(inspect(&val)))
-            }
-            // `haystack.split_first(needle)` → `Ok({ before, after })`, or
-            // `Err(NotFound)`. Splits at the FIRST occurrence only.
-            ("Str", "split_first") => {
-                let (text, needle) = match (args.first(), args.get(1)) {
-                    (Some(Value::Str(t)), Some(Value::Str(n))) => (&**t, &**n),
-                    _ => {
-                        return Err(EvalError {
-                            message: "Str.split_first needs two Str arguments".to_string(),
-                        })
-                    }
-                };
-                Ok(match text.find(needle) {
-                    Some(i) => Value::tag(
-                        "Ok",
-                        vec![Value::Record(vec![
-                            ("before", str_value(text[..i].to_string())),
-                            (
-                                "after",
-                                str_value(text[i + needle.len()..].to_string()),
-                            ),
-                        ])],
-                    ),
-                    None => Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
-                })
-            }
-            // `Str.join_with(list, separator)`, the subject first as always.
-            ("Str", "join_with") => {
-                let (items, sep) = match (args.first(), args.get(1)) {
-                    (Some(Value::List(items)), Some(Value::Str(sep))) => (items, &**sep),
-                    _ => {
-                        return Err(EvalError {
-                            message: "Str.join_with needs a List and a Str".to_string(),
-                        })
-                    }
-                };
-                let rendered: Vec<String> = items
-                    .iter()
-                    .map(|v| match v {
-                        Value::Str(text) => text.to_string(),
-                        other => other.to_string(),
-                    })
-                    .collect();
-                Ok(str_value(rendered.join(sep)))
-            }
-            ("Str", "trim") | ("Str", "trim_start") | ("Str", "trim_end")
-            | ("Str", "with_ascii_uppercased") | ("Str", "with_ascii_lowercased") => {
-                let text = match args.first() {
-                    Some(Value::Str(t)) => &**t,
-                    _ => {
-                        return Err(EvalError {
-                            message: format!("Str.{} needs a Str", name),
-                        })
-                    }
-                };
-                let out = match name {
-                    "trim" => text.trim().to_string(),
-                    "trim_start" => text.trim_start().to_string(),
-                    "trim_end" => text.trim_end().to_string(),
-                    "with_ascii_uppercased" => text.to_ascii_uppercase(),
-                    _ => text.to_ascii_lowercase(),
-                };
-                Ok(str_value(out))
-            }
-            ("Str", "starts_with") | ("Str", "ends_with") | ("Str", "contains") => {
-                let (text, needle) = match (args.first(), args.get(1)) {
-                    (Some(Value::Str(t)), Some(Value::Str(n))) => (&**t, &**n),
-                    _ => {
-                        return Err(EvalError {
-                            message: format!("Str.{} needs two Str arguments", name),
-                        })
-                    }
-                };
-                Ok(Value::Bool(match name {
-                    "starts_with" => text.starts_with(needle),
-                    "ends_with" => text.ends_with(needle),
-                    _ => text.contains(needle),
-                }))
-            }
-            ("Str", "len") | ("Str", "count_utf8_bytes") => {
-                let text = match args.first() {
-                    Some(Value::Str(t)) => &**t,
-                    _ => {
-                        return Err(EvalError {
-                            message: format!("Str.{} needs a Str", name),
-                        })
-                    }
-                };
-                Ok(Value::Int(text.len() as i64))
-            }
-            ("Str", "split_on") => {
-                let (text, sep) = match (args.first(), args.get(1)) {
-                    (Some(Value::Str(t)), Some(Value::Str(sep))) => (&**t, &**sep),
-                    _ => {
-                        return Err(EvalError {
-                            message: "Str.split_on needs two Str arguments".to_string(),
-                        })
-                    }
-                };
-                Ok(Value::List(
-                    text.split(sep)
-                        .map(|part| str_value(part.to_string()))
-                        .collect(),
-                ))
-            }
-            ("Str", "from_utf8") => {
-                let bytes = match args.first() {
-                    Some(Value::List(items)) => items,
-                    _ => {
-                        return Err(EvalError {
-                            message: "Str.from_utf8 needs a List of bytes".to_string(),
-                        })
-                    }
-                };
-                let raw: Vec<u8> = bytes
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Int(n) if (0..=255).contains(n) => Some(*n as u8),
-                        _ => None,
-                    })
-                    .collect();
-                Ok(match String::from_utf8(raw) {
-                    Ok(text) => Value::tag("Ok", vec![str_value(text)]),
-                    Err(_) => Value::tag("Err", vec![Value::tag("BadUtf8", vec![])]),
-                })
-            }
-            ("Str", "to_utf8") => {
-                let text = match args.first() {
-                    Some(Value::Str(t)) => &**t,
-                    _ => {
-                        return Err(EvalError {
-                            message: "Str.to_utf8 needs a Str".to_string(),
-                        })
-                    }
-                };
-                Ok(Value::List(
-                    text.as_bytes().iter().map(|b| Value::Int(*b as i64)).collect(),
-                ))
-            }
-            ("Str", "concat") => {
-                let mut result = String::new();
-                for val in &args {
-                    match val {
-                        Value::Str(text) => result.push_str(text),
-                        other => result.push_str(&other.to_string()),
-                    }
-                }
-                Ok(str_value(result))
-            }
-            _ => Err(EvalError {
-                // A platform that declares this really does provide it; the gap is
-                // this interpreter's, and the message should say which.
-                message: if crate::platform::real::is_declared(module, name) {
-                    crate::platform::real::describe_gap(module, name)
-                } else {
-                    format!("Unknown function {}.{}", module, name)
-                },
-            }),
-        }
+        _ => Err(EvalError {
+            // A platform that declares this really does provide it; the gap is
+            // this interpreter's, and the message should say which.
+            message: if crate::platform::real::is_declared(module, name) {
+                crate::platform::real::describe_gap(module, name)
+            } else {
+                format!("Unknown function {}.{}", module, name)
+            },
+        }),
     }
+}
 
-    /// Apply binary operation
-    /// Route an operator to a user-defined method, if the operand type has one.
-    ///
-    /// roc spells every operator as a method — `a + b` IS `a.plus(b)` — so a nominal
-    /// that defines `plus` gets `+`. Only tried for compound values: a type defining
-    /// `plus` must not hijack `1 + 2`, and the builtin path handles the primitives.
-    ///
-    /// Dispatch is by method NAME, not by type, because values carry no nominal tag at
-    /// runtime — the same search `Dispatch` already does.
-    pub fn dispatch_operator(
-        &mut self,
-        op: BinOp,
-        left: &Value,
-        right: &Value,
-    ) -> Result<Option<Value>, EvalError> {
-        if !matches!(left, Value::Record(_) | Value::Tag(..) | Value::Tuple(_)) {
-            return Ok(None);
-        }
-        let method = match op {
-            BinOp::Add => "plus",
-            BinOp::Sub => "minus",
-            BinOp::Mul => "times",
-            BinOp::Div => "div_by",
-            BinOp::IntDiv => "div_trunc_by",
-            BinOp::Rem => "rem_by",
-            BinOp::Lt => "is_lt",
-            BinOp::Gt => "is_gt",
-            BinOp::Le => "is_lte",
-            BinOp::Ge => "is_gte",
-            // `!=` is `is_eq` negated: roc asks for `is_eq` either way.
-            BinOp::Eq | BinOp::Ne => "is_eq",
-            _ => return Ok(None),
-        };
-
-        let mut candidates = self.env.methods_named(method);
-        if candidates.len() != 1 {
-            return Ok(None);
-        }
-        let (_, func) = candidates.pop().expect("checked len");
-        let result = apply(func, vec![left.clone(), right.clone()])?;
-        Ok(Some(match (op, result) {
-            (BinOp::Ne, Value::Bool(b)) => Value::Bool(!b),
-            (_, other) => other,
-        }))
+/// Apply binary operation
+/// Route an operator to a user-defined method, if the operand type has one.
+///
+/// roc spells every operator as a method — `a + b` IS `a.plus(b)` — so a nominal
+/// that defines `plus` gets `+`. Only tried for compound values: a type defining
+/// `plus` must not hijack `1 + 2`, and the builtin path handles the primitives.
+///
+/// Dispatch is by method NAME, not by type, because values carry no nominal tag at
+/// runtime — the same search `Dispatch` already does.
+pub fn dispatch_operator(
+    op: BinOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Option<Value>, EvalError> {
+    if !matches!(left, Value::Record(_) | Value::Tag(..) | Value::Tuple(_)) {
+        return Ok(None);
     }
+    let method = match op {
+        BinOp::Add => "plus",
+        BinOp::Sub => "minus",
+        BinOp::Mul => "times",
+        BinOp::Div => "div_by",
+        BinOp::IntDiv => "div_trunc_by",
+        BinOp::Rem => "rem_by",
+        BinOp::Lt => "is_lt",
+        BinOp::Gt => "is_gt",
+        BinOp::Le => "is_lte",
+        BinOp::Ge => "is_gte",
+        // `!=` is `is_eq` negated: roc asks for `is_eq` either way.
+        BinOp::Eq | BinOp::Ne => "is_eq",
+        _ => return Ok(None),
+    };
 
-    /// Apply a binary operator to two already-evaluated operands.
-    ///
-    /// An associated function rather than a method: it needs no evaluator state, and
-    /// the VM backend calls it too. Operator SEMANTICS live in exactly one place, so
-    /// the two engines cannot drift on what `//` does to a negative number.
-    ///
-    /// The operands are BORROWED. No arm here needs to own them — every one either
-    /// copies a scalar out or builds a new value — and cloning them cost the VM 40% of
-    /// `fib`: two 32-byte `Value` clones per arithmetic instruction, for two integers.
-    /// The alternative was a fast path for `Int` inside the VM's `Bin` opcode, which
-    /// would have been a second implementation of Roc's arithmetic; this is the same
-    /// win with one.
-    pub fn apply_binop(op: BinOp, left: &Value, right: &Value) -> Result<Value, EvalError> {
-        match (op, left, right) {
-            // Arithmetic on integers
-            (BinOp::Add, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
-            (BinOp::Sub, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
-            (BinOp::Mul, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
-            (BinOp::Div, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err(EvalError { message: "Division by zero".to_string() })
-                } else {
-                    Ok(Value::Int(a / b))
-                }
+    let mut candidates = crate::vm::methods_named(method);
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let (_, func) = candidates.pop().expect("checked len");
+    let result = call_function(func, vec![left.clone(), right.clone()])?;
+    Ok(Some(match (op, result) {
+        (BinOp::Ne, Value::Bool(b)) => Value::Bool(!b),
+        (_, other) => other,
+    }))
+}
+
+/// Apply a binary operator to two already-evaluated operands.
+///
+/// An associated function rather than a method: it needs no evaluator state, and
+/// the VM backend calls it too. Operator SEMANTICS live in exactly one place, so
+/// the two engines cannot drift on what `//` does to a negative number.
+///
+/// The operands are BORROWED. No arm here needs to own them — every one either
+/// copies a scalar out or builds a new value — and cloning them cost the VM 40% of
+/// `fib`: two 32-byte `Value` clones per arithmetic instruction, for two integers.
+/// The alternative was a fast path for `Int` inside the VM's `Bin` opcode, which
+/// would have been a second implementation of Roc's arithmetic; this is the same
+/// win with one.
+pub fn apply_binop(op: BinOp, left: &Value, right: &Value) -> Result<Value, EvalError> {
+    match (op, left, right) {
+        // Arithmetic on integers
+        (BinOp::Add, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
+        (BinOp::Sub, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
+        (BinOp::Mul, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
+        (BinOp::Div, Value::Int(a), Value::Int(b)) => {
+            if *b == 0 {
+                Err(EvalError { message: "Division by zero".to_string() })
+            } else {
+                Ok(Value::Int(a / b))
             }
-            // `//` truncating division and `%` remainder — integers only in Roc.
-            (BinOp::IntDiv, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err(EvalError { message: "Division by zero".to_string() })
-                } else {
-                    // Roc's `//` truncates toward zero, which is Rust's `/` for i64.
-                    Ok(Value::Int(a / b))
-                }
+        }
+        // `//` truncating division and `%` remainder — integers only in Roc.
+        (BinOp::IntDiv, Value::Int(a), Value::Int(b)) => {
+            if *b == 0 {
+                Err(EvalError { message: "Division by zero".to_string() })
+            } else {
+                // Roc's `//` truncates toward zero, which is Rust's `/` for i64.
+                Ok(Value::Int(a / b))
             }
-            (BinOp::Rem, Value::Int(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err(EvalError { message: "Division by zero".to_string() })
-                } else {
-                    Ok(Value::Int(a % b))
-                }
+        }
+        (BinOp::Rem, Value::Int(a), Value::Int(b)) => {
+            if *b == 0 {
+                Err(EvalError { message: "Division by zero".to_string() })
+            } else {
+                Ok(Value::Int(a % b))
             }
-            // Arithmetic on floats
-            (BinOp::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
-            (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
-            (BinOp::Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
-            (BinOp::Div, Value::Float(a), Value::Float(b)) => {
-                if *b == 0.0 {
-                    Err(EvalError { message: "Division by zero".to_string() })
-                } else {
-                    Ok(Value::Float(a / b))
-                }
+        }
+        // Arithmetic on floats
+        (BinOp::Add, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
+        (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
+        (BinOp::Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
+        (BinOp::Div, Value::Float(a), Value::Float(b)) => {
+            if *b == 0.0 {
+                Err(EvalError { message: "Division by zero".to_string() })
+            } else {
+                Ok(Value::Float(a / b))
             }
-            // Mixed int/float arithmetic
-            (BinOp::Add, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
-            (BinOp::Add, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
-            (BinOp::Sub, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
-            (BinOp::Sub, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
-            (BinOp::Mul, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
-            (BinOp::Mul, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
-            (BinOp::Div, Value::Int(a), Value::Float(b)) => {
-                if *b == 0.0 {
-                    Err(EvalError { message: "Division by zero".to_string() })
-                } else {
-                    Ok(Value::Float(*a as f64 / b))
-                }
+        }
+        // Mixed int/float arithmetic
+        (BinOp::Add, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
+        (BinOp::Add, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
+        (BinOp::Sub, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
+        (BinOp::Sub, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
+        (BinOp::Mul, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
+        (BinOp::Mul, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
+        (BinOp::Div, Value::Int(a), Value::Float(b)) => {
+            if *b == 0.0 {
+                Err(EvalError { message: "Division by zero".to_string() })
+            } else {
+                Ok(Value::Float(*a as f64 / b))
             }
-            (BinOp::Div, Value::Float(a), Value::Int(b)) => {
-                if *b == 0 {
-                    Err(EvalError { message: "Division by zero".to_string() })
-                } else {
-                    Ok(Value::Float(a / *b as f64))
-                }
+        }
+        (BinOp::Div, Value::Float(a), Value::Int(b)) => {
+            if *b == 0 {
+                Err(EvalError { message: "Division by zero".to_string() })
+            } else {
+                Ok(Value::Float(a / *b as f64))
             }
-            // String concatenation
-            (BinOp::Add, Value::Str(a), Value::Str(b)) => {
-                let concatenated = format!("{}{}", a, b);
-                Ok(str_value(concatenated))
-            }
-            // Comparison operators — these yield Bool in Roc, not 0/1.
-            (BinOp::Eq, a, b) => Ok(Value::Bool(values_equal(a, b))),
-            (BinOp::Ne, a, b) => Ok(Value::Bool(!values_equal(a, b))),
-            (BinOp::Lt, a, b) => compare(a, b, |o| o == std::cmp::Ordering::Less),
-            (BinOp::Le, a, b) => compare(a, b, |o| o != std::cmp::Ordering::Greater),
-            (BinOp::Gt, a, b) => compare(a, b, |o| o == std::cmp::Ordering::Greater),
-            (BinOp::Ge, a, b) => compare(a, b, |o| o != std::cmp::Ordering::Less),
-            // `and` / `or` are Bool-only in Roc. Both operands are already
-            // evaluated, so these do not short-circuit — see the ponytail note.
-            (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
-            (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
-            // Numeric operands to `and`/`or`, kept for the `1 && 0` spelling used
-            // before Bool existed. ponytail: drop once nothing relies on it.
-            (BinOp::And, a, b) => Ok(Value::Bool(is_truthy(a) && is_truthy(b))),
-            (BinOp::Or, a, b) => Ok(Value::Bool(is_truthy(a) || is_truthy(b))),
-            (_op, _left, _right) => {
-                Err(EvalError {
-                    message: "Invalid operands for operator".to_string(),
-                })
-            }
+        }
+        // String concatenation
+        (BinOp::Add, Value::Str(a), Value::Str(b)) => {
+            let concatenated = format!("{}{}", a, b);
+            Ok(str_value(concatenated))
+        }
+        // Comparison operators — these yield Bool in Roc, not 0/1.
+        (BinOp::Eq, a, b) => Ok(Value::Bool(values_equal(a, b))),
+        (BinOp::Ne, a, b) => Ok(Value::Bool(!values_equal(a, b))),
+        (BinOp::Lt, a, b) => compare(a, b, |o| o == std::cmp::Ordering::Less),
+        (BinOp::Le, a, b) => compare(a, b, |o| o != std::cmp::Ordering::Greater),
+        (BinOp::Gt, a, b) => compare(a, b, |o| o == std::cmp::Ordering::Greater),
+        (BinOp::Ge, a, b) => compare(a, b, |o| o != std::cmp::Ordering::Less),
+        // `and` / `or` are Bool-only in Roc. Both operands are already
+        // evaluated, so these do not short-circuit — see the ponytail note.
+        (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
+        (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
+        // Numeric operands to `and`/`or`, kept for the `1 && 0` spelling used
+        // before Bool existed. ponytail: drop once nothing relies on it.
+        (BinOp::And, a, b) => Ok(Value::Bool(is_truthy(a) && is_truthy(b))),
+        (BinOp::Or, a, b) => Ok(Value::Bool(is_truthy(a) || is_truthy(b))),
+        (_op, _left, _right) => {
+            Err(EvalError {
+                message: "Invalid operands for operator".to_string(),
+            })
         }
     }
 }
@@ -1386,11 +835,6 @@ fn is_truthy(v: &Value) -> bool {
     }
 }
 
-impl Default for Evaluator {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Is `module` one of Roc's numeric types (or the generic `Num`)?
 fn is_numeric_module(module: &str) -> bool {
@@ -1510,12 +954,10 @@ pub fn interpolated(value: &Value) -> String {
 
 /// Dispatch `method` on an evaluated receiver, the BUILTIN way.
 ///
-/// A nominal's own method block is not consulted here: the tree-walker looks that up in
-/// its environment and the VM resolves it at compile time, and both then call the
-/// method directly. Everything after that point is this function, shared, so the two
-/// engines cannot disagree about what `xs.map(f)` or `Ok(1).with_default(0)` means.
+/// A nominal's own method block is not consulted here: the compiler resolves that to a
+/// chunk and calls it directly. Everything after that point is this function — the
+/// `iter` shorthand, the `Try` methods, then the module's builtin table.
 pub fn dispatch_builtin(
-    ev: &mut Evaluator,
     receiver: Value,
     method: &str,
     args: Vec<Value>,
@@ -1541,7 +983,7 @@ pub fn dispatch_builtin(
     // than in `module_for` because the payload has to be rebuilt around the result.
     if let Value::Tag(tag, payload) = &receiver {
         if matches!(*tag, "Ok" | "Err") {
-            if let Some(result) = Evaluator::try_method(tag, payload, method, args.clone())? {
+            if let Some(result) = try_method(tag, payload, method, args.clone())? {
                 return Ok(result);
             }
         }
@@ -1556,7 +998,7 @@ pub fn dispatch_builtin(
     let mut values = Vec::with_capacity(args.len() + 1);
     values.push(receiver);
     values.extend(args);
-    ev.call_builtin_values(module, method, values)
+    call_builtin_values(module, method, values)
 }
 
 /// Run one of the default host's effects on already-evaluated arguments.
@@ -1604,161 +1046,19 @@ pub fn literal_pattern_matches(pattern: &Pattern, value: &Value) -> bool {
     }
 }
 
-fn pattern_matches<'a>(
-    pattern: &Pattern,
-    value: &Value,
-    bindings: &mut Vec<(&'static str, Value)>,
-) -> bool {
-    match pattern {
-        Pattern::Wildcard => true,
-        Pattern::Binding(name) => {
-            bindings.push((name, value.clone()));
-            true
-        }
-        Pattern::Int(_) | Pattern::Float(_) | Pattern::Str(_) => {
-            literal_pattern_matches(pattern, value)
-        }
-        // A nominal's backing record. Values carry no nominal wrapper — roc erases it,
-        // as `Str.inspect` showing the bare record confirms — so this matches an
-        // ordinary record.
-        Pattern::Record { fields, rest } => match value {
-            Value::Record(actual) => {
-                let matched = fields.iter().all(|(name, pattern)| {
-                    actual
-                        .iter()
-                        .find(|(field, _)| field == name)
-                        .is_some_and(|(_, v)| pattern_matches(pattern, v, bindings))
-                });
-                if !matched {
-                    return false;
-                }
-                // `..rest` collects the fields the pattern did not name.
-                if let Some(rest_name) = rest {
-                    let remaining: Vec<(&'static str, Value)> = actual
-                        .iter()
-                        .filter(|(field, _)| !fields.iter().any(|(named, _)| named == field))
-                        .cloned()
-                        .collect();
-                    bindings.push((rest_name, Value::Record(remaining)));
-                }
-                true
-            }
-            _ => false,
-        },
-        Pattern::Tuple(items) => match value {
-            Value::Tuple(values) if values.len() == items.len() => items
-                .iter()
-                .zip(values.iter())
-                .all(|(p, v)| pattern_matches(p, v, bindings)),
-            _ => false,
-        },
-        Pattern::List { before, rest, after } => {
-            let items = match value {
-                Value::List(items) => items,
-                _ => return false,
-            };
-
-            match rest {
-                // Exact length: one pattern per element.
-                None => {
-                    if items.len() != before.len() {
-                        return false;
-                    }
-                    before
-                        .iter()
-                        .zip(items.iter())
-                        .all(|(p, v)| pattern_matches(p, v, bindings))
-                }
-                // `..` absorbs whatever the fixed patterns do not cover, so the list
-                // only has to be long enough.
-                Some(binding) => {
-                    if items.len() < before.len() + after.len() {
-                        return false;
-                    }
-                    let split = items.len() - after.len();
-
-                    for (p, v) in before.iter().zip(items[..before.len()].iter()) {
-                        if !pattern_matches(p, v, bindings) {
-                            return false;
-                        }
-                    }
-                    for (p, v) in after.iter().zip(items[split..].iter()) {
-                        if !pattern_matches(p, v, bindings) {
-                            return false;
-                        }
-                    }
-                    if let Some(name) = binding {
-                        bindings.push((name, Value::List(items[before.len()..split].to_vec())));
-                    }
-                    true
-                }
-            }
-        }
-        Pattern::Tag { name, args } => match value {
-            Value::Tag(tag_name, payload) => {
-                if tag_name != name || payload.len() != args.len() {
-                    return false;
-                }
-                args.iter()
-                    .zip(payload.iter())
-                    .all(|(arg, v)| pattern_matches(arg, v, bindings))
-            }
-            _ => false,
-        },
-    }
-}
-
-/// Call a lambda value with already-evaluated arguments.
+/// Call a function value with already-evaluated arguments.
 ///
-/// Runs in the lambda's captured environment, not the caller's. Factored out because
-/// the two call sites in `eval` had identical copies, and the List builtins need to
-/// invoke a callback too.
-pub fn apply(func: Value, args: Vec<Value>) -> Result<Value, EvalError> {
+/// The builtins' callback hook: `xs.map(f)` reaches a function through here, whether
+/// `f` is a closure the compiler produced or a builtin passed as a value.
+pub fn call_function(func: Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda(l) => {
-            if args.len() != l.params.len() {
-                return Err(EvalError {
-                    message: format!(
-                        "Lambda expects {} argument(s), got {}",
-                        l.params.len(),
-                        args.len()
-                    ),
-                });
-            }
-            // The environment AS CAPTURED, before the call frame is pushed.
-            let mut lambda_eval = Evaluator { env: l.env.clone(), returning: None };
-            lambda_eval.env.push_scope();
-            // Tie the recursive knot: the body may call the function by its own name,
-            // which its captured environment predates. The closure to bind is THIS
-            // one, unchanged — `l` already holds the captured environment, the one
-            // that predates this call frame, so the binding is a refcount bump. The
-            // hand-rebuilt closure this replaces had to be careful not to capture the
-            // frame it was being bound into; an `Rc` cannot make that mistake.
-            if let Some(name) = l.self_name {
-                lambda_eval.env.bind(name, Value::Lambda(l.clone()));
-            }
-            for (param, arg) in l.params.iter().zip(args.into_iter()) {
-                lambda_eval.env.bind(param, arg);
-            }
-            match lambda_eval.eval(&l.body) {
-                // `return` unwinds to here — the function boundary — and its value is
-                // the call's result.
-                Err(e) if e.is_return() => Ok(lambda_eval
-                    .returning
-                    .take()
-                    .unwrap_or(Value::Unit)),
-                other => other,
-            }
-        }
-        // A closure the VM built, reaching a builtin's callback: `xs.map(|x| x * 2)`
-        // compiled by the VM still ends up in `List.map`, which is the tree-walker's.
         Value::Closure(closure) => crate::vm::call_closure(&closure, args),
         // A builtin passed as a value — `xs.map(Str.inspect)`.
         Value::Builtin(qualified, _) => {
             let (module, name) = qualified.split_once('.').ok_or_else(|| EvalError {
                 message: format!("`{}` is not a qualified builtin", qualified),
             })?;
-            Evaluator::new().call_builtin_values(module, name, args)
+            call_builtin_values(module, name, args)
         }
         other => Err(EvalError {
             message: format!("Attempted to call a non-function value: {}", other),
@@ -1813,6 +1113,6 @@ pub fn module_for(value: &Value) -> Option<&'static str> {
         | Value::Tuple(_)
         | Value::Range { .. }
         | Value::Unit => return None,
-        Value::Lambda(..) | Value::Closure(..) | Value::Builtin(..) => return None,
+        Value::Closure(..) | Value::Builtin(..) => return None,
     })
 }

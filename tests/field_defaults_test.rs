@@ -12,7 +12,7 @@
 //! is for. On a nominal's `?:` field it works correctly.
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -24,7 +24,7 @@ fn build(src: &str) -> rocflight::ast::Expr {
 fn as_str(src: &str) -> String {
     let ast = build(src);
     TypeChecker::new().synth(&ast).expect("type check failed");
-    match Evaluator::new().eval(&ast).expect("eval failed") {
+    match rocflight::vm::eval(&ast).expect("eval failed") {
         Value::Str(s) => s.to_string(),
         other => other.to_string(),
     }

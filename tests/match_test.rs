@@ -10,7 +10,7 @@
 //! lists, which are a later phase.
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -22,7 +22,7 @@ fn build(src: &str) -> rocflight::ast::Expr {
 fn eval(src: &str) -> Value {
     let ast = build(src);
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed")
+    rocflight::vm::eval(&ast).expect("eval failed")
 }
 
 fn as_str(src: &str) -> String {
@@ -35,8 +35,7 @@ fn as_str(src: &str) -> String {
 fn eval_err(src: &str) -> String {
     let ast = build(src);
     let _ = TypeChecker::new().synth(&ast);
-    Evaluator::new()
-        .eval(&ast)
+    rocflight::vm::eval(&ast)
         .expect_err("expected an eval error")
         .message
 }

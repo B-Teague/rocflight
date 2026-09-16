@@ -1,10 +1,8 @@
-//! A register VM for Roc, in safe Rust.
+//! A register VM for Roc, in safe Rust. The engine.
 //!
-//! Phases V0–V1 of `OPTIMIZATION_PLAN.md`: the machinery, plus literals, locals,
-//! arithmetic, `if`, `let`, `return`, closures with captures, functions as values, and
-//! calls — direct, dynamic and tail. Anything else is a **compile error** from
-//! `compile`, never a silent fall-through to the tree-walker, so what the VM does and
-//! does not cover is always visible.
+//! It ran alongside a tree-walking interpreter for six phases, gated against it at
+//! every step; `OPTIMIZATION_PLAN.md` has the measurements and the order they landed
+//! in. The tree-walker is gone, and this runs every program.
 //!
 //! Four properties are load-bearing and worth stating before the code:
 //!
@@ -17,7 +15,9 @@
 //!    is faster than walking the tree.
 //! 3. **Calls do not recurse in Rust.** `frames` is an ordinary `Vec`, so Roc recursion
 //!    costs ~32 bytes a level on the heap instead of a Rust stack frame, and going too
-//!    deep is a Roc-level error rather than a stack overflow with no diagnostic.
+//!    deep is a Roc-level error rather than a stack overflow with no diagnostic. The
+//!    exception is a builtin's callback, which re-enters through `call_closure` — see
+//!    there.
 //! 4. **A tail call reuses its frame.** Tail-recursive Roc runs in constant memory, so
 //!    the idiomatic functional loop stops being a depth risk at all.
 
@@ -27,7 +27,7 @@ pub use compile::{compile, compile_unit};
 
 use crate::ast::BinOp;
 use crate::error::EvalError;
-use crate::eval::{Evaluator, Value};
+use crate::eval::Value;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -44,19 +44,40 @@ thread_local! {
     static RUNNING: RefCell<Vec<(Rc<Program>, Globals)>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Every `Type.method` function in the running program, for a given method name.
+///
+/// A nominal's method block compiles to top-level functions whose names carry a dot, so
+/// finding one is a scan of the chunk table, which is fixed once the program is
+/// compiled.
+///
+/// Used by the two builtins that dispatch on a user's own method: `Str.inspect` looking
+/// for a `to_inspect`, and operator dispatch looking for `plus`/`is_eq`/…
+pub fn methods_named(method: &str) -> Vec<(&'static str, Value)> {
+    let suffix = format!(".{}", method);
+    let Some((program, _)) = RUNNING.with(|r| r.borrow().last().cloned()) else {
+        return Vec::new();
+    };
+    program
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.name.ends_with(&suffix))
+        .map(|chunk| (chunk.name, Value::Closure(Rc::clone(&chunk.bare))))
+        .collect()
+}
+
 /// Call a VM closure from outside the VM — from a builtin's callback.
 ///
-/// `List.map` and friends are the tree-walker's, written against `eval::apply`, and
-/// reusing them is why V4 did not have to reimplement forty builtins. The cost is that
-/// a callback nests a Rust frame, so `calls do not recurse in Rust` holds for Roc calls
-/// but not across a builtin's callback boundary. That is what it buys forty builtins.
+/// `List.map` and friends are written against `eval::call_function`, so a callback
+/// re-enters the VM here. The cost is that a callback nests a Rust frame: "calls do not
+/// recurse in Rust" holds for Roc calls but NOT across a builtin's callback boundary,
+/// so deeply nested `map`-inside-`map` is bounded by the Rust stack again. Lowering the
+/// callback-taking builtins into bytecode is what removes the last such bound.
 pub fn call_closure(closure: &Rc<Closure>, args: Vec<Value>) -> Result<Value, EvalError> {
     let context = RUNNING.with(|r| r.borrow().last().cloned());
     let (program, globals) = context.ok_or_else(|| EvalError {
         message: "vm: a closure was called with no VM running".to_string(),
     })?;
-    let mut vm = Vm { program, regs: Vec::new(), frames: Vec::new(), globals, shim: Evaluator::new() };
-    vm.bind_methods();
+    let mut vm = Vm { program, regs: Vec::new(), frames: Vec::new(), globals };
     vm.call(closure, args)
 }
 
@@ -174,9 +195,9 @@ pub enum Op {
     // ---- builtins, dispatch, interpolation ----
     /// `dst = Module.name(regs[base .. base + argc])`, a builtin of the interpreter's.
     ///
-    /// The implementations are the tree-walker's, called through the shim evaluator:
-    /// forty builtins shared rather than written twice, which is also why a `List.map`
-    /// callback can be a VM closure — `eval::apply` re-enters the VM for it.
+    /// The implementations live in `crate::eval`, take and return `Value`s, and hold
+    /// no interpreter state — which is why they outlived the tree-walker they were
+    /// written for.
     CallBuiltin { dst: Reg, name: u16, base: Reg, argc: u16 },
     /// `dst = name(regs[base .. base + argc])`, an effect of the default host.
     CallHost { dst: Reg, name: u16, base: Reg, argc: u16 },
@@ -312,6 +333,15 @@ struct Frame {
 /// tail-recursive function does not count against it at all.
 const MAX_FRAMES: usize = 1_000_000;
 
+/// Compile an AST and run it, in one call.
+///
+/// The ordinary way to run a single-file program: the compile step is not separately
+/// interesting to a caller who just wants the answer.
+pub fn eval(ast: &crate::ast::Expr) -> Result<Value, EvalError> {
+    let program = Rc::new(compile(ast, None).map_err(|message| EvalError { message })?);
+    run(&program)
+}
+
 /// Run a compiled program's top level, then its entry point if it has one.
 ///
 /// The return value is the entry point's, or the top level's if there is none — which
@@ -356,38 +386,15 @@ pub struct Vm {
     /// Top-level values, by slot. `None` until the top level assigns it, which is how
     /// a use-before-definition becomes a message instead of a wrong answer.
     globals: Globals,
-    /// An `Evaluator` kept only so the tree-walker's builtins can be called.
-    ///
-    /// They are ordinary methods on it, and two of them look names up in its
-    /// environment: `Str.inspect` checks for a nominal's own `inspect`, and operator
-    /// dispatch checks for `plus`/`is_eq`/… So `bind_methods` puts this program's
-    /// `Type.method` functions in there, as closures, and both work unchanged.
-    shim: Evaluator,
 }
 
 impl Vm {
     pub fn new(program: &Rc<Program>) -> Self {
-        let mut vm = Vm {
+        Vm {
             program: Rc::clone(program),
             regs: Vec::new(),
             frames: Vec::new(),
             globals: Rc::new(RefCell::new(vec![None; program.n_globals])),
-            shim: Evaluator::new(),
-        };
-        vm.bind_methods();
-        vm
-    }
-
-    /// Put every `Type.method` function into the shim evaluator's environment.
-    ///
-    /// A nominal's method block compiles to top-level functions whose names carry a
-    /// dot, which is exactly what `methods_named` looks for.
-    fn bind_methods(&mut self) {
-        for (i, chunk) in self.program.chunks.iter().enumerate() {
-            if chunk.name.contains('.') {
-                self.shim.env.bind(chunk.name, Value::Closure(Rc::clone(&chunk.bare)));
-            }
-            let _ = i;
         }
     }
 
@@ -430,7 +437,7 @@ impl Vm {
         // file is mutated all the way through. Without this the two would conflict.
         let program = Rc::clone(&self.program);
         let globals = Rc::clone(&self.globals);
-        let Vm { regs, frames, shim, .. } = self;
+        let Vm { regs, frames, .. } = self;
 
         let mut cur = start;
         let mut chunk_id = cur.chunk;
@@ -478,7 +485,7 @@ impl Vm {
                     // Nominal operator overloading (`dispatch_operator`) is not
                     // consulted because the compiler cannot yet compile a nominal's
                     // method block, so no value reaching here can have one.
-                    let value = Evaluator::apply_binop(
+                    let value = crate::eval::apply_binop(
                         op,
                         &regs[base + a as usize],
                         &regs[base + b as usize],
@@ -833,7 +840,7 @@ impl Vm {
                     let names = &program.chunks[chunk_id as usize].names;
                     let (module, func) = (names[name as usize], names[name as usize + 1]);
                     let args = collect(regs, base + b as usize, argc);
-                    let value = shim.call_builtin_values(module, func, args)?;
+                    let value = crate::eval::call_builtin_values(module, func, args)?;
                     regs[base + dst as usize] = value;
                 }
                 Op::CallHost { dst, name, base: b, argc } => {
@@ -852,7 +859,7 @@ impl Vm {
                     let method = program.chunks[chunk_id as usize].names[name as usize];
                     let mut args = collect(regs, base + b as usize, argc);
                     let receiver = args.remove(0);
-                    let value = crate::eval::dispatch_builtin(shim, receiver, method, args)?;
+                    let value = crate::eval::dispatch_builtin(receiver, method, args)?;
                     regs[base + dst as usize] = value;
                 }
                 Op::Interp { dst, name, base: b, n } => {
@@ -868,9 +875,9 @@ impl Vm {
                 Op::BinDispatch { dst, a, b, op } => {
                     let left = regs[base + a as usize].clone();
                     let right = regs[base + b as usize].clone();
-                    let value = match shim.dispatch_operator(op, &left, &right)? {
+                    let value = match crate::eval::dispatch_operator(op, &left, &right)? {
                         Some(from_method) => from_method,
-                        None => Evaluator::apply_binop(op, &left, &right)?,
+                        None => crate::eval::apply_binop(op, &left, &right)?,
                     };
                     regs[base + dst as usize] = value;
                 }

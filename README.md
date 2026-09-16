@@ -1,15 +1,16 @@
 # rocflight
 
-A tree-walking interpreter for [Roc](https://www.roc-lang.org), written in Rust.
+An interpreter for [Roc](https://www.roc-lang.org), written in Rust: a parser, a
+bidirectional type checker, and a register VM in safe Rust.
 
 Two goals, in this order:
 
 1. **Full feature parity with the Roc compiler.** Not "mostly works" — every syntax
    feature is verified against the real `roc` binary, and a divergence is a bug.
 2. **As close to bare metal as safe Rust reaches.** Every optimization is measured
-   against a benchmark suite, and none of them is allowed to cost goal 1. The
-   tree-walker got the representation fixes; the next round replaces it with a register
-   VM in safe Rust — no `unsafe`, no loss of Rust's memory-safety guarantees.
+   against a benchmark suite, and none of them is allowed to cost goal 1. It began as a
+   tree-walker; a register VM replaced it, in safe Rust throughout — no `unsafe`, no
+   loss of Rust's memory-safety guarantees.
 
 ```bash
 cargo build --release
@@ -146,49 +147,43 @@ The interpreter was profiled and optimized against `tests/bench.sh`, which repor
 medians against a saved baseline and checks each benchmark's output, so a change that is
 fast and wrong fails instead of looking like a win.
 
+It started as a tree-walker. Two rounds of representation fixes took it a long way, and
+then a **register VM in safe Rust** replaced it — built alongside it for six phases,
+differentially gated against it at every step, and switched over only once both engines
+passed every gate on every file.
+
 ```
-benchmark          before    after  speedup
-calls                80ms     12ms     6.7x    function calls (naive fib)
-closure_capture     516ms      3ms   172.0x    map+fold, lambda captures the list
-closure_in_loop      75ms     30ms     2.5x    a closure built per iteration
-matching            224ms     54ms     4.1x    tag construction and matching
-records              32ms     16ms     2.0x    record update in a loop
-strings              30ms      5ms     6.0x    string building
+benchmark        tree-walker, first   tree-walker, tuned   register VM
+calls                          80ms                 12ms           6ms
+closure_capture               516ms                  3ms           2ms
+closure_in_loop                75ms                 29ms           8ms
+loop                           27ms                 22ms           9ms
+matching                      224ms                 52ms          22ms
+records                        32ms                 16ms           8ms
+strings                        30ms                  5ms           5ms
 ```
 
-Three ceilings are gone rather than merely improved: list work is **linear** instead of
-quadratic, building a 40,000-character string peaks at 6 MB where it used to reach
-**710 MB**, and creating a closure no longer deep-copies its body. The wins came from
-sharing scopes behind `Rc` instead of deep-copying them on every call, `Rc<str>` instead
-of leaking every string, sharing the lambda body with the AST rather than cloning it,
-and shrinking `Value` from 80 bytes to **32** so that every move in the interpreter is
-cheaper.
+`strings` and `list_ops` are unchanged by the VM, because they are bound by allocation
+rather than by dispatch — which the plan predicted before any of it was written.
 
-The crate is `#![forbid(unsafe_code)]`. It contained exactly one `unsafe` — a lifetime
-transmute around the AST — and removing the lifetime it worked around removed the need
-for it.
+Four ceilings are gone rather than merely improved:
 
-A **register VM** is being built alongside the tree-walker, in safe Rust, and `--vm`
-runs a program on it. It now covers the whole language: **both engines pass every gate this project has** —
-98 golden pairs, 12 vendored examples, and all 196 suite files byte-identical.
+- List work is **linear**, not quadratic.
+- Building a 40,000-character string peaks at 6 MB where it used to reach **710 MB**.
+- Recursion is heap-allocated frames, so 500,000 levels run in 4 MB — the tree-walker
+  exhausted a 256 MB reserved stack at 200,000 — and a **tail call reuses its frame**,
+  so five million tail calls run in 2.8 MB.
+- A `for` over a range never builds one, so `0..<10_000_000` allocates nothing.
 
-On the same programs the VM is **2 to 8×** the tree-walker — `calls` 12ms against 6ms,
-`matching` 52ms against 21ms, `loop` 22ms against 9ms, and a tail-recursive loop 154ms
-against 24ms in 3 MB rather than 184 MB — while `strings` and `list_ops` are unchanged,
-because those are bound by allocation rather than by dispatch. Its call frames are a `Vec`
-rather than Rust stack frames, so it recurses 500,000 levels in 4 MB where the
-tree-walker exhausts a 256 MB stack at 200,000 — and a tail call reuses its frame, so
-five million tail calls run in 2.8 MB where the tree-walker cannot run them at all.
+Names are resolved once, at compile time: a local is a register, a captured variable an
+index, a top-level name a slot, a top-level function a chunk id. Nothing compares a
+string at run time. `Value` is **32 bytes** (it was 80), with a guard test to keep it
+there, and the crate is `#![forbid(unsafe_code)]` — it contained exactly one `unsafe`, a
+lifetime transmute around the AST, and removing the lifetime removed the need for it.
 
-`cargo test --test vm_test` runs 56 programs on *both* engines and requires the same
-answer, `tests/check_roc.sh --vm` and `VM_FLAG=--vm tests/check_examples.sh` put the VM
-through the golden pairs and the examples, and `tests/vm_coverage.sh` checks all 196
-suite files on both.
-
-`OPTIMIZATION_PLAN.md` has the full method, one optimization that was measured and
-**rejected** for not being worth its complexity, and the register-VM plan that replaces
-the tree-walker — including the phase order, the falsifiable targets, and the stop
-condition if the first phase misses them.
+`OPTIMIZATION_PLAN.md` has the full method: every phase with its measurements, the
+targets that were missed and by how much, three optimizations that were measured and
+**rejected**, two gate corrections, and the four things the compiler refuses on purpose.
 
 ---
 
@@ -197,7 +192,8 @@ condition if the first phase misses them.
 ```
 src/parser/      the parser — the largest piece, and where most syntax lives
 src/types/       bidirectional checker with let-polymorphism
-src/eval/        the tree-walking evaluator
+src/vm/          the register VM: compiler, opcodes, machine
+src/eval/        builtins, operators and runtime helpers
 src/platform/    platform resolution, including real tarball loading
 tests/roc/       98 golden pairs across 20 phases, plus the 28 vendored examples
 tests/bench/     benchmark programs and the saved baseline

@@ -6,8 +6,7 @@
 mod phase5_tests {
     use rocflight::parser::Parser;
     use rocflight::types::TypeChecker;
-    use rocflight::eval::Evaluator;
-    use rocflight::eval::Value;
+        use rocflight::eval::Value;
 
     #[test]
     fn test_parse_simple_lambda() {
@@ -31,9 +30,8 @@ mod phase5_tests {
     fn test_eval_identity_lambda() {
         let mut parser = Parser::new("|x| x");
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
-        assert!(matches!(result, Value::Lambda(..)));
+        let result = rocflight::vm::eval(&expr).unwrap();
+        assert!(matches!(result, Value::Closure(..)));
     }
 
     #[test]
@@ -41,8 +39,7 @@ mod phase5_tests {
         let source = r#"let f = |x| x in f("hello")"#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Str(s) = result {
             assert_eq!(&*s, "hello");
         } else {
@@ -55,8 +52,7 @@ mod phase5_tests {
         let source = r#"let f = |x| x in f(42)"#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Int(n) = result {
             assert_eq!(n, 42);
         } else {
@@ -69,8 +65,7 @@ mod phase5_tests {
         let source = r#"let outer = |x| |y| x in outer(5)(3)"#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Int(n) = result {
             assert_eq!(n, 5);
         } else {
@@ -83,8 +78,7 @@ mod phase5_tests {
         let source = r#"let f = |x| "Value: ${x}" in f("test")"#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Str(s) = result {
             assert_eq!(&*s, "Value: test");
         } else {
@@ -97,8 +91,7 @@ mod phase5_tests {
         let source = r#"let y = 10 in let f = |x| x in f(y)"#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Int(n) = result {
             assert_eq!(n, 10);
         } else {
@@ -121,8 +114,7 @@ mod phase5_tests {
         let source = r#"let f = |x| let y = x in y in f("nested")"#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Str(s) = result {
             assert_eq!(&*s, "nested");
         } else {
@@ -137,8 +129,7 @@ mod phase5_tests {
         "#;
         let mut parser = Parser::new(source);
         let expr = parser.parse_expr().unwrap();
-        let mut evaluator = Evaluator::new();
-        let result = evaluator.eval(&expr).unwrap();
+        let result = rocflight::vm::eval(&expr).unwrap();
         if let Value::Str(s) = result {
             assert_eq!(&*s, "test");
         } else {

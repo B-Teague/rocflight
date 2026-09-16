@@ -88,8 +88,7 @@ fn eval_ok(src: &str) -> String {
     let ast = parser.parse_expr().expect("parse failed");
     let mut tc = rocflight::types::TypeChecker::new();
     tc.synth(&ast).expect("type check failed");
-    let mut ev = rocflight::eval::Evaluator::new();
-    ev.eval(&ast).expect("eval failed").to_string()
+    rocflight::vm::eval(&ast).expect("eval failed").to_string()
 }
 
 #[test]

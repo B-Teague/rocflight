@@ -7,7 +7,7 @@
 //!   * destructuring works both inside a block and at the top level
 
 use rocflight::desugaring::Desugarer;
-use rocflight::eval::{Evaluator, Value};
+use rocflight::eval::Value;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
@@ -19,7 +19,7 @@ fn parse(src: &str) -> Result<rocflight::ast::Expr, rocflight::error::ParseError
 fn eval(src: &str) -> Value {
     let ast = parse(src).expect("parse failed");
     TypeChecker::new().synth(&ast).expect("type check failed");
-    Evaluator::new().eval(&ast).expect("eval failed")
+    rocflight::vm::eval(&ast).expect("eval failed")
 }
 
 fn type_error(src: &str) -> String {
@@ -93,7 +93,7 @@ fn out_of_range_index_is_an_error() {
 fn indexing_a_non_tuple_is_an_error() {
     let ast = parse("x = Red\nx.0").unwrap();
     let _ = TypeChecker::new().synth(&ast);
-    assert!(Evaluator::new().eval(&ast).is_err(), "indexing a tag should fail");
+    assert!(rocflight::vm::eval(&ast).is_err(), "indexing a tag should fail");
 }
 
 // --- patterns -------------------------------------------------------------

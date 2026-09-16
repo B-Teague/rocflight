@@ -9,36 +9,23 @@
 //! 2. Desugar shorthand syntax
 //! 3. Parse into AST
 //! 4. Type check with Hindley-Milner inference
-//! 5. Evaluate with tree-walk interpreter
+//! 5. Compile to bytecode and run it on the register VM
 
 use std::env;
 use std::error::Error;
 use std::process;
 
+use rocflight::desugaring::Desugarer;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
-use rocflight::eval::Evaluator;
-use rocflight::eval::Value;
-use rocflight::desugaring::Desugarer;
 
-/// Stack for the interpreter thread.
+/// No thread with a giant stack any more.
 ///
-/// A tree-walker spends many Rust frames per Roc call, so the 8 MB a main thread gets
-/// by default runs out at a couple of hundred levels of Roc recursion — well short of
-/// what ordinary Roc programs do (the LeastSquares example recurses 501 times).
-const INTERPRETER_STACK: usize = 256 * 1024 * 1024;
-
+/// The tree-walker spent many Rust frames per Roc call and needed 256 MB reserved to
+/// recurse a few hundred levels. The VM's call frames are a `Vec`, so Roc recursion
+/// costs heap rather than stack and the default main-thread stack is plenty.
 fn main() {
-    // Everything runs on a thread with a stack big enough for deep recursion.
-    let worker = std::thread::Builder::new()
-        .stack_size(INTERPRETER_STACK)
-        .spawn(cli)
-        .expect("failed to start the interpreter thread");
-    match worker.join() {
-        Ok(()) => {}
-        // The thread already reported whatever went wrong.
-        Err(_) => process::exit(1),
-    }
+    cli();
 }
 
 fn cli() {
@@ -53,7 +40,6 @@ fn cli() {
         eprintln!("  --emit-desugared    Write the desugared source to .rocflight/cache/");
         eprintln!("  --show-platforms    Report each real platform the app resolves");
         eprintln!("  --test              Run the file's `expect`s and report, like `roc test`");
-        eprintln!("  --vm                Run on the register VM instead of the tree-walker");
         eprintln!("  --clear-cache       Delete .rocflight/cache/desugared and exit");
         process::exit(1);
     }
@@ -65,7 +51,6 @@ fn cli() {
     let mut emit_desugared = false;
     let mut show_platforms = false;
     let mut test_mode = false;
-    let mut use_vm = false;
     let mut filename = None;
 
     for arg in &args[1..] {
@@ -93,9 +78,6 @@ fn cli() {
             }
             "--test" => {
                 test_mode = true;
-            }
-            "--vm" => {
-                use_vm = true;
             }
             "--show-platforms" => {
                 show_platforms = true;
@@ -127,7 +109,6 @@ fn cli() {
         emit_desugared,
         show_platforms,
         test_mode,
-        use_vm,
     ) {
         eprintln!("Error: {}", e);
         process::exit(1);
@@ -143,7 +124,6 @@ fn run(
     emit_desugared: bool,
     show_platforms: bool,
     test_mode: bool,
-    use_vm: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Step 1: Load and desugar file.
     //
@@ -256,102 +236,53 @@ fn run(
         })
         .collect::<Result<_, _>>()?;
 
-    // Step 4 (--vm): compile to bytecode and run that instead.
+    // Step 4: compile to bytecode and run it.
     //
-    // Anything the VM cannot compile is an error naming the construct, never a silent
-    // fall-through to the tree-walker: which engine ran a program has to be knowable.
-    if use_vm {
-        let unit = rocflight::vm::compile::Unit {
-            // A module's top level is compiled into the SAME program, ahead of the
-            // app's, which is how `hello` from `import Hello exposing [hello]` ends up
-            // in scope — the tree-walker gets there by evaluating each module into the
-            // shared global scope first.
-            modules: module_asts
-                .iter()
-                .map(|(module_ast, type_name, exposed)| rocflight::vm::compile::Module {
-                    ast: module_ast,
-                    type_name: Box::leak(type_name.clone().into_boxed_str()),
-                    exposed: exposed
-                        .iter()
-                        .map(|name| &*Box::leak(name.clone().into_boxed_str()) as &'static str)
-                        .collect(),
-                })
-                .collect(),
-            app: &ast,
-            entry: app_entry_point.as_deref(),
-            ingested,
-        };
-        let program = std::rc::Rc::new(rocflight::vm::compile_unit(&unit)?);
-        let value = rocflight::vm::run(&program)?;
+    // Anything the compiler cannot lower is an error naming the construct. There is no
+    // fallback interpreter to quietly take over, which is the point of there being one
+    // engine: a program either compiles or says why.
+    let unit = rocflight::vm::compile::Unit {
+        // A module's top level is compiled into the SAME program, ahead of the app's,
+        // which is how `hello` from `import Hello exposing [hello]` ends up in scope.
+        modules: module_asts
+            .iter()
+            .map(|(module_ast, type_name, exposed)| rocflight::vm::compile::Module {
+                ast: module_ast,
+                type_name: Box::leak(type_name.clone().into_boxed_str()),
+                exposed: exposed
+                    .iter()
+                    .map(|name| &*Box::leak(name.clone().into_boxed_str()) as &'static str)
+                    .collect(),
+            })
+            .collect(),
+        app: &ast,
+        entry: app_entry_point.as_deref(),
+        ingested,
+    };
+    let program = std::rc::Rc::new(rocflight::vm::compile_unit(&unit)?);
 
-        // `--test` reports the `expect` tally the way `roc test` does. The tally is
-        // process-wide and both engines feed the same one, so this is the same report.
-        if test_mode {
-            return report_tests();
-        }
-        // A module's own value is its output, exactly as below. An app's output comes
-        // from its effects, so there is nothing to print.
-        if app_entry_point.is_none() {
-            println!("{}", value);
-        }
-        return Ok(());
-    }
-
-    // Step 4: Evaluate
-    let mut evaluator = Evaluator::new();
-    for (module_ast, type_name, exposed) in &module_asts {
-        evaluator.eval(module_ast)?;
-        // `exposing [hello]` makes `Hello.hello` reachable as plain `hello`.
-        for name in exposed {
-            let qualified = format!("{}.{}", type_name, name);
-            match evaluator.env.lookup(&qualified) {
-                Some(value) => evaluator
-                    .env
-                    .bind(Box::leak(name.clone().into_boxed_str()), value),
-                None => {
-                    return Err(format!(
-                        "module `{}` does not expose `{}`",
-                        type_name, name
-                    )
-                    .into())
-                }
-            }
-        }
-    }
-    for (name, text) in ingested {
-        evaluator
-            .env
-            .bind(name, rocflight::eval::str_value(text));
-    }
-    let _value = evaluator.eval(&ast)?;
-
-    // Step 5: Execute app entry point if present
-    // A file with no entry point is a MODULE: walking it has already run its
+    // Step 5: run the top level, then the app's entry point if it declared one.
+    //
+    // A file with no entry point is a MODULE: running its top level has already run its
     // `expect`s, which is all roc does for one too. Several of the language's own
     // examples are modules of nothing but expects.
-    let is_module = match &app_entry_point {
-        Some(name) => evaluator.env.lookup(name).is_none(),
-        None => true,
-    };
+    let value = rocflight::vm::run(&program)?;
 
+    // `--test` reports the `expect` tally the way `roc test` does.
     if test_mode {
         return report_tests();
     }
-
-    match app_entry_point {
-        Some(entry_name) if !is_module => invoke_app_entry_point(&mut evaluator, &entry_name)?,
-        // A module produces no output of its own.
-        Some(_) => {}
-        None => println!("{}", _value),
+    // A module's own value is its output. An app's output comes from its effects, so
+    // there is nothing to print.
+    if app_entry_point.is_none() {
+        println!("{}", value);
     }
-
     Ok(())
 }
 
 /// Report the `expect` tally, the way `roc test` does.
 ///
-/// The tally is process-wide, and both engines add to the same one, so this is one
-/// function rather than one per engine.
+/// The tally is process-wide: `expect` runs wherever the program puts it.
 fn report_tests() -> Result<(), Box<dyn Error>> {
     let (ran, failed) = rocflight::eval::expect_tally();
     if failed == 0 {
@@ -363,51 +294,4 @@ fn report_tests() -> Result<(), Box<dyn Error>> {
         process::exit(1);
     }
     Ok(())
-}
-
-/// Invoke the app entry point function
-fn invoke_app_entry_point(
-    evaluator: &mut Evaluator,
-    entry_name: &str,
-) -> Result<(), Box<dyn Error>> {
-    // Validate entry point name is not empty
-    if entry_name.is_empty() {
-        return Err("Empty app entry point name".into());
-    }
-
-    // `!` is part of the name (e.g. `main!`), so look it up verbatim.
-    let entry_fn = evaluator
-        .env
-        .lookup(entry_name)
-        .ok_or_else(|| format!("App entry point '{}' not found", entry_name))?;
-
-    // Match on the entry point type
-    match entry_fn {
-        Value::Lambda(l) => {
-            let arity = l.params.len();
-
-            // The entry point takes the command-line arguments — a LIST, matching
-            // `main! : List(Str) => ...`. Passing a string here made `args` the wrong
-            // shape for anything that inspected it.
-            //
-            // ponytail: always empty. Real argv needs the host to supply it.
-            let args: Vec<Value> = match arity {
-                0 => Vec::new(),
-                1 => vec![Value::List(Vec::new())],
-                n => {
-                    return Err(format!(
-                        "App entry point expects {} arguments, only 0 or 1 supported",
-                        n
-                    )
-                    .into())
-                }
-            };
-
-            // Shared with every other call, so `return` unwinds here too.
-            rocflight::eval::apply(Value::Lambda(l), args)?;
-
-            Ok(())
-        }
-        _ => Err(format!("App entry point '{}' is not a function", entry_name).into()),
-    }
 }

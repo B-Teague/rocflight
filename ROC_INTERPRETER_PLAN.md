@@ -134,7 +134,7 @@ What is read from a platform's sources:
 | `<Module>.roc` | members declared inside `Name :: [].{ ... }`, with signatures |
 
 **The limit is architectural, not an omission.** A platform's `hosted` functions are
-implemented in its compiled host — native code. A tree-walking interpreter has nothing
+implemented in its compiled host — native code. An interpreter has nothing
 to call. So effects run only where this interpreter supplies its own implementation,
 and anything else the platform declares is reported as a gap that names which effects
 *are* available. `HOST_EFFECTS` in `platform/host.rs` still covers the default
@@ -626,7 +626,7 @@ once_cell and regex as given; check before assuming any of them is in use.
 | Arena for AST, not persistent | All Expr lifetimes tied to arena; freed after eval | No AST reuse across files in v1.0 | Phase 16: Cache ASTs, use stable addresses |
 | No custom memory pools, use bumpalo | Fewer lines of code; battle-tested | No fine-grained allocation control | Phase 25: Custom allocators per AST size class |
 | Stack-based env, O(n) lookup | Linear per scope depth; simple to implement | 5+ scope nesting slows slightly | Phase 20: Flat index map if profiling shows hot |
-| No bytecode, tree-walk only | Simpler eval loop; matches interpreter size budget | ~10-20% slower than bytecode | Phase 25: Add bytecode compilation pass |
+| ~~No bytecode, tree-walk only~~ **superseded** | Simpler eval loop; matches interpreter size budget | ~10-20% slower than bytecode | Done: a register VM replaced the tree-walker, 2-8x faster. See OPTIMIZATION_PLAN.md |
 | Type errors include inferred + expected | More helpful debug; no extra cost | Longer error messages | (no upgrade needed) |
 | Builtin functions as native Rust | Fastest path; no need for VM | Can't define builtins in Roc | Phase 25: Host-language FFI, user-defined builtins |
 
@@ -639,7 +639,7 @@ Aspirational, not measured. Treat as budgets to check against, not as results.
 | Metric | Target | Ceiling |
 |--------|--------|---------|
 | Parse + Type Check | <100ms for 1000-line file | Single-threaded; no parallelism in v1.0 |
-| Runtime eval | <10ms for recursive fib(20) | Tree-walk overhead; bytecode helps Phase 25 |
+| Runtime eval | <10ms for recursive fib(20) | Met on the register VM |
 | Memory per file | <10MB for 1000-line program | Arena + strings; no cleanup until end |
 | Startup | <50ms cold | No caching; Phase 16 helps |
 | String pool size | <1MB for typical program | Interning; no dedup of semantically-equal strings |
