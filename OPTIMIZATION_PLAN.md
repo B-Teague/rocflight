@@ -898,6 +898,111 @@ strings                        30ms                  5ms           5ms
 
 `Value` is 32 bytes, `Op` is 16, and the crate is `#![forbid(unsafe_code)]`.
 
+## Node identity: both blocked items, unblocked
+
+`Expr` now carries a `NodeId` in every variant, and two side tables hang off it: the
+parser records where each node came from, and the checker records what it inferred
+there. That was the prerequisite [After V6](#after-v6-four-retired-one-landed-one-blocked)
+named, and it unblocked both things waiting on it.
+
+The AST itself did not change shape — a `match` on `Expr` still reads as the grammar,
+and the id is last in every variant so existing patterns kept working with `..`. 147 of
+the 245 pattern sites were fixed by applying rustc's own suggestions from
+`--message-format=json`; the 86 construction sites in the parser were filled the same
+way, by span.
+
+### Runtime errors say where
+
+```
+Error: Runtime error: Division by zero at fib.roc:3:16
+```
+
+Each instruction carries the node it was compiled from (`Chunk::spans`, parallel to
+`code`), each node carries a byte offset, and each parse registers a source range so an
+offset resolves to a file, line and column. A string interpolation parses with its own
+parser mid-expression, so ranges nest and the narrowest one containing a node wins.
+
+Three details that took measuring rather than reasoning:
+
+- **Positions are starts, not ends.** Most nodes are built *after* their text is
+  consumed, so `self.pos` by then points past them. `parse_primary_expr` stamps the
+  position it began at, and composite nodes inherit their first child's — `a + b` starts
+  where `a` does. Without that, a division by zero on line 3 reported line 5.
+- **A literal parsed by a free function has no position to record.** Those helpers take
+  a `&str` and have no parser state, so the caller relocates the node afterwards. That
+  is also why the node table is a thread-local rather than a field on `Parser`:
+  threading a counter through them would have changed their signatures for nothing.
+- **One span per instruction, or the locations shift.** `constant()` pushed straight
+  onto `code` and skipped `emit`, which left the span table one short — and every error
+  after the first constant in a chunk lost its location. `FnState::finish` now asserts
+  the two lengths match, and a test walks a real program's chunks.
+
+Line numbers survive desugaring: the desugarer rewrites within a line, so a desugared
+line is the source's line. Columns can shift where a line was rewritten.
+
+A program parsed straight from a string — which is what most of `vm_test.rs` does —
+registers no source, so its nodes have no location and its errors read exactly as
+before. That is deliberate: it kept every existing expectation valid, and
+`a_runtime_error_says_where_it_happened` covers the new behaviour explicitly.
+
+### Specialised arithmetic: 3-4%, not 24%
+
+The checker records each `BinOp` node's operand type and resolves it through the
+finished substitution — necessary because inference is not done when the node is
+visited, so the type there may still be a variable that unifies with `I64` later.
+`integer_binops()` is the resolved answer, and the compiler emits `BinInt` for those
+nodes. On the benchmarks it emits it for **every** operator (`Bin=0`), so the mechanism
+reaches as far as it can.
+
+It is worth 3-4%, not the 24% this plan predicted:
+
+```
+                 BinInt      generic Bin      (back to back)
+calls             6.3ms          6.6ms
+matching         23.1ms         23.8ms
+loop             11.2ms         11.2ms
+records           9.9ms          9.9ms
+```
+
+The reason is instructive. Pricing the win in
+[round 3c](#round-3c-v1-closures-and-the-clone-that-was-costing-40) used a throwaway
+fast path that skipped *both* the operand-shape dispatch and the call into
+`apply_binop`. Landing it properly meant extracting integer arithmetic into
+`int_binop`, so that there is still exactly one implementation — and once that existed,
+`apply_binop` could try it first too. **The generic opcode got most of the win**, and
+what is left for the specialised one is the shape match alone.
+
+That is a good outcome and a bad prediction: the 24% was real, but it belonged to a
+refactor that helps every operator rather than to an opcode that helps some of them.
+
+### Measured against HEAD, back to back
+
+```
+                 HEAD (1fec2e4)     with node identity
+calls                   7.1ms                 6.3ms      -11%
+matching               24.3ms                23.1ms       -5%
+loop                   11.3ms                11.2ms         ~
+records                10.0ms                 9.9ms         ~
+```
+
+**A methodological note worth keeping.** The first run of the benchmarks after this work
+showed `loop` and `records` 25% *slower* than the saved baseline, which looked like a
+regression and was not: the same HEAD binary, measured in the same minute, was slower
+too. This machine drifts that much between sessions. A saved baseline is only comparable
+within a session, and an A/B has to be back to back — which is how the numbers above
+were taken, and how the `BinInt` comparison was.
+
+### Still open
+
+- **Type errors have no location.** `Error: Type error at 0:0` — the checker has a
+  position field it never fills, and now there is a `NodeId` on every node to fill it
+  from. Cheaper than either item above, and the same machinery.
+- Attribution is statement-granular in places: a single-expression block reports the
+  brace rather than the expression inside it, because such a block lowers to that
+  expression and the relocation moves it.
+
+---
+
 ## After V6: four retired, one landed, one blocked
 
 The list V6 left behind had seven items. Working through them mostly produced
@@ -978,7 +1083,12 @@ Closure(Rc)              8
 boxed — which is every builtin in the crate, for one word. The `Builtin` change is kept
 because it removes an allocation; the 16-byte target is withdrawn.
 
-### Blocked: specialised arithmetic opcodes
+### ~~Blocked~~: specialised arithmetic opcodes — now done, see above
+
+The section below is what this looked like before node identity existed. It is kept
+because the prediction it makes is wrong in an instructive way.
+
+#### Blocked: specialised arithmetic opcodes
 
 This is the one item with a real number still attached — **24% of `fib`**, priced in
 [round 3c](#round-3c-v1-closures-and-the-clone-that-was-costing-40) — and it is blocked

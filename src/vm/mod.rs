@@ -113,6 +113,14 @@ pub enum Op {
     LoadSelf { dst: Reg },
     /// `dst = a op b`
     Bin { dst: Reg, a: Reg, b: Reg, op: BinOp },
+    /// `dst = a op b`, where the checker proved both operands are integers.
+    ///
+    /// Skips the dispatch on operand shapes that `Bin` pays on every execution: the
+    /// answer to "what are these?" was known once, at compile time. Emitted only where
+    /// `TypeChecker::integer_binops` says so, and it falls back to the generic path if
+    /// a value turns out not to be an integer after all — being right matters more
+    /// than the assumption being kept.
+    BinInt { dst: Reg, a: Reg, b: Reg, op: BinOp },
     /// `ip = to`
     Jump { to: u32 },
     /// `if cond == False { ip = to }`. The condition must be a `Bool`, and `kind`
@@ -276,14 +284,19 @@ pub struct Chunk {
     pub pats: Vec<crate::ast::Pattern>,
     /// For errors and `dbg` only — never looked up by.
     pub name: &'static str,
+    /// The AST node each instruction came from, parallel to `code`.
+    ///
+    /// This is what a runtime error is located by: the instruction that failed knows
+    /// its node, the node knows its offset, and the offset knows its line. It was
+    /// impossible until the AST had node identity — there was nothing for an
+    /// instruction to point at.
+    pub spans: Vec<crate::ast::NodeId>,
     /// This chunk as a closure over nothing, made once at compile time.
     ///
     /// A top-level function captures nothing, so the closure it runs under is the same
     /// object every time. Building it per call — which is what the first draft did —
     /// put a heap allocation on the hot path and cost 4% of `fib`.
     pub bare: Rc<Closure>,
-    // spans: Vec<u32>,       // ip -> source offset — BLOCKED, see round 3b: `Expr`
-    // carries no source positions for a span to point at
 }
 
 /// A function value: which chunk to run, and what it captured.
@@ -489,7 +502,26 @@ impl Vm {
                         op,
                         &regs[base + a as usize],
                         &regs[base + b as usize],
-                    )?;
+                    )
+                    .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                    regs[base + dst as usize] = value;
+                }
+                Op::BinInt { dst, a, b, op } => {
+                    let value = match (&regs[base + a as usize], &regs[base + b as usize]) {
+                        (Value::Int(x), Value::Int(y)) => match crate::eval::int_binop(op, *x, *y)
+                        {
+                            Some(result) => result,
+                            // `and`/`or` are the only ops `int_binop` declines, and the
+                            // compiler never specialises those.
+                            None => crate::eval::apply_binop(
+                                op,
+                                &regs[base + a as usize],
+                                &regs[base + b as usize],
+                            ),
+                        },
+                        (left, right) => crate::eval::apply_binop(op, left, right),
+                    }
+                    .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
                 Op::Jump { to } => ip = to as usize,
@@ -499,7 +531,7 @@ impl Vm {
                     match &regs[base + cond as usize] {
                         Value::Bool(true) => {}
                         Value::Bool(false) => ip = to as usize,
-                        other => return Err(kind.expected_bool(other)),
+                        other => return Err(locate_error(&program, chunk_id, ip, kind.expected_bool(other))),
                     }
                 }
                 Op::MakeClosure { dst, chunk, base: cap_base, n } => {
@@ -521,9 +553,9 @@ impl Vm {
                 }
                 Op::CallFn { dst, chunk, base: arg_base, argc } => {
                     let callee = &program.chunks[chunk as usize];
-                    check_arity(callee.arity, argc)?;
+                    check_arity(callee.arity, argc).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     if frames.len() >= MAX_FRAMES {
-                        return Err(too_deep(callee.name));
+                        return Err(locate_error(&program, chunk_id, ip, too_deep(callee.name)));
                     }
                     let new_base = base + arg_base as usize;
                     grow(regs, new_base + callee.n_regs as usize);
@@ -544,11 +576,12 @@ impl Vm {
                     ip = 0;
                 }
                 Op::Call { dst, func, base: arg_base, argc } => {
-                    let callee = as_closure(&regs[base + func as usize])?;
+                    let callee = as_closure(&regs[base + func as usize])
+                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     let target = &program.chunks[callee.chunk as usize];
-                    check_arity(target.arity, argc)?;
+                    check_arity(target.arity, argc).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     if frames.len() >= MAX_FRAMES {
-                        return Err(too_deep(target.name));
+                        return Err(locate_error(&program, chunk_id, ip, too_deep(target.name)));
                     }
                     let new_base = base + arg_base as usize;
                     grow(regs, new_base + target.n_regs as usize);
@@ -572,10 +605,11 @@ impl Vm {
                     // therefore a loop, in constant memory.
                     let callee = match chunk {
                         Some(id) => program.chunks[id as usize].bare.clone(),
-                        None => as_closure(&regs[base + func as usize])?,
+                        None => as_closure(&regs[base + func as usize])
+                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?,
                     };
                     let target = &program.chunks[callee.chunk as usize];
-                    check_arity(target.arity, argc)?;
+                    check_arity(target.arity, argc).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     if arg_base != 0 {
                         // Increasing order, and every destination is below its source,
                         // so nothing is overwritten before it has been read.
@@ -619,9 +653,9 @@ impl Vm {
                     let mut fields = match &regs[base + obj as usize] {
                         Value::Record(fields) => fields.clone(),
                         other => {
-                            return Err(EvalError {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!("Cannot update `{}`: it is not a record", other),
-                            })
+                            }))
                         }
                     };
                     let names = &program.chunks[chunk_id as usize].names;
@@ -630,9 +664,9 @@ impl Vm {
                         match fields.iter_mut().find(|(f, _)| *f == field) {
                             Some(slot) => slot.1 = regs[base + b as usize + i].clone(),
                             None => {
-                                return Err(EvalError {
+                                return Err(locate_error(&program, chunk_id, ip, EvalError {
                                     message: format!("Record has no field `{}` to update", field),
-                                })
+                                }))
                             }
                         }
                     }
@@ -649,9 +683,9 @@ impl Vm {
                                 message: format!("Record has no field '{}'", field),
                             })?,
                         other => {
-                            return Err(EvalError {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!("Cannot access field '{}' on {}", field, other),
-                            })
+                            }))
                         }
                     };
                     regs[base + dst as usize] = value;
@@ -665,12 +699,12 @@ impl Vm {
                             None => Value::tag("Err", vec![Value::tag("MissingField", vec![])]),
                         },
                         other => {
-                            return Err(EvalError {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!(
                                     "Cannot read optional field `{}` on {}",
                                     field, other
                                 ),
-                            })
+                            }))
                         }
                     };
                     regs[base + dst as usize] = value;
@@ -687,9 +721,9 @@ impl Vm {
                             })?
                         }
                         other => {
-                            return Err(EvalError {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!("Cannot index .{} on {}", i, other),
-                            })
+                            }))
                         }
                     };
                     regs[base + dst as usize] = value;
@@ -726,9 +760,9 @@ impl Vm {
                     _ => ip = to as usize,
                 },
                 Op::NoMatch { obj } => {
-                    return Err(EvalError {
+                    return Err(locate_error(&program, chunk_id, ip, EvalError {
                         message: format!("No match arm matched {}", regs[base + obj as usize]),
-                    })
+                    }))
                 }
 
                 // ---- destructuring ----
@@ -805,9 +839,9 @@ impl Vm {
                     let at = match &regs[base + idx as usize] {
                         Value::Int(n) => *n,
                         other => {
-                            return Err(EvalError {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!("vm: loop counter held {}", other),
-                            })
+                            }))
                         }
                     };
                     let next = match &regs[base + iter as usize] {
@@ -818,12 +852,12 @@ impl Vm {
                         }
                         Value::List(items) => items.get(at as usize).cloned(),
                         other => {
-                            return Err(EvalError {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!(
                                     "`for` needs a List or a range to iterate, got {}",
                                     other
                                 ),
-                            })
+                            }))
                         }
                     };
                     match next {
@@ -840,13 +874,14 @@ impl Vm {
                     let names = &program.chunks[chunk_id as usize].names;
                     let (module, func) = (names[name as usize], names[name as usize + 1]);
                     let args = collect(regs, base + b as usize, argc);
-                    let value = crate::eval::call_builtin_values(module, func, args)?;
+                    let value = crate::eval::call_builtin_values(module, func, args)
+                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
                 Op::CallHost { dst, name, base: b, argc } => {
                     let effect = program.chunks[chunk_id as usize].names[name as usize];
                     let args = collect(regs, base + b as usize, argc);
-                    regs[base + dst as usize] = crate::eval::host_effect(effect, args)?;
+                    regs[base + dst as usize] = crate::eval::host_effect(effect, args).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                 }
                 Op::MakeBuiltin { dst, name } => {
                     // The qualified name is built once, at compile time.
@@ -859,7 +894,8 @@ impl Vm {
                     let method = program.chunks[chunk_id as usize].names[name as usize];
                     let mut args = collect(regs, base + b as usize, argc);
                     let receiver = args.remove(0);
-                    let value = crate::eval::dispatch_builtin(receiver, method, args)?;
+                    let value = crate::eval::dispatch_builtin(receiver, method, args)
+                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
                 Op::Interp { dst, name, base: b, n } => {
@@ -875,20 +911,28 @@ impl Vm {
                 Op::BinDispatch { dst, a, b, op } => {
                     let left = regs[base + a as usize].clone();
                     let right = regs[base + b as usize].clone();
-                    let value = match crate::eval::dispatch_operator(op, &left, &right)? {
+                    let value = match crate::eval::dispatch_operator(op, &left, &right)
+                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?
+                    {
                         Some(from_method) => from_method,
-                        None => crate::eval::apply_binop(op, &left, &right)?,
+                        None => crate::eval::apply_binop(op, &left, &right)
+                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?,
                     };
                     regs[base + dst as usize] = value;
                 }
 
                 // ---- statements ----
                 Op::Expect { cond } => {
-                    crate::eval::run_expect(&regs[base + cond as usize])?;
+                    crate::eval::run_expect(&regs[base + cond as usize]).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                 }
                 Op::Dbg { src } => crate::eval::run_dbg(&regs[base + src as usize]),
                 Op::Crash { src } => {
-                    return Err(crate::eval::crash_error(&regs[base + src as usize]))
+                    return Err(locate_error(
+                        &program,
+                        chunk_id,
+                        ip,
+                        crate::eval::crash_error(&regs[base + src as usize]),
+                    ))
                 }
 
                 Op::Ret { src } => {
@@ -930,6 +974,26 @@ fn unreachable_shape<T>(expected: &str, got: &Value) -> Result<T, EvalError> {
     Err(EvalError {
         message: format!("vm: destructured {} as {}", got, expected),
     })
+}
+
+/// Say where a failing instruction was, if its node knows.
+///
+/// The message gains " at file:line:column". A node with no registered source — a
+/// string parsed straight into the parser, as the tests do — adds nothing, so an error
+/// from one reads exactly as it did before locations existed.
+fn locate_error(program: &Program, chunk: ChunkId, ip: usize, mut error: EvalError) -> EvalError {
+    // `ip` has already advanced past the instruction that failed.
+    let Some(node) = program
+        .chunks
+        .get(chunk as usize)
+        .and_then(|c| c.spans.get(ip.saturating_sub(1)))
+    else {
+        return error;
+    };
+    if let Some(at) = crate::ast::locate(*node) {
+        error.message = format!("{} at {}", error.message, at);
+    }
+    error
 }
 
 /// Make room for a callee's frame. The register file only ever grows to the deepest

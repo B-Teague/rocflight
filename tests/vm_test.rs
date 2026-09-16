@@ -751,6 +751,7 @@ fn a_module_is_compiled_into_the_same_program() {
         app: &app,
         entry: None,
         ingested: Vec::new(),
+        integer_binops: Default::default(),
     };
     let program = std::rc::Rc::new(vm::compile_unit(&unit).expect("compile failed"));
     assert_eq!(vm::run(&program).expect("vm failed").to_string(), "\"Hello World\"");
@@ -765,6 +766,7 @@ fn a_module_is_compiled_into_the_same_program() {
         app: &app,
         entry: None,
         ingested: Vec::new(),
+        integer_binops: Default::default(),
     };
     assert!(vm::compile_unit(&unit).is_err(), "an unexposed name was in scope");
 }
@@ -777,7 +779,82 @@ fn an_ingested_file_is_a_top_level_string() {
         app: &app,
         entry: None,
         ingested: vec![("text", "  hello  ".to_string())],
+        integer_binops: Default::default(),
     };
     let program = std::rc::Rc::new(vm::compile_unit(&unit).expect("compile failed"));
     assert_eq!(vm::run(&program).expect("vm failed").to_string(), "\"hello\"");
+}
+
+// ------------------------------------------ node identity: located runtime errors
+
+/// Parse with a named source, so its nodes know where they came from.
+fn run_err_located(file: &str, src: &str) -> String {
+    let desugared = Desugarer::new(src.to_string()).desugar().expect("desugar failed");
+    let ast = Parser::named(file, &desugared).parse_expr().expect("parse failed");
+    match vm::eval(&ast) {
+        Err(e) => e.to_string(),
+        Ok(value) => panic!("expected an error on:\n{}\ngot {}", src, value),
+    }
+}
+
+#[test]
+fn a_runtime_error_says_where_it_happened() {
+    // Every instruction carries the AST node it came from, and a node carries its
+    // offset — so the failing instruction can name a line and column. None of this was
+    // possible while `Expr` had no node identity.
+    assert_eq!(
+        run_err_located("div.roc", "split = |a, b| a // b\n\nsplit(1, 0)"),
+        "Runtime error: Division by zero at div.roc:1:16"
+    );
+    // Line 3, and the column where the failing expression starts rather than where the
+    // operator is.
+    assert_eq!(
+        run_err_located("m.roc", "f = |n| match n {\n\t1 => \"one\"\n}\n\nf(9)"),
+        "Runtime error: No match arm matched 9 at m.roc:1:9"
+    );
+    // Column 18 is the `{`, not the `crash` at 20: a single-expression block lowers to
+    // that expression, so the node is relocated to where the block starts. Statement
+    // granularity, which is what a line-and-column is mostly used for anyway.
+    assert_eq!(
+        run_err_located("c.roc", "f = |n| if n < 0 { crash \"negative\" } else { n }\n\nf(-1)"),
+        "Runtime error: crash: negative at c.roc:1:18"
+    );
+}
+
+#[test]
+fn an_unnamed_source_reads_as_it_always_did() {
+    // A program parsed straight from a string — which is what most of this file does —
+    // registers no source, so its nodes have no location and the message is unchanged.
+    // That is what keeps every other expectation here valid.
+    assert_eq!(
+        run_err("split = |a, b| a // b\n\nsplit(1, 0)"),
+        "Runtime error: Division by zero"
+    );
+}
+
+#[test]
+fn every_instruction_has_a_span() {
+    // A `code.push` that skips `emit` leaves the span table short, and every error
+    // after it in that chunk silently loses its location. `FnState::finish` asserts
+    // the two are the same length; this makes sure a real program exercises it.
+    let ast = parse(
+        "Shape : [Circle(I64), Dot]\n\
+         area = |s| match s {\n\
+         \tCircle(r) => 3 * r * r\n\
+         \tDot => 0\n\
+         }\n\n\
+         go = |i, acc| if i == 0 { acc } else { go(i - 1, acc + area(Circle(i))) }\n\n\
+         go(10, 0)",
+    );
+    let program = vm::compile(&ast, None).expect("compile failed");
+    for chunk in &program.chunks {
+        assert_eq!(
+            chunk.code.len(),
+            chunk.spans.len(),
+            "chunk `{}` has {} instructions and {} spans",
+            chunk.name,
+            chunk.code.len(),
+            chunk.spans.len()
+        );
+    }
 }

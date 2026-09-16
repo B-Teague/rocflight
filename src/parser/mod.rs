@@ -26,6 +26,8 @@ pub struct Parser {
     pos: usize,
     /// App entry point (e.g., "main!") if app declaration found
     entry_point: Option<String>,
+    /// The registered source this parser's nodes belong to, when it was given a name.
+    source: Option<usize>,
     /// Counter for type variables introduced by annotations (`a -> a`, and any type
     /// name the interpreter does not model).
     next_type_var: u32,
@@ -93,6 +95,18 @@ pub struct Parser {
 
 impl Parser {
     /// Create new parser for input
+    /// A parser whose nodes know which file they came from, so a runtime error can
+    /// say where.
+    ///
+    /// `new` leaves that out, which is what the tests and the nested parse of a string
+    /// interpolation want: without a registered source a node simply has no location,
+    /// and an error reads exactly as it did before.
+    pub fn named(file: &str, input: &str) -> Self {
+        let mut parser = Parser::new(input);
+        parser.source = Some(crate::ast::open_source(crate::ast::next_node_id(), file, input));
+        parser
+    }
+
     pub fn new(input: &str) -> Self {
         Parser {
             input: input.to_string(),
@@ -115,6 +129,7 @@ impl Parser {
             expr_depth: 0,
             methods: Vec::new(),
             entry_point: None,
+            source: None,
         }
     }
 
@@ -148,7 +163,25 @@ impl Parser {
 
     /// Parse expression (entry point)
     /// Handles: let bindings, function calls, literals, top-level definitions
+    /// A fresh node id, remembering where the parser currently is.
+    ///
+    /// Composite nodes should prefer `crate::ast::fresh_node_like(child)`, which takes
+    /// the construct's START from its first child rather than its end from here.
+    fn node(&self) -> crate::ast::NodeId {
+        crate::ast::fresh_node(self.pos)
+    }
+
     pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        let parsed = self.parse_expr_outer();
+        // Closing the range bounds this file's nodes, so a node made LATER by an
+        // enclosing parse does not resolve to this file.
+        if let Some(handle) = self.source {
+            crate::ast::close_source(handle);
+        }
+        parsed
+    }
+
+    fn parse_expr_outer(&mut self) -> Result<Expr, ParseError> {
         // Counted from the very start: a nominal's method block is parsed by
         // `skip_trivia` in the loop below, so a lambda inside it re-enters this
         // function before the main expression is reached.
@@ -163,7 +196,7 @@ impl Parser {
             for (name, annotation, value) in
                 std::mem::take(&mut self.methods).into_iter().rev()
             {
-                program = Expr::Let {
+                program = Expr::Let { id: self.node(),
                     name,
                     annotation,
                     value: Box::new(value),
@@ -188,10 +221,10 @@ impl Parser {
         while let Expr::Let { body, .. } = cursor {
             cursor = body;
         }
-        let tail = std::mem::replace(cursor, Expr::Unit);
+        let tail = std::mem::replace(cursor, Expr::Unit(crate::ast::fresh_node_unlocated()));
         let mut rebuilt = tail;
         for value in extra.into_iter().rev() {
-            rebuilt = Expr::Let {
+            rebuilt = Expr::Let { id: crate::ast::fresh_node_unlocated(),
                 name: "_",
                 annotation: None,
                 value: Box::new(value),
@@ -367,7 +400,7 @@ impl Parser {
         })?;
         self.pos += rest.len() - remaining.len();
         let name = match ident {
-            Expr::Ident(n) => n,
+            Expr::Ident(n, _) => n,
             other => {
                 return Err(ParseError {
                     message: format!("Expected a type name, got {}", other),
@@ -464,7 +497,7 @@ impl Parser {
             let (remaining, ident) = parse_identifier(rest)?;
             self.pos += rest.len() - remaining.len();
             let field = match ident {
-                Expr::Ident(n) => n.to_string(),
+                Expr::Ident(n, _) => n.to_string(),
                 other => {
                     return Err(ParseError {
                         message: format!("Expected a field name in a record type, got {}", other),
@@ -562,7 +595,7 @@ impl Parser {
             let (remaining, ident) = parse_identifier(rest)?;
             self.pos += rest.len() - remaining.len();
             let tag = match ident {
-                Expr::Ident(n) => n.to_string(),
+                Expr::Ident(n, _) => n.to_string(),
                 other => {
                     return Err(ParseError {
                         message: format!("Expected a tag name, got {}", other),
@@ -692,14 +725,15 @@ impl Parser {
         else {
             return built;
         };
-        let Expr::Record(mut fields) = built else {
+        let Expr::Record(mut fields, _) = built else {
             // `Name.{}` parses as unit; a nominal with defaults still gets them.
-            if matches!(built, Expr::Unit) {
+            if matches!(built, Expr::Unit(_)) {
                 return Expr::Record(
                     defaults
                         .iter()
                         .map(|(f, d)| (leak_field(f), d.clone()))
                         .collect(),
+                    self.node(),
                 );
             }
             return built;
@@ -710,7 +744,7 @@ impl Parser {
                 fields.push((leak_field(field), default.clone()));
             }
         }
-        Expr::Record(fields)
+        Expr::Record(fields, self.node())
     }
 
     /// Finish a tag expression whose name has been consumed, reading any payload.
@@ -745,7 +779,7 @@ impl Parser {
             }
         }
         self.skip_whitespace();
-        Ok(Expr::Tag { name, args })
+        Ok(Expr::Tag { id: self.node(), name, args })
     }
 
     /// Read a nominal type declaration: `Name := backing`.
@@ -871,7 +905,7 @@ impl Parser {
                 self.pos += consumed.max(1);
                 continue;
             }
-            let Expr::Ident(method) = ident else {
+            let Expr::Ident(method, _) = ident else {
                 self.pos += consumed.max(1);
                 continue;
             };
@@ -1157,7 +1191,7 @@ impl Parser {
             };
             self.pos += rest.len() - remaining.len();
             let alias = match ident {
-                Expr::Ident(name) => name.to_string(),
+                Expr::Ident(name, _) => name.to_string(),
                 _ => continue,
             };
 
@@ -1305,7 +1339,7 @@ impl Parser {
             self.pos += rest.len() - remaining.len();
 
             let name = match name_expr {
-                Expr::Ident(n) => n,
+                Expr::Ident(n, _) => n,
                 _ => unreachable!(),
             };
 
@@ -1349,7 +1383,7 @@ impl Parser {
             // Parse body expression
             let body = Box::new(self.parse_let_or_expr()?);
 
-            Ok(Expr::Let { name, annotation: None, value, body })
+            Ok(Expr::Let { id: self.node(), name, annotation: None, value, body })
         } else {
             // Top-level destructuring: `(a, b) = value`, then the rest of the file.
             // Same shape as inside a block, and likewise a one-arm match.
@@ -1409,7 +1443,7 @@ impl Parser {
 
                 if after_ident.starts_with('=') && !after_ident.starts_with("==") {
                     // This is a binding!
-                    if let Expr::Ident(name) = expr {
+                    if let Expr::Ident(name, _) = expr {
                         self.pos += lookahead_pos;
                         self.skip_whitespace();
                         self.pos += 1; // Skip '='
@@ -1431,11 +1465,11 @@ impl Parser {
                             // The body refers to the name rather than cloning the
                             // value: cloning doubled the AST and made the evaluator
                             // build the value twice, discarding the second copy.
-                            return Ok(Expr::Let {
+                            return Ok(Expr::Let { id: self.node(),
                                 name,
                                 annotation,
                                 value,
-                                body: Box::new(Expr::Ident(name)),
+                                body: Box::new(Expr::Ident(name, self.node())),
                             });
                         } else {
                             // Continue parsing the rest of the chain.
@@ -1443,15 +1477,15 @@ impl Parser {
                             if self.input[self.pos..].is_empty() {
                                 // Trailing annotations/comments only: this binding is
                                 // the last one, so its value is the file's value.
-                                return Ok(Expr::Let {
+                                return Ok(Expr::Let { id: self.node(),
                                     name,
                                     annotation,
                                     value,
-                                    body: Box::new(Expr::Ident(name)),
+                                    body: Box::new(Expr::Ident(name, self.node())),
                                 });
                             }
                             let body = Box::new(self.parse_let_or_expr()?);
-                            return Ok(Expr::Let { name, annotation, value, body });
+                            return Ok(Expr::Let { id: self.node(), name, annotation, value, body });
                         }
                     }
                 }
@@ -1474,11 +1508,11 @@ impl Parser {
         let value = self.parse_let_or_expr()?;
         // A top-level test waits for the whole file, so it is set aside here and put
         // back at the end by `parse_expr`.
-        if self.expr_depth == 1 && matches!(value, Expr::Expect(_)) {
+        if self.expr_depth == 1 && matches!(value, Expr::Expect(_, _)) {
             self.deferred_expects.push(value);
             self.skip_trivia();
             if self.input[self.pos..].is_empty() {
-                return Ok(Expr::Unit);
+                return Ok(Expr::Unit(self.node()));
             }
             return self.parse_top_level();
         }
@@ -1492,7 +1526,7 @@ impl Parser {
         if self.input[self.pos..].is_empty() {
             return Ok(value);
         }
-        Ok(Expr::Let {
+        Ok(Expr::Let { id: self.node(),
             name: "_",
             annotation: None,
             value: Box::new(value),
@@ -1520,7 +1554,7 @@ impl Parser {
             self.skip_whitespace();
             let default = self.parse_or_inner()?;
 
-            left = Expr::Match {
+            left = Expr::Match { id: self.node(),
                 scrutinee: Box::new(left),
                 arms: vec![
                     MatchArm {
@@ -1529,7 +1563,7 @@ impl Parser {
                             args: vec![Pattern::Binding("v")],
                         }],
                         guard: None,
-                        body: Expr::Ident("v"),
+                        body: Expr::Ident("v", self.node()),
                     },
                     MatchArm {
                         patterns: vec![Pattern::Tag {
@@ -1562,7 +1596,7 @@ impl Parser {
                 self.pos += 2;
                 self.skip_whitespace();
                 let right = self.parse_and_expr()?;
-                left = Expr::BinOp {
+                left = Expr::BinOp { id: crate::ast::fresh_node_like(&left),
                     left: Box::new(left),
                     op: crate::ast::BinOp::Or,
                     right: Box::new(right),
@@ -1595,7 +1629,7 @@ impl Parser {
             if matched {
                 self.skip_whitespace();
                 let right = self.parse_comparison_expr()?;
-                left = Expr::BinOp {
+                left = Expr::BinOp { id: crate::ast::fresh_node_like(&left),
                     left: Box::new(left),
                     op: crate::ast::BinOp::And,
                     right: Box::new(right),
@@ -1640,7 +1674,7 @@ impl Parser {
 
             self.skip_whitespace();
             let right = self.parse_range_expr()?;
-            left = Expr::BinOp {
+            left = Expr::BinOp { id: crate::ast::fresh_node_like(&left),
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
@@ -1669,7 +1703,7 @@ impl Parser {
         self.pos += 3;
         self.skip_whitespace();
 
-        Ok(Expr::Range {
+        Ok(Expr::Range { id: self.node(),
             start: Box::new(left),
             end: Box::new(self.parse_additive_expr()?),
             inclusive,
@@ -1713,7 +1747,7 @@ impl Parser {
 
             self.skip_whitespace();
             let right = self.parse_multiplicative_expr()?;
-            left = Expr::BinOp {
+            left = Expr::BinOp { id: crate::ast::fresh_node_like(&left),
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
@@ -1750,7 +1784,7 @@ impl Parser {
 
             self.skip_whitespace();
             let right = self.parse_unary_expr()?;
-            left = Expr::BinOp {
+            left = Expr::BinOp { id: crate::ast::fresh_node_like(&left),
                 left: Box::new(left),
                 op,
                 right: Box::new(right),
@@ -1781,7 +1815,7 @@ impl Parser {
             self.pos += 1;
             self.skip_whitespace();
             let operand = self.parse_unary_expr()?;
-            return Ok(Expr::Dispatch {
+            return Ok(Expr::Dispatch { id: self.node(),
                 receiver: Box::new(operand),
                 method: "negate",
                 args: Vec::new(),
@@ -1815,14 +1849,14 @@ impl Parser {
             let target = self.parse_call_expr()?;
             left = match target {
                 // Already a call: the piped value joins its arguments, in front.
-                Expr::Call { func, args } => {
+                Expr::Call { func, args, .. } => {
                     let mut all = Vec::with_capacity(args.len() + 1);
                     all.push(left);
                     all.extend(args);
-                    Expr::Call { func, args: all }
+                    Expr::Call { id: self.node(), func, args: all }
                 }
                 // A bare function — a name, a lambda, `Module.fn` — is applied to it.
-                func => Expr::Call { func: Box::new(func), args: vec![left] },
+                func => Expr::Call { id: self.node(), func: Box::new(func), args: vec![left] },
             };
         }
 
@@ -1847,8 +1881,8 @@ impl Parser {
                 let rest = &self.input[self.pos..];
                 let (remaining, field_expr) = parse_identifier(rest)?;
                 self.pos += rest.len() - remaining.len();
-                if let Expr::Ident(field) = field_expr {
-                    expr = Expr::OptionalField { record: Box::new(expr), field };
+                if let Expr::Ident(field, _) = field_expr {
+                    expr = Expr::OptionalField { id: self.node(), record: Box::new(expr), field };
                     self.skip_whitespace();
                     continue;
                 }
@@ -1871,7 +1905,7 @@ impl Parser {
                     message: format!("Invalid tuple index .{}", digits),
                     position: self.pos,
                 })?;
-                expr = Expr::TupleIndex { tuple: Box::new(expr), index };
+                expr = Expr::TupleIndex { id: self.node(), tuple: Box::new(expr), index };
                 self.skip_whitespace();
                 continue;
             }
@@ -1887,18 +1921,18 @@ impl Parser {
                 // other call.
                 let after_name = &remaining[..];
                 if after_name.starts_with('(') {
-                    if let Expr::Ident(method) = field_expr {
+                    if let Expr::Ident(method, _) = field_expr {
                         self.pos += rest.len() - remaining.len();
                         let args = self.parse_call_arguments()?;
-                        expr = Expr::Dispatch { receiver: Box::new(expr), method, args };
+                        expr = Expr::Dispatch { id: self.node(), receiver: Box::new(expr), method, args };
                         self.skip_whitespace();
                         continue;
                     }
                 }
                 self.pos += rest.len() - remaining.len();
                 match field_expr {
-                    Expr::Ident(field) => {
-                        expr = Expr::FieldAccess { record: Box::new(expr), field };
+                    Expr::Ident(field, _) => {
+                        expr = Expr::FieldAccess { id: self.node(), record: Box::new(expr), field };
                         self.skip_whitespace();
                         continue;
                     }
@@ -1958,7 +1992,7 @@ impl Parser {
                 }
                 self.pos += 1; // Skip ')'
 
-                expr = Expr::Call {
+                expr = Expr::Call { id: self.node(),
                     func: Box::new(expr),
                     args,
                 };
@@ -2010,9 +2044,9 @@ impl Parser {
         if content.contains("${") {
             let parts =
                 parse_interpolation_parts(&content, &self.nominals, &self.nominal_defaults)?;
-            return Ok(Expr::StrInterp(parts));
+            return Ok(Expr::StrInterp(parts, self.node()));
         }
-        Ok(Expr::Str(string_pool::intern(&content)))
+        Ok(Expr::Str(string_pool::intern(&content), self.node()))
     }
 
     /// Parse `'a'` into the code point it denotes.
@@ -2079,10 +2113,24 @@ impl Parser {
         }
         self.pos += 1;
 
-        Ok(Expr::Int(ch as i64))
+        Ok(Expr::Int(ch as i64, self.node()))
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
+        self.skip_whitespace();
+        // Where this expression starts. Most nodes are built after their text has been
+        // consumed, so `self.pos` by then points PAST them; a literal parsed by one of
+        // the free functions does not know its position at all. Stamping the start here
+        // fixes both, and every composite node inherits it from its first child.
+        let start = self.pos;
+        let parsed = self.parse_primary_inner();
+        if let Ok(expr) = &parsed {
+            crate::ast::relocate(expr.id(), start);
+        }
+        parsed
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Expr, ParseError> {
         self.skip_whitespace();
 
         let rest = &self.input[self.pos..];
@@ -2114,22 +2162,22 @@ impl Parser {
         if starts_with_keyword(rest, "return") {
             self.pos += 6;
             self.skip_whitespace();
-            return Ok(Expr::Return(Box::new(self.parse_or_expr()?)));
+            return Ok(Expr::Return(Box::new(self.parse_or_expr()?), self.node()));
         }
         if starts_with_keyword(rest, "crash") {
             self.pos += 5;
             self.skip_whitespace();
-            return Ok(Expr::Crash(Box::new(self.parse_or_expr()?)));
+            return Ok(Expr::Crash(Box::new(self.parse_or_expr()?), self.node()));
         }
         if starts_with_keyword(rest, "expect") {
             self.pos += 6;
             self.skip_whitespace();
-            return Ok(Expr::Expect(Box::new(self.parse_or_expr()?)));
+            return Ok(Expr::Expect(Box::new(self.parse_or_expr()?), self.node()));
         }
         if starts_with_keyword(rest, "dbg") {
             self.pos += 3;
             self.skip_whitespace();
-            return Ok(Expr::Dbg(Box::new(self.parse_or_expr()?)));
+            return Ok(Expr::Dbg(Box::new(self.parse_or_expr()?), self.node()));
         }
 
         // Loops are EXPRESSIONS whose value is `{}`, so they may be bound
@@ -2143,7 +2191,7 @@ impl Parser {
         if starts_with_keyword(rest, "break") {
             self.pos += 5;
             self.skip_whitespace();
-            return Ok(Expr::Break);
+            return Ok(Expr::Break(self.node()));
         }
 
         // `if cond then else otherwise`. Checked before the identifier branch, or
@@ -2159,8 +2207,8 @@ impl Parser {
             self.pos += 1;
             self.skip_whitespace();
             let operand = self.parse_call_expr()?;
-            return Ok(Expr::Call {
-                func: Box::new(Expr::Qualified { module: "Bool", name: "not" }),
+            return Ok(Expr::Call { id: self.node(),
+                func: Box::new(Expr::Qualified { id: self.node(), module: "Bool", name: "not" }),
                 args: vec![operand],
             });
         }
@@ -2203,7 +2251,7 @@ impl Parser {
                 }
                 self.pos += 1;
                 self.skip_whitespace();
-                return Ok(Expr::Tuple(items));
+                return Ok(Expr::Tuple(items, self.node()));
             }
 
             if !self.input[self.pos..].starts_with(')') {
@@ -2243,7 +2291,7 @@ impl Parser {
                     // `x.y` is either a module member or a record field access.
                     // Roc capitalises modules and types, so the receiver's case
                     // decides: `Str.inspect` is a module member, `point.x` a field.
-                    if let Expr::Ident(base) = expr {
+                    if let Expr::Ident(base, _) = expr {
                         if base.starts_with(|c: char| c.is_uppercase()) {
                             // `Name.{ ... }` builds a nominal from its backing record.
                             // The nominal name is erased in the value, matching roc:
@@ -2270,7 +2318,7 @@ impl Parser {
                                 // `Animal.Dog(x)` is the tag `Dog(x)`: the
                                 // qualification says which nominal it belongs to, and
                                 // carries no runtime weight.
-                                if let Expr::Qualified { module, name } = qualified {
+                                if let Expr::Qualified { module, name, .. } = qualified {
                                     if self.nominal(module).is_some()
                                         && name.starts_with(|c: char| c.is_uppercase())
                                     {
@@ -2286,7 +2334,7 @@ impl Parser {
 
                     // A capitalised identifier that is not `Module.name` is a tag:
                     // `Ok(x)`, `Err(e)`, or a bare tag like `Red`.
-                    if let Expr::Ident(name) = expr {
+                    if let Expr::Ident(name, _) = expr {
                         if name.starts_with(|c: char| c.is_uppercase()) {
                             return self.finish_tag(name);
                         }
@@ -2313,9 +2361,9 @@ impl Parser {
         let (remaining, name_expr) = parse_identifier(rest).ok()?;
         self.pos += rest.len() - remaining.len();
         match name_expr {
-            Expr::Ident(name) => {
+            Expr::Ident(name, _) => {
                 self.skip_whitespace();
-                Some(Expr::Qualified { module, name })
+                Some(Expr::Qualified { id: self.node(), module, name })
             }
             _ => None,
         }
@@ -2364,17 +2412,17 @@ impl Parser {
         mapper: Option<Expr>,
     ) -> Expr {
         let propagated = match mapper {
-            Some(map) => Expr::Tag {
+            Some(map) => Expr::Tag { id: crate::ast::fresh_node_unlocated(),
                 name: "Err",
-                args: vec![Expr::Call {
+                args: vec![Expr::Call { id: crate::ast::fresh_node_unlocated(),
                     func: Box::new(map),
-                    args: vec![Expr::Ident("e")],
+                    args: vec![Expr::Ident("e", crate::ast::fresh_node_unlocated())],
                 }],
             },
-            None => Expr::Tag { name: "Err", args: vec![Expr::Ident("e")] },
+            None => Expr::Tag { id: crate::ast::fresh_node_unlocated(), name: "Err", args: vec![Expr::Ident("e", crate::ast::fresh_node_unlocated())] },
         };
 
-        Expr::Match {
+        Expr::Match { id: crate::ast::fresh_node_unlocated(),
             scrutinee: Box::new(value),
             arms: vec![
                 MatchArm { patterns: vec![ok], guard: None, body: continuation },
@@ -2444,7 +2492,7 @@ impl Parser {
             });
         }
 
-        Ok(Expr::Match { scrutinee, arms })
+        Ok(Expr::Match { id: self.node(), scrutinee, arms })
     }
 
     /// Parse one arm: `A | B if guard => body`.
@@ -2519,7 +2567,7 @@ impl Parser {
 
         if rest.starts_with('"') {
             return match self.parse_string()? {
-                Expr::Str(s) => Ok(Pattern::Str(s)),
+                Expr::Str(s, _) => Ok(Pattern::Str(s)),
                 other => Err(ParseError {
                     message: format!("Only plain strings may be patterns, got {}", other),
                     position: self.pos,
@@ -2531,8 +2579,8 @@ impl Parser {
             self.pos += rest.len() - remaining.len();
             self.skip_whitespace();
             return match expr {
-                Expr::Int(n) => Ok(Pattern::Int(n)),
-                Expr::Float(n) => Ok(Pattern::Float(n)),
+                Expr::Int(n, _) => Ok(Pattern::Int(n)),
+                Expr::Float(n, _) => Ok(Pattern::Float(n)),
                 other => Err(ParseError {
                     message: format!("Unsupported numeric pattern: {}", other),
                     position: self.pos,
@@ -2543,7 +2591,7 @@ impl Parser {
         if let Ok((remaining, ident)) = parse_identifier(rest) {
             self.pos += rest.len() - remaining.len();
             let name = match ident {
-                Expr::Ident(n) => n,
+                Expr::Ident(n, _) => n,
                 other => {
                     return Err(ParseError {
                         message: format!("Unsupported pattern: {}", other),
@@ -2601,7 +2649,7 @@ impl Parser {
                     let rest = &self.input[self.pos..];
                     let (leftover, tag_ident) = parse_identifier(rest)?;
                     self.pos += rest.len() - leftover.len();
-                    if let Expr::Ident(tag) = tag_ident {
+                    if let Expr::Ident(tag, _) = tag_ident {
                         return self.finish_tag_pattern(tag);
                     }
                 }
@@ -2661,7 +2709,7 @@ impl Parser {
             Box::new(self.parse_or_expr()?)
         };
 
-        Ok(Expr::If { condition, then_branch, otherwise })
+        Ok(Expr::If { id: self.node(), condition, then_branch, otherwise })
     }
 
     /// Parse a list literal: `[1, 2, 3]`, `[]`. A trailing comma is allowed.
@@ -2697,7 +2745,7 @@ impl Parser {
             }
         }
 
-        Ok(Expr::List(items))
+        Ok(Expr::List(items, self.node()))
     }
 
     /// Build a top-level `(a, b) = value` binding.
@@ -2774,16 +2822,16 @@ impl Parser {
                 }
             };
             let value = match accessor {
-                Accessor::Index(index) => Expr::TupleIndex {
-                    tuple: Box::new(Expr::Ident(TEMP)),
+                Accessor::Index(index) => Expr::TupleIndex { id: crate::ast::fresh_node_unlocated(),
+                    tuple: Box::new(Expr::Ident(TEMP, crate::ast::fresh_node_unlocated())),
                     index: *index,
                 },
-                Accessor::Field(field) => Expr::FieldAccess {
-                    record: Box::new(Expr::Ident(TEMP)),
+                Accessor::Field(field) => Expr::FieldAccess { id: crate::ast::fresh_node_unlocated(),
+                    record: Box::new(Expr::Ident(TEMP, crate::ast::fresh_node_unlocated())),
                     field,
                 },
             };
-            chain = Expr::Let {
+            chain = Expr::Let { id: crate::ast::fresh_node_unlocated(),
                 name,
                 annotation: None,
                 value: Box::new(value),
@@ -2791,7 +2839,7 @@ impl Parser {
             };
         }
 
-        Ok(Expr::Let {
+        Ok(Expr::Let { id: crate::ast::fresh_node_unlocated(),
             name: TEMP,
             annotation: None,
             value: Box::new(value),
@@ -2867,7 +2915,7 @@ impl Parser {
                 let (leftover, ident) = parse_identifier(rest)?;
                 self.pos += rest.len() - leftover.len();
                 match ident {
-                    Expr::Ident(name) => rest_binding = Some(name),
+                    Expr::Ident(name, _) => rest_binding = Some(name),
                     other => {
                         return Err(ParseError {
                             message: format!("Expected a name after `..`, got {}", other),
@@ -2885,7 +2933,7 @@ impl Parser {
             let (leftover, ident) = parse_identifier(rest)?;
             self.pos += rest.len() - leftover.len();
             let field = match ident {
-                Expr::Ident(n) => n,
+                Expr::Ident(n, _) => n,
                 other => {
                     return Err(ParseError {
                         message: format!("Expected a field name in a record pattern, got {}", other),
@@ -3001,7 +3049,7 @@ impl Parser {
                     let (leftover, ident) = parse_identifier(rest)?;
                     self.pos += rest.len() - leftover.len();
                     match ident {
-                        Expr::Ident(n) => name = Some(n),
+                        Expr::Ident(n, _) => name = Some(n),
                         other => {
                             return Err(ParseError {
                                 message: format!("Expected a name after `.. as`, got {}", other),
@@ -3086,7 +3134,7 @@ impl Parser {
         let (remaining, ident) = parse_identifier(rest)?;
         self.pos += rest.len() - remaining.len();
         let name = match ident {
-            Expr::Ident(n) => n,
+            Expr::Ident(n, _) => n,
             other => {
                 return Err(ParseError {
                     message: format!("Expected a loop variable after `for`, got {}", other),
@@ -3117,7 +3165,7 @@ impl Parser {
         }
         let body = Box::new(self.parse_block()?);
 
-        Ok(Expr::For { name, iterable, body })
+        Ok(Expr::For { id: self.node(), name, iterable, body })
     }
 
     /// Parse `while condition { body }`. Its value is `{}`.
@@ -3135,7 +3183,7 @@ impl Parser {
         }
         let body = Box::new(self.parse_block()?);
 
-        Ok(Expr::While { condition, body })
+        Ok(Expr::While { id: self.node(), condition, body })
     }
 
     /// Parse whatever the `{` at the cursor opens: a record literal or a block.
@@ -3226,7 +3274,7 @@ impl Parser {
 
             let (remaining, ident) = parse_identifier(rest)?;
             let name = match ident {
-                Expr::Ident(n) => n,
+                Expr::Ident(n, _) => n,
                 _ => {
                     return Err(ParseError {
                         message: "Expected a field name in record literal".to_string(),
@@ -3242,7 +3290,7 @@ impl Parser {
             if !self.input[self.pos..].starts_with(':') {
                 let next = self.input[self.pos..].chars().next();
                 if matches!(next, Some(',') | Some('}')) || next.is_none() {
-                    fields.push((name, Expr::Ident(name)));
+                    fields.push((name, Expr::Ident(name, self.node())));
                     self.skip_whitespace();
                     if self.input[self.pos..].starts_with(',') {
                         self.pos += 1;
@@ -3279,8 +3327,8 @@ impl Parser {
         }
 
         Ok(match base {
-            Some(base) => Expr::RecordUpdate { base: Box::new(base), fields },
-            None => Expr::Record(fields),
+            Some(base) => Expr::RecordUpdate { id: self.node(), base: Box::new(base), fields },
+            None => Expr::Record(fields, self.node()),
         })
     }
 
@@ -3300,7 +3348,7 @@ impl Parser {
         if self.input[self.pos..].starts_with('}') {
             self.pos += 1;
             self.skip_whitespace();
-            return Ok(Expr::Unit);
+            return Ok(Expr::Unit(self.node()));
         }
 
         // (binding target, annotation, value, uses `?`) per statement; the last is
@@ -3338,7 +3386,7 @@ impl Parser {
                 let (remaining, ident) = parse_identifier(rest)?;
                 self.pos += rest.len() - remaining.len();
                 let name = match ident {
-                    Expr::Ident(n) => n,
+                    Expr::Ident(n, _) => n,
                     other => {
                         return Err(ParseError {
                             message: format!("Expected a name after `var`, got {}", other),
@@ -3406,7 +3454,7 @@ impl Parser {
                         && !after.starts_with("==")
                         && !after.starts_with("=>")
                     {
-                        if let Expr::Ident(name) = ident {
+                        if let Expr::Ident(name, _) = ident {
                             self.pos += consumed;
                             self.skip_whitespace();
                             self.pos += 1; // Skip '='
@@ -3476,22 +3524,22 @@ impl Parser {
         // `for n in xs { $sum = $sum + n }` became `for n in xs { $sum + n }` and the
         // loop did nothing.
         let mut body = match result_target {
-            BindTarget::Assign(name) => Expr::Assign {
+            BindTarget::Assign(name) => Expr::Assign { id: self.node(),
                 name,
                 value: Box::new(result),
-                body: Box::new(Expr::Unit),
+                body: Box::new(Expr::Unit(self.node())),
             },
-            BindTarget::Var(name) => Expr::VarDecl {
+            BindTarget::Var(name) => Expr::VarDecl { id: self.node(),
                 name,
                 value: Box::new(result),
-                body: Box::new(Expr::Unit),
+                body: Box::new(Expr::Unit(self.node())),
             },
-            BindTarget::Destructure(pattern) => Expr::Match {
+            BindTarget::Destructure(pattern) => Expr::Match { id: self.node(),
                 scrutinee: Box::new(result),
                 arms: vec![MatchArm {
                     patterns: vec![pattern],
                     guard: None,
-                    body: Expr::Unit,
+                    body: Expr::Unit(self.node()),
                 }],
             },
             BindTarget::Name(_) => result,
@@ -3511,7 +3559,7 @@ impl Parser {
                     );
                     continue;
                 }
-                body = Expr::Match {
+                body = Expr::Match { id: self.node(),
                     scrutinee: Box::new(value),
                     arms: vec![MatchArm { patterns: vec![pattern], guard: None, body }],
                 };
@@ -3520,7 +3568,7 @@ impl Parser {
             let name = match target {
                 BindTarget::Name(name) => name,
                 BindTarget::Var(name) => {
-                    body = Expr::VarDecl {
+                    body = Expr::VarDecl { id: self.node(),
                         name,
                         value: Box::new(value),
                         body: Box::new(body),
@@ -3528,7 +3576,7 @@ impl Parser {
                     continue;
                 }
                 BindTarget::Assign(name) => {
-                    body = Expr::Assign {
+                    body = Expr::Assign { id: self.node(),
                         name,
                         value: Box::new(value),
                         body: Box::new(body),
@@ -3559,7 +3607,7 @@ impl Parser {
                     mapper,
                 )
             } else {
-                Expr::Let {
+                Expr::Let { id: self.node(),
                     name,
                     annotation,
                     value: Box::new(value),
@@ -3644,13 +3692,13 @@ impl Parser {
         // A pattern parameter is a one-arm match on the generated name, the same shape
         // a destructuring binding uses inside a block.
         for (generated, pattern) in destructured.into_iter().rev() {
-            body = Expr::Match {
-                scrutinee: Box::new(Expr::Ident(generated)),
+            body = Expr::Match { id: self.node(),
+                scrutinee: Box::new(Expr::Ident(generated, self.node())),
                 arms: vec![MatchArm { patterns: vec![pattern], guard: None, body }],
             };
         }
 
-        Ok(Expr::Lambda { params: std::rc::Rc::new(params), body: std::rc::Rc::new(body) })
+        Ok(Expr::Lambda { id: self.node(), params: std::rc::Rc::new(params), body: std::rc::Rc::new(body) })
     }
 
     /// Skip whitespace
@@ -3717,14 +3765,14 @@ fn parse_string_literal<'input>(
     let remaining = &remaining[1..]; // Skip closing quote
 
     if content.is_empty() {
-        Ok((remaining, Expr::Str(string_pool::intern(""))))
+        Ok((remaining, Expr::Str(string_pool::intern(""), crate::ast::fresh_node_unlocated())))
     } else if content.contains("${") {
         // Parse interpolation expressions
         let parts = parse_interpolation_parts(&content, nominals, nominal_defaults)?;
-        Ok((remaining, Expr::StrInterp(parts)))
+        Ok((remaining, Expr::StrInterp(parts, crate::ast::fresh_node_unlocated())))
     } else {
         // Plain string
-        Ok((remaining, Expr::Str(string_pool::intern(&content))))
+        Ok((remaining, Expr::Str(string_pool::intern(&content), crate::ast::fresh_node_unlocated())))
     }
 }
 
@@ -3948,7 +3996,7 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                 position: 0,
             })?;
             let value = if is_negative { -value } else { value };
-            return Ok((&input[next..], Expr::Int(value)));
+            return Ok((&input[next..], Expr::Int(value, crate::ast::fresh_node_unlocated())));
         }
     }
 
@@ -4002,10 +4050,10 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
         let remaining = &input[pos..];
         for suffix in [".F32", ".F64", ".Dec"] {
             if let Some(rest) = remaining.strip_prefix(suffix) {
-                return Ok((rest, Expr::Float(value)));
+                return Ok((rest, Expr::Float(value, crate::ast::fresh_node_unlocated())));
             }
         }
-        return Ok((remaining, Expr::Float(value)));
+        return Ok((remaining, Expr::Float(value, crate::ast::fresh_node_unlocated())));
     }
 
     let value = number.parse::<i64>().map_err(|_| ParseError {
@@ -4027,16 +4075,16 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                 // Only if the suffix ends there — `255.U8x` is not a suffix.
                 if !rest.starts_with(is_ident_char) {
                     return if suffix.starts_with('F') || suffix == "Dec" {
-                        Ok((rest, Expr::Float(value as f64)))
+                        Ok((rest, Expr::Float(value as f64, crate::ast::fresh_node_unlocated())))
                     } else {
-                        Ok((rest, Expr::Int(value)))
+                        Ok((rest, Expr::Int(value, crate::ast::fresh_node_unlocated())))
                     };
                 }
             }
         }
     }
 
-    Ok((remaining, Expr::Int(value)))
+    Ok((remaining, Expr::Int(value, crate::ast::fresh_node_unlocated())))
 }
 
 /// Parse identifier: x, main, birds
@@ -4075,7 +4123,7 @@ fn parse_identifier(input: &str) -> Result<(&str, Expr), ParseError> {
     let ident = &input[..pos];
     let remaining = &input[pos..];
 
-    Ok((remaining, Expr::Ident(string_pool::intern(ident))))
+    Ok((remaining, Expr::Ident(string_pool::intern(ident), crate::ast::fresh_node_unlocated())))
 }
 
 /// Parse string interpolation: "text ${expr} more"

@@ -10,6 +10,14 @@ use super::{Type, Substitution};
 /// Type checker with Hindley-Milner inference
 pub struct TypeChecker {
     subst: Substitution,
+    /// Each `BinOp` node and the type its operands unified to, before the
+    /// substitution is finished.
+    ///
+    /// The compiler asks for this so it can emit an integer-only opcode where both
+    /// operands are known to be integers. Recorded rather than answered on the spot
+    /// because inference is not finished yet: the type here may still be a variable
+    /// that later unifies with `I64`.
+    binops: Vec<(crate::ast::NodeId, Type)>,
     next_var: u32,
     /// Methods a `where` clause promised, which may be dispatched on a type variable
     /// inference has not resolved. Set from the parser before checking.
@@ -49,6 +57,7 @@ impl TypeChecker {
             where_methods: Vec::new(),
             lambda_depth: 0,
             subst: Substitution::new(),
+            binops: Vec::new(),
             next_var: 0,
             env: vec![Vec::new()],
         }
@@ -216,12 +225,12 @@ impl TypeChecker {
             // Numeric literals are POLYMORPHIC: `255` is a U8 in `x : U8`, an I64 in
             // `x : I64`. Synthesising them as I64 and unifying would reject every
             // annotation that is not I64.
-            Expr::Int(_) if resolved.is_numeric() => Ok(()),
-            Expr::Float(_) if resolved.is_fractional() => Ok(()),
+            Expr::Int(_, _) if resolved.is_numeric() => Ok(()),
+            Expr::Float(_, _) if resolved.is_fractional() => Ok(()),
 
             // Arithmetic inherits the expected type, so `x : U8 = 1 + 2` works for the
             // same reason a bare literal does.
-            Expr::BinOp { left, op, right }
+            Expr::BinOp { left, op, right, id }
                 if resolved.is_numeric()
                     && matches!(
                         op,
@@ -229,11 +238,12 @@ impl TypeChecker {
                             | BinOp::IntDiv | BinOp::Rem
                     ) =>
             {
+                self.binops.push((*id, resolved.clone()));
                 self.check(left, &resolved)?;
                 self.check(right, &resolved)
             }
 
-            Expr::Lambda { params, body } => {
+            Expr::Lambda { params, body, .. } => {
                 match Self::peel_params(&resolved, params.len()) {
                     Some((param_types, result_type)) => {
                         self.push_scope();
@@ -293,11 +303,24 @@ impl TypeChecker {
     }
 
     /// Synthesize (infer) type of expression
+    /// The `BinOp` nodes whose operands are both integers, once inference is done.
+    ///
+    /// Resolved through the finished substitution, so a node whose operands were only
+    /// a type variable while it was being checked is answered correctly here. What the
+    /// compiler does with it is emit `BinInt`.
+    pub fn integer_binops(&self) -> std::collections::HashSet<crate::ast::NodeId> {
+        self.binops
+            .iter()
+            .filter(|(_, ty)| matches!(self.subst.apply(ty), Type::I64))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
     pub fn synth(&mut self, expr: &Expr) -> Result<Type, TypeError> {
         match expr {
-            Expr::Str(_) => Ok(Type::Str),
-            Expr::Unit => Ok(Type::Unit),
-            Expr::Bool(_) => Ok(Type::Bool),
+            Expr::Str(_, _) => Ok(Type::Str),
+            Expr::Unit(_) => Ok(Type::Unit),
+            Expr::Bool(_, _) => Ok(Type::Bool),
             Expr::Range { start, end, .. } => {
                 for bound in [start, end] {
                     let bound_type = self.synth(bound)?;
@@ -305,7 +328,7 @@ impl TypeChecker {
                 }
                 Ok(Type::Range)
             }
-            Expr::Tuple(items) => {
+            Expr::Tuple(items, _) => {
                 // Positional, so each element keeps its own type — no joining.
                 let mut types = Vec::with_capacity(items.len());
                 for item in items {
@@ -313,7 +336,7 @@ impl TypeChecker {
                 }
                 Ok(Type::Tuple(types))
             }
-            Expr::TupleIndex { tuple, index } => {
+            Expr::TupleIndex { tuple, index, .. } => {
                 let tuple_type = self.synth(tuple)?;
                 // Likewise for a nominal over a tuple.
                 let resolved = match self.subst.apply(&tuple_type) {
@@ -337,7 +360,7 @@ impl TypeChecker {
                     _ => Ok(self.fresh_var()),
                 }
             }
-            Expr::RecordUpdate { base, fields } => {
+            Expr::RecordUpdate { base, fields, .. } => {
                 let base_type = self.synth(base)?;
                 let mut updated = Vec::new();
                 for (name, value) in fields {
@@ -373,7 +396,7 @@ impl TypeChecker {
                     _ => Ok(self.fresh_var()),
                 }
             }
-            Expr::List(items) => {
+            Expr::List(items, _) => {
                 // Every element must share one type. An empty list's element type is
                 // unconstrained, so it gets a fresh variable.
                 let mut element = self.fresh_var();
@@ -383,7 +406,7 @@ impl TypeChecker {
                 }
                 Ok(Type::List(Box::new(element)))
             }
-            Expr::Match { scrutinee, arms } => {
+            Expr::Match { scrutinee, arms, .. } => {
                 let scrutinee_type = self.synth(scrutinee)?;
 
                 // Every pattern must be able to match the scrutinee, and every arm
@@ -478,7 +501,7 @@ impl TypeChecker {
                     col: 0,
                 })
             }
-            Expr::If { condition, then_branch, otherwise } => {
+            Expr::If { condition, then_branch, otherwise, .. } => {
                 // The condition must be a Bool — roc is explicit that a number will
                 // not do: "This if condition must evaluate to a Bool".
                 let condition_type = self.synth(condition)?;
@@ -491,12 +514,12 @@ impl TypeChecker {
                 // union of them, not just the first branch's type.
                 self.join(&then_type, &else_type)
             }
-            Expr::VarDecl { name, value, body } => {
+            Expr::VarDecl { name, value, body, .. } => {
                 let bound = self.synth(value)?;
                 self.bind(name, bound);
                 self.synth(body)
             }
-            Expr::Assign { name, value, body } => {
+            Expr::Assign { name, value, body, .. } => {
                 // A reassignment must agree with what the `var` already holds.
                 let assigned = self.synth(value)?;
                 if let Some(existing) = self.lookup(name) {
@@ -504,7 +527,7 @@ impl TypeChecker {
                 }
                 self.synth(body)
             }
-            Expr::For { name, iterable, body } => {
+            Expr::For { name, iterable, body, .. } => {
                 let iterable_type = self.synth(iterable)?;
                 let element = match self.subst.apply(&iterable_type) {
                     // A range yields whole numbers without being a list.
@@ -526,34 +549,34 @@ impl TypeChecker {
                 outcome?;
                 Ok(Type::Unit)
             }
-            Expr::While { condition, body } => {
+            Expr::While { condition, body, .. } => {
                 let condition_type = self.synth(condition)?;
                 self.unify(&condition_type, &Type::Bool)?;
                 self.synth(body)?;
                 Ok(Type::Unit)
             }
             // `break` never produces a value; it leaves the loop.
-            Expr::Break => Ok(self.fresh_var()),
+            Expr::Break(_) => Ok(self.fresh_var()),
             // `return` leaves the function, so it fits wherever it appears.
-            Expr::Return(value) => {
+            Expr::Return(value, _) => {
                 self.synth(value)?;
                 Ok(self.fresh_var())
             }
             // `crash` never returns, so it too fits anywhere.
-            Expr::Crash(message) => {
+            Expr::Crash(message, _) => {
                 self.synth(message)?;
                 Ok(self.fresh_var())
             }
-            Expr::Expect(condition) => {
+            Expr::Expect(condition, _) => {
                 let condition_type = self.synth(condition)?;
                 self.unify(&condition_type, &Type::Bool)?;
                 Ok(Type::Unit)
             }
-            Expr::Dbg(value) => {
+            Expr::Dbg(value, _) => {
                 self.synth(value)?;
                 Ok(Type::Unit)
             }
-            Expr::Dispatch { receiver, method, args } => {
+            Expr::Dispatch { receiver, method, args, .. } => {
                 let receiver_type = self.synth(receiver)?;
                 let mut arg_types = Vec::with_capacity(args.len());
                 for arg in args {
@@ -606,7 +629,7 @@ impl TypeChecker {
                 }
                 Ok(self.builtin_result(method, Some(&resolved), &arg_types))
             }
-            Expr::OptionalField { record, field } => {
+            Expr::OptionalField { record, field, .. } => {
                 let record_type = self.synth(record)?;
                 let resolved = match self.subst.apply(&record_type) {
                     Type::Nominal { backing, .. } => *backing,
@@ -638,7 +661,7 @@ impl TypeChecker {
                     open: false,
                 })
             }
-            Expr::FieldAccess { record, field } => {
+            Expr::FieldAccess { record, field, .. } => {
                 let record_type = self.synth(record)?;
                 // A nominal over a record supports field access on its backing — roc
                 // allows `p.x` for `p : Point`, and a method body relies on it.
@@ -663,7 +686,7 @@ impl TypeChecker {
                     _ => Ok(self.fresh_var()),
                 }
             }
-            Expr::Record(fields) => {
+            Expr::Record(fields, _) => {
                 // Sorted by field name, so `{ x: 1, y: 2 }` and `{ y: 2, x: 1 }`
                 // produce the same type and therefore unify.
                 let mut typed = Vec::with_capacity(fields.len());
@@ -675,7 +698,7 @@ impl TypeChecker {
             }
             // A tag literal is a one-tag union. Unifying it with another union
             // merges them, so `if b Red else Green` comes out as [Green, Red].
-            Expr::Tag { name, args } => {
+            Expr::Tag { name, args, .. } => {
                 let mut payload = Vec::with_capacity(args.len());
                 for arg in args {
                     payload.push(self.synth(arg)?);
@@ -689,7 +712,7 @@ impl TypeChecker {
             // have to be checked — skipping them meant a whole class of error inside
             // `${...}` went unreported, including the one that hid broken chained
             // dispatch in this project's own test files.
-            Expr::StrInterp(parts) => {
+            Expr::StrInterp(parts, _) => {
                 for part in parts {
                     if let crate::ast::StrPart::Expr(inner) = part {
                         self.synth(inner)?;
@@ -697,9 +720,9 @@ impl TypeChecker {
                 }
                 Ok(Type::Str)
             }
-            Expr::Int(_) => Ok(Type::I64),       // Integer literals default to I64
-            Expr::Float(_) => Ok(Type::F64),     // Float literals default to F64
-            Expr::Ident(name) => {
+            Expr::Int(_, _) => Ok(Type::I64),       // Integer literals default to I64
+            Expr::Float(_, _) => Ok(Type::F64),     // Float literals default to F64
+            Expr::Ident(name, _) => {
                 // A name in scope has a known type now.
                 if let Some(ty) = self.lookup(name) {
                     return Ok(self.subst.apply(&ty));
@@ -719,18 +742,18 @@ impl TypeChecker {
             // `Bool.True` / `Bool.False` are VALUES. Treating every qualified name as a
             // function meant the checker and the evaluator disagreed about these, which
             // stayed invisible until annotations were actually checked against.
-            Expr::Qualified { module: "Bool", name: "True" | "False" } => Ok(Type::Bool),
+            Expr::Qualified { module: "Bool", name: "True" | "False", .. } => Ok(Type::Bool),
             // A nominal's method block binds `Type.method` as an ordinary name, so a
             // qualified reference resolves from the environment before falling back to
             // "some function" — `Counter.start` is a Counter, not a function.
-            Expr::Qualified { module, name }
+            Expr::Qualified { module, name, .. }
                 if self.lookup(&format!("{}.{}", module, name)).is_some() =>
             {
                 Ok(self
                     .lookup(&format!("{}.{}", module, name))
                     .expect("checked by the guard"))
             }
-            Expr::Qualified { module: _, name: _ } => {
+            Expr::Qualified { module: _, name: _, .. } => {
                 // Qualified names are typically functions from builtins
                 // Create a function type that can accept arguments
                 // Input type: fresh var, Output type: fresh var
@@ -741,9 +764,10 @@ impl TypeChecker {
                     Box::new(output_type),
                 ))
             }
-            Expr::BinOp { left, op, right } => {
+            Expr::BinOp { left, op, right, id } => {
                 let left_type = self.synth(left)?;
                 let right_type = self.synth(right)?;
+                self.binops.push((*id, left_type.clone()));
 
                 match op {
                     // Arithmetic returns the type of its operands, not always I64.
@@ -767,7 +791,7 @@ impl TypeChecker {
                     BinOp::And | BinOp::Or => Ok(Type::Bool),
                 }
             }
-            Expr::Lambda { params, body } => {
+            Expr::Lambda { params, body, .. } => {
                 // For each parameter, allocate a fresh type variable
                 let mut param_types = vec![];
                 for _ in params.iter() {
@@ -797,12 +821,12 @@ impl TypeChecker {
             }
             // A qualified builtin call — `List.len(xs)` — resolves its result the same
             // way `xs.len()` does, so the two spellings behave alike when chained.
-            Expr::Call { func, args } if matches!(**func, Expr::Qualified { .. }) => {
+            Expr::Call { func, args, .. } if matches!(**func, Expr::Qualified { .. }) => {
                 let mut arg_types = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_types.push(self.synth(arg)?);
                 }
-                if let Expr::Qualified { module, name } = &**func {
+                if let Expr::Qualified { module, name, .. } = &**func {
                     // A nominal's method is an ordinary binding, so its own signature
                     // decides the result — not the builtin table, which would hand back
                     // an unconstrained variable and break any chaining off it.
@@ -824,7 +848,7 @@ impl TypeChecker {
                 }
                 unreachable!("guarded by the match arm")
             }
-            Expr::Call { func, args } => {
+            Expr::Call { func, args, .. } => {
                 // Unify the callee with `arg -> fresh` for each argument, rather than
                 // requiring it to already BE a `Type::Function`.
                 //
@@ -857,7 +881,7 @@ impl TypeChecker {
 
                 Ok(self.subst.apply(&current_type))
             }
-            Expr::Let { name, annotation, value, body } => {
+            Expr::Let { name, annotation, value, body, .. } => {
                 match annotation {
                     // Declared: the annotation is authoritative, and the value is
                     // CHECKED against it rather than merely inferred. That is what

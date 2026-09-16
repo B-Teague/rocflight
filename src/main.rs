@@ -148,7 +148,7 @@ fn run(
     }
 
     // Step 2: Parse desugared code (includes AST building)
-    let mut parser = Parser::new(&desugared);
+    let mut parser = Parser::named(filename, &desugared);
     let (ast, app_entry_point) = {
         let expr = parser.parse_expr()?;
         (expr, parser.app_entry_point())
@@ -196,7 +196,7 @@ fn run(
             .map_err(|e| format!("cannot read module `{}`: {}", file.display(), e))?;
         let module_source = Desugarer::new(text).desugar()?;
         let module_source: &'static str = Box::leak(module_source.into_boxed_str());
-        let mut module_parser = Parser::new(module_source);
+        let mut module_parser = Parser::named(&file.display().to_string(), module_source);
         let module_ast = module_parser.parse_expr()?;
         // The last segment is the type the module's method block hangs its names on:
         // `Dir/Hello` exposes them as `Hello.hello`.
@@ -258,6 +258,9 @@ fn run(
         app: &ast,
         entry: app_entry_point.as_deref(),
         ingested,
+        // What the checker learned about each operator's operands, which is what lets
+        // the compiler emit an integer-only opcode where it applies.
+        integer_binops: type_checker.integer_binops(),
     };
     let program = std::rc::Rc::new(rocflight::vm::compile_unit(&unit)?);
 

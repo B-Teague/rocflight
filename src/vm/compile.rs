@@ -112,11 +112,21 @@ pub struct Unit<'a> {
     pub entry: Option<&'a str>,
     /// `import "data.txt" as text : Str` — file contents, read before compiling.
     pub ingested: Vec<(&'static str, String)>,
+    /// The `BinOp` nodes the checker proved have integer operands, from
+    /// `TypeChecker::integer_binops`. Empty is always safe: it just means every
+    /// operator goes through the generic opcode.
+    pub integer_binops: std::collections::HashSet<crate::ast::NodeId>,
 }
 
 /// Compile a single-file program.
 pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
-    compile_unit(&Unit { modules: Vec::new(), app: ast, entry, ingested: Vec::new() })
+    compile_unit(&Unit {
+        modules: Vec::new(),
+        app: ast,
+        entry,
+        ingested: Vec::new(),
+        integer_binops: std::collections::HashSet::new(),
+    })
 }
 
 /// Compile a whole program, local modules and ingested files included.
@@ -204,10 +214,12 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
             .map(|_| None)
             .collect(),
         states: Vec::new(),
+        node: ast.id(),
+        integer_binops: unit.integer_binops.clone(),
     };
 
     for (name, value) in &bindings {
-        if let Expr::Lambda { params, body } = value {
+        if let Expr::Lambda { params, body, .. } = value {
             let (chunk, _) = c.tops.func(name).expect("collected above");
             // A top-level function is at the outermost level, so it has nothing to
             // capture: every free name in it is a global or another top-level function.
@@ -270,6 +282,7 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
 /// lambda can see the frames it is written inside.
 struct FnState {
     code: Vec<Op>,
+    spans: Vec<crate::ast::NodeId>,
     consts: Vec<Value>,
     /// Name → register, innermost last. A linear scan, but at COMPILE time and over a
     /// single function's names — the run-time scan this replaces walked every scope of
@@ -313,6 +326,7 @@ impl FnState {
     ) -> Self {
         FnState {
             code: Vec::new(),
+            spans: Vec::new(),
             consts: Vec::new(),
             locals: Vec::new(),
             loops: Vec::new(),
@@ -330,8 +344,19 @@ impl FnState {
     }
 
     fn finish(self, chunk: ChunkId, arity: u16) -> Chunk {
+        // One span per instruction, or an error's location is somebody else's. A
+        // `code.push` that skipped `emit` is exactly how that goes wrong, and it did.
+        debug_assert_eq!(
+            self.code.len(),
+            self.spans.len(),
+            "chunk `{}` has {} instructions and {} spans",
+            self.name,
+            self.code.len(),
+            self.spans.len()
+        );
         Chunk {
             code: self.code,
+            spans: self.spans,
             consts: self.consts,
             n_regs: self.max_reg,
             arity,
@@ -371,6 +396,10 @@ struct Compiler {
     tops: Tops,
     chunks: Vec<Option<Chunk>>,
     states: Vec<FnState>,
+    /// The node being compiled, stamped onto every instruction it emits.
+    node: crate::ast::NodeId,
+    /// Which `BinOp` nodes may use the integer-only opcode.
+    integer_binops: std::collections::HashSet<crate::ast::NodeId>,
 }
 
 impl Compiler {
@@ -380,7 +409,12 @@ impl Compiler {
     }
 
     fn emit(&mut self, op: Op) {
-        self.st().code.push(op);
+        let node = self.node;
+        let st = self.st();
+        st.code.push(op);
+        // Parallel to `code`: whichever node the compiler is working on owns the
+        // instructions it emits, which is how a runtime error finds its line.
+        st.spans.push(node);
     }
 
     fn alloc(&mut self) -> Result<Reg, String> {
@@ -406,7 +440,10 @@ impl Compiler {
         let k = u32::try_from(st.consts.len())
             .map_err(|_| "vm: too many constants".to_string())?;
         st.consts.push(value);
-        st.code.push(Op::LoadK { dst, k });
+        // Through `emit`, so this instruction gets a span like every other. Pushing
+        // straight onto `code` left the span table one short, and every error after
+        // the first constant in a chunk lost its location.
+        self.emit(Op::LoadK { dst, k });
         Ok(())
     }
 
@@ -627,7 +664,7 @@ impl Compiler {
     /// A call whose callee is a top-level function, if this one is.
     fn direct_callee(&mut self, func: &Expr) -> Option<(ChunkId, u16)> {
         let name = match func {
-            Expr::Ident(name) => *name,
+            Expr::Ident(name, _) => *name,
             _ => return None,
         };
         // A local, a capture or a self-reference shadows a top-level name, so those
@@ -641,8 +678,15 @@ impl Compiler {
     /// Compile `e` in TAIL position: the code emitted ends the function, either by
     /// returning or by handing the frame to a tail call.
     fn tail(&mut self, e: &Expr) -> Result<(), String> {
+        let enclosing = std::mem::replace(&mut self.node, e.id());
+        let result = self.tail_inner(e);
+        self.node = enclosing;
+        result
+    }
+
+    fn tail_inner(&mut self, e: &Expr) -> Result<(), String> {
         match e {
-            Expr::If { condition, then_branch, otherwise } => {
+            Expr::If { condition, then_branch, otherwise, .. } => {
                 let save = self.st().next_reg;
                 let cond = self.expr(condition)?;
                 self.st().next_reg = save;
@@ -665,29 +709,29 @@ impl Compiler {
                 result
             }
 
-            Expr::VarDecl { name, value, body } => {
+            Expr::VarDecl { name, value, body, .. } => {
                 self.bind(name, value, true)?;
                 let result = self.tail(body);
                 self.st().locals.pop();
                 result
             }
 
-            Expr::Assign { name, value, body } => {
+            Expr::Assign { name, value, body, .. } => {
                 self.assign(name, value)?;
                 self.tail(body)
             }
 
             // Every arm's body is in tail position too, so a function that is one
             // `match` returns straight out of the arm that matched.
-            Expr::Match { scrutinee, arms } => {
+            Expr::Match { scrutinee, arms, .. } => {
                 self.compile_match(scrutinee, arms, true)?;
                 Ok(())
             }
 
             // `return f(x)` is still a tail call.
-            Expr::Return(inner) if self.st().in_function => self.tail(inner),
+            Expr::Return(inner, _) if self.st().in_function => self.tail(inner),
 
-            Expr::Call { func, args } => {
+            Expr::Call { func, args, .. } => {
                 if let Some((chunk, arity)) = self.direct_callee(func) {
                     let (arg_base, argc) = self.arguments(args)?;
                     check_arity(func_name(func), arity, argc)?;
@@ -729,7 +773,7 @@ impl Compiler {
         // body resolves it to the running closure rather than to a binding that does
         // not exist yet.
         let src = match value {
-            Expr::Lambda { params, body } => self.closure(name, params, body, Some(name))?,
+            Expr::Lambda { params, body, .. } => self.closure(name, params, body, Some(name))?,
             other => self.expr(other)?,
         };
         self.st().next_reg = save;
@@ -749,18 +793,27 @@ impl Compiler {
     /// except through an op that reads its inputs first (`Bin` does) or a fresh
     /// destination (everything else).
     fn expr(&mut self, e: &Expr) -> Result<Reg, String> {
+        // Whatever this node emits is attributed to it. Restored afterwards so a
+        // parent's own instructions are not blamed on its last child.
+        let enclosing = std::mem::replace(&mut self.node, e.id());
+        let result = self.expr_inner(e);
+        self.node = enclosing;
+        result
+    }
+
+    fn expr_inner(&mut self, e: &Expr) -> Result<Reg, String> {
         match e {
-            Expr::Int(n) => self.literal(Value::Int(*n)),
-            Expr::Float(f) => self.literal(Value::Float(*f)),
-            Expr::Bool(b) => self.literal(Value::Bool(*b)),
-            Expr::Str(s) => self.literal(Value::Str(Rc::from(*s))),
-            Expr::Unit => self.literal(Value::Unit),
+            Expr::Int(n, _) => self.literal(Value::Int(*n)),
+            Expr::Float(f, _) => self.literal(Value::Float(*f)),
+            Expr::Bool(b, _) => self.literal(Value::Bool(*b)),
+            Expr::Str(s, _) => self.literal(Value::Str(Rc::from(*s))),
+            Expr::Unit(_) => self.literal(Value::Unit),
 
-            Expr::Ident(name) => self.use_name(name),
+            Expr::Ident(name, _) => self.use_name(name),
 
-            Expr::Lambda { params, body } => self.closure("<lambda>", params, body, None),
+            Expr::Lambda { params, body, .. } => self.closure("<lambda>", params, body, None),
 
-            Expr::BinOp { left, op, right } => {
+            Expr::BinOp { left, op, right, id } => {
                 let save = self.st().next_reg;
                 // Both sides are evaluated, `&&` and `||` included, because that is
                 // what the tree-walker does — see `apply_binop`. Short-circuiting is a
@@ -772,13 +825,19 @@ impl Compiler {
                 let dst = self.alloc()?;
                 if self.tops.operator_methods {
                     self.emit(Op::BinDispatch { dst, a, b, op: *op });
+                } else if self.integer_binops.contains(id)
+                    && !matches!(op, crate::ast::BinOp::And | crate::ast::BinOp::Or)
+                {
+                    // The checker says both sides are integers, so the shapes need not
+                    // be examined again at run time.
+                    self.emit(Op::BinInt { dst, a, b, op: *op });
                 } else {
                     self.emit(Op::Bin { dst, a, b, op: *op });
                 }
                 Ok(dst)
             }
 
-            Expr::If { condition, then_branch, otherwise } => {
+            Expr::If { condition, then_branch, otherwise, .. } => {
                 let save = self.st().next_reg;
                 let cond = self.expr(condition)?;
                 self.st().next_reg = save;
@@ -816,14 +875,14 @@ impl Compiler {
 
             // `return` in the middle of a block: the code after it is unreachable,
             // which is exactly what a jump to the function's exit means.
-            Expr::Return(inner) if self.st().in_function => {
+            Expr::Return(inner, _) if self.st().in_function => {
                 let src = self.expr(inner)?;
                 self.emit(Op::Ret { src });
                 Ok(src)
             }
-            Expr::Return(_) => Err("vm: `return` outside a function".to_string()),
+            Expr::Return(_, _) => Err("vm: `return` outside a function".to_string()),
 
-            Expr::Call { func, args } => {
+            Expr::Call { func, args, .. } => {
                 if let Some((chunk, arity)) = self.direct_callee(func) {
                     let (arg_base, argc) = self.arguments(args)?;
                     check_arity(func_name(func), arity, argc)?;
@@ -846,7 +905,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::List(items) => {
+            Expr::List(items, _) => {
                 let (base, n) = self.arguments(items)?;
                 self.st().next_reg = base;
                 let dst = self.alloc()?;
@@ -854,7 +913,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Tuple(items) => {
+            Expr::Tuple(items, _) => {
                 let (base, n) = self.arguments(items)?;
                 self.st().next_reg = base;
                 let dst = self.alloc()?;
@@ -862,7 +921,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Tag { name, args } => {
+            Expr::Tag { name, args, .. } => {
                 let name = self.name_idx(name)?;
                 let (base, n) = self.arguments(args)?;
                 self.st().next_reg = base;
@@ -871,7 +930,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Record(fields) => {
+            Expr::Record(fields, _) => {
                 let field_names: Vec<&'static str> = fields.iter().map(|(n, _)| *n).collect();
                 let name = self.names_run(&field_names)?;
                 let values: Vec<&Expr> = fields.iter().map(|(_, v)| v).collect();
@@ -882,7 +941,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::RecordUpdate { base: record, fields } => {
+            Expr::RecordUpdate { base: record, fields, .. } => {
                 let field_names: Vec<&'static str> = fields.iter().map(|(n, _)| *n).collect();
                 let name = self.names_run(&field_names)?;
                 let save = self.st().next_reg;
@@ -896,7 +955,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::FieldAccess { record, field } => {
+            Expr::FieldAccess { record, field, .. } => {
                 let name = self.name_idx(field)?;
                 let save = self.st().next_reg;
                 let obj = self.expr(record)?;
@@ -906,7 +965,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::OptionalField { record, field } => {
+            Expr::OptionalField { record, field, .. } => {
                 let name = self.name_idx(field)?;
                 let save = self.st().next_reg;
                 let obj = self.expr(record)?;
@@ -916,7 +975,7 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::TupleIndex { tuple, index } => {
+            Expr::TupleIndex { tuple, index, .. } => {
                 let i = u16::try_from(*index)
                     .map_err(|_| "vm: tuple index out of range".to_string())?;
                 let save = self.st().next_reg;
@@ -927,13 +986,13 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Match { scrutinee, arms } => {
+            Expr::Match { scrutinee, arms, .. } => {
                 let dst = self.compile_match(scrutinee, arms, false)?;
                 Ok(dst.expect("a non-tail match has a destination"))
             }
 
             // `Module.name` as a VALUE — `xs.map(Str.inspect)`.
-            Expr::Qualified { module, name } => {
+            Expr::Qualified { module, name, .. } => {
                 // A nominal's method block binds `Type.method` as an ordinary
                 // top-level name, so it resolves exactly like any other name — and it
                 // need not be a function: `Counter.start = { n: 0 }` is a global.
@@ -955,14 +1014,14 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::StrInterp(parts) => self.interpolation(parts),
+            Expr::StrInterp(parts, _) => self.interpolation(parts),
 
-            Expr::Dispatch { receiver, method, args } => {
+            Expr::Dispatch { receiver, method, args, .. } => {
                 self.dispatch(receiver, method, args)
             }
 
             // The three statement forms. Each yields `{}`, as in the tree-walker.
-            Expr::Expect(condition) => {
+            Expr::Expect(condition, _) => {
                 let save = self.st().next_reg;
                 let cond = self.expr(condition)?;
                 self.st().next_reg = save;
@@ -970,7 +1029,7 @@ impl Compiler {
                 self.literal(Value::Unit)
             }
 
-            Expr::Dbg(value) => {
+            Expr::Dbg(value, _) => {
                 let save = self.st().next_reg;
                 let src = self.expr(value)?;
                 self.st().next_reg = save;
@@ -978,7 +1037,7 @@ impl Compiler {
                 self.literal(Value::Unit)
             }
 
-            Expr::Crash(message) => {
+            Expr::Crash(message, _) => {
                 let save = self.st().next_reg;
                 let src = self.expr(message)?;
                 self.st().next_reg = save;
@@ -988,7 +1047,7 @@ impl Compiler {
                 self.literal(Value::Unit)
             }
 
-            Expr::Range { start, end, inclusive } => {
+            Expr::Range { start, end, inclusive, .. } => {
                 let save = self.st().next_reg;
                 let a = self.expr(start)?;
                 let b = self.expr(end)?;
@@ -1000,30 +1059,30 @@ impl Compiler {
 
             // `var x = value` then the rest of the block. Like a `let`, except the
             // binding may be assigned — which, compiled, is a write to its register.
-            Expr::VarDecl { name, value, body } => {
+            Expr::VarDecl { name, value, body, .. } => {
                 self.bind(name, value, true)?;
                 let result = self.expr(body);
                 self.st().locals.pop();
                 result
             }
 
-            Expr::Assign { name, value, body } => {
+            Expr::Assign { name, value, body, .. } => {
                 self.assign(name, value)?;
                 self.expr(body)
             }
 
-            Expr::For { name, iterable, body } => {
+            Expr::For { name, iterable, body, .. } => {
                 self.for_loop(name, iterable, body)?;
                 // `for` is a statement: its value is `{}`, as in the tree-walker.
                 self.literal(Value::Unit)
             }
 
-            Expr::While { condition, body } => {
+            Expr::While { condition, body, .. } => {
                 self.while_loop(condition, body)?;
                 self.literal(Value::Unit)
             }
 
-            Expr::Break => {
+            Expr::Break(_) => {
                 if self.st().loops.is_empty() {
                     // The tree-walker raises a break signal that nothing catches, so
                     // what a bare `break` does there is not worth copying.
@@ -1285,7 +1344,7 @@ impl Compiler {
     fn builtin_call(&mut self, func: &Expr, args: &[Expr]) -> Result<Option<Reg>, String> {
         match func {
             // `Str.concat(a, b)`, or `Point.show(p)` for a nominal's own method.
-            Expr::Qualified { module, name } => {
+            Expr::Qualified { module, name, .. } => {
                 let qualified = qualify(module, name);
                 // A nominal name that is not a function — `Counter.start = { n: 0 }` —
                 // is a value being called, which the caller compiles as such.
@@ -1308,7 +1367,7 @@ impl Compiler {
                 Ok(Some(dst))
             }
 
-            Expr::Ident(bare) => {
+            Expr::Ident(bare, _) => {
                 // A local, a capture or a global shadows all of this: a name bound in
                 // the program is called as a value, not as a builtin.
                 if self.resolve(bare).is_some() {
@@ -1542,7 +1601,7 @@ fn qualify(module: &str, name: &str) -> &'static str {
 
 fn func_name(func: &Expr) -> &'static str {
     match func {
-        Expr::Ident(name) => name,
+        Expr::Ident(name, _) => name,
         _ => "a function",
     }
 }
