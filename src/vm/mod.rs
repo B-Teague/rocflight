@@ -849,10 +849,10 @@ impl Vm {
                     regs[base + dst as usize] = crate::eval::host_effect(effect, args)?;
                 }
                 Op::MakeBuiltin { dst, name } => {
-                    let names = &program.chunks[chunk_id as usize].names;
-                    let qualified = format!("{}.{}", names[name as usize], names[name as usize + 1]);
+                    // The qualified name is built once, at compile time.
+                    let qualified = program.chunks[chunk_id as usize].names[name as usize];
                     // Arity 1: every builtin used as a value takes its subject and
-                    // nothing else, which is what the tree-walker assumes too.
+                    // nothing else.
                     regs[base + dst as usize] = Value::Builtin(qualified, 1);
                 }
                 Op::DispatchMethod { dst, name, base: b, argc } => {

@@ -949,7 +949,7 @@ impl Compiler {
                         _ => {}
                     }
                 }
-                let name = self.names_run(&[module, name])?;
+                let name = self.name_idx(qualified)?;
                 let dst = self.alloc()?;
                 self.emit(Op::MakeBuiltin { dst, name });
                 Ok(dst)

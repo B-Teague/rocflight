@@ -316,7 +316,7 @@ bare record patterns `|{ x, y }|`, `Name.(payload)` patterns, multiline strings
 `import "file" as name : Str` ingestion, local module imports with `exposing`,
 parameterised type aliases `Parser(a) : ...`, `where` on a continuation line,
 `expr ? |err| Mapped(err)`, builtins as values (`xs.map(Str.inspect)`), the `Try`
-methods (`map_ok`, `map_err`, `with_default`, `on_err`), eager iterators, custom
+methods (`map_ok`, `map_err`, `with_default`, `on_err`), iterators, custom
 `to_inspect`, and a long tail of `Str`/`List`/numeric builtins.
 
 ---
@@ -340,8 +340,11 @@ Deliberate, and each one diverges from `roc` only where no golden pair can see i
 - **Dispatch on an unresolved receiver is only rejected at the top level**, not inside
   a function body. A body is checked before any call site is seen, and may dispatch on
   the result of a builtin this interpreter does not model.
-- **An iterator is an eager list.** `.iter()` materialises, so an infinite one would
-  hang and `Str.inspect` shows a list where roc shows `<opaque>`.
+- **An iterator over a LIST is that list.** `.iter()` on a range keeps it a range —
+  which also means `Str.inspect` shows `<opaque>`, as roc does — and the builtins that
+  only walk their elements walk it without building one. What is still eager is
+  `map`: it produces its output list rather than fusing into its consumer, so
+  `xs.map(f).fold(g)` makes one intermediate list.
 - **Custom `to_inspect` is picked by trial.** Values carry no nominal tag at runtime,
   so each candidate is applied and the first that returns a Str wins.
 - **Checked arithmetic never fails.** `*_try` always gives `Ok` and `*_saturated` is

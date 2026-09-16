@@ -76,6 +76,55 @@ pub fn try_method(
 /// `(list, initial, fn)` with the accumulator as the callback's first parameter.
 /// `List.len` returns a U64 in roc — worth remembering, since mixing it with I64
 /// arms in a match is a type error.
+/// The elements of a List, or of a Range without ever building one.
+///
+/// `(1..=2_000_000).iter()` used to materialize two million `Value`s — 190 MB — before
+/// the first element was looked at. A range knows its elements from three integers, so
+/// the ones that only need to WALK the elements walk them instead.
+enum Elements {
+    List(std::vec::IntoIter<Value>),
+    Range(std::ops::RangeInclusive<i64>),
+}
+
+impl Iterator for Elements {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Value> {
+        match self {
+            Elements::List(items) => items.next(),
+            Elements::Range(range) => range.next().map(Value::Int),
+        }
+    }
+}
+
+impl Elements {
+    /// How many elements there are, without walking them.
+    fn count_of(value: &Value) -> Option<usize> {
+        match value {
+            Value::List(items) => Some(items.len()),
+            Value::Range { start, end, inclusive } => {
+                let last = if *inclusive { *end } else { *end - 1 };
+                Some((last - start + 1).max(0) as usize)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A List or a Range, as something to iterate.
+fn elements(value: Value, name: &str) -> Result<Elements, EvalError> {
+    match value {
+        Value::List(items) => Ok(Elements::List(items.into_iter())),
+        Value::Range { start, end, inclusive } => {
+            let last = if inclusive { end } else { end - 1 };
+            Ok(Elements::Range(start..=last))
+        }
+        other => Err(EvalError {
+            message: format!("List.{} needs a List, got {}", name, other),
+        }),
+    }
+}
+
 fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
     let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
         if wanted == got {
@@ -97,21 +146,28 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
     };
 
     match name {
+        // A range knows its length from its bounds, so neither of these walks anything.
         "len" => {
             expect(1, args.len())?;
-            let items = as_list(args[0].clone())?;
-            Ok(Value::Int(items.len() as i64))
+            let count = Elements::count_of(&args[0]).ok_or_else(|| EvalError {
+                message: format!("List.{} needs a List, got {}", name, args[0]),
+            })?;
+            Ok(Value::Int(count as i64))
         }
         "is_empty" => {
             expect(1, args.len())?;
-            let items = as_list(args[0].clone())?;
-            Ok(Value::Bool(items.is_empty()))
+            let count = Elements::count_of(&args[0]).ok_or_else(|| EvalError {
+                message: format!("List.{} needs a List, got {}", name, args[0]),
+            })?;
+            Ok(Value::Bool(count == 0))
         }
         "map" => {
             expect(2, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let capacity = Elements::count_of(&args[0]).unwrap_or(0);
+            let items = elements(args[0].clone(), name)?;
             let func = args[1].clone();
-            let mut out = Vec::with_capacity(items.len());
+            // The OUTPUT is a list either way, but the input need not become one first.
+            let mut out = Vec::with_capacity(capacity);
             for item in items {
                 out.push(call_function(func.clone(), vec![item])?);
             }
@@ -119,7 +175,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
         "fold" => {
             expect(3, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let items = elements(args[0].clone(), name)?;
             let mut acc = args[1].clone();
             let func = args[2].clone();
             for item in items {
@@ -175,7 +231,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
         "keep_if" | "drop_if" => {
             expect(2, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let items = elements(args[0].clone(), name)?;
             let func = args[1].clone();
             let keep = name == "keep_if";
             let mut out = Vec::new();
@@ -206,7 +262,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         // accumulator is a Try and the fold short-circuits.
         "fold_try" => {
             expect(3, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let items = elements(args[0].clone(), name)?;
             let mut acc = args[1].clone();
             let func = args[2].clone();
             for item in items {
@@ -220,15 +276,16 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             }
             Ok(Value::tag("Ok", vec![acc]))
         }
-        // An iterator is already a list here, so collecting one is a no-op.
+        // Collecting an iterator into a list. A range reaches here still a range —
+        // `.iter()` no longer materializes one — so this is where it becomes a list.
         "from_iter" => {
             expect(1, args.len())?;
-            Ok(Value::List(as_list(args[0].clone())?))
+            Ok(Value::List(elements(args[0].clone(), name)?.collect()))
         }
         "contains" => {
             expect(2, args.len())?;
-            let items = as_list(args[0].clone())?;
-            Ok(Value::Bool(items.iter().any(|v| values_equal(v, &args[1]))))
+            let mut items = elements(args[0].clone(), name)?;
+            Ok(Value::Bool(items.any(|v| values_equal(&v, &args[1]))))
         }
         _ => Err(EvalError {
             message: format!("Unknown function List.{}", name),
@@ -962,20 +1019,17 @@ pub fn dispatch_builtin(
     method: &str,
     args: Vec<Value>,
 ) -> Result<Value, EvalError> {
-    // `.iter()` turns a range or list into an iterator. Here that is simply the list
-    // of its elements.
+    // `.iter()` on something already iterable is the identity. A range STAYS a range:
+    // building the list of its elements cost 190 MB on a two-million-element range, and
+    // every builtin that only walks the elements can walk a range instead. It also
+    // matches roc, which inspects a range as `<opaque>` rather than as a list.
     //
-    // ponytail: EAGER — a real iterator is lazy, so an infinite one would hang and
-    // `Str.inspect` shows a list where roc shows `<opaque>`. Nothing in the examples
-    // depends on either.
+    // ponytail: still eager in the sense that `map` over a range builds its output
+    // list. Fusing `map` into the consumer needs a real lazy iterator; this removes the
+    // ceiling without one.
     if method == "iter" && args.is_empty() {
-        match &receiver {
-            Value::List(items) => return Ok(Value::List(items.clone())),
-            Value::Range { start, end, inclusive } => {
-                let last = if *inclusive { *end } else { *end - 1 };
-                return Ok(Value::List((*start..=last).map(Value::Int).collect()));
-            }
-            _ => {}
+        if matches!(receiver, Value::List(_) | Value::Range { .. }) {
+            return Ok(receiver);
         }
     }
 
@@ -1108,11 +1162,10 @@ pub fn module_for(value: &Value) -> Option<&'static str> {
         Value::Str(_) => "Str",
         Value::Bool(_) => "Bool",
         Value::List(_) => "List",
-        Value::Record(_)
-        | Value::Tag(..)
-        | Value::Tuple(_)
-        | Value::Range { .. }
-        | Value::Unit => return None,
+        // A range answers the List methods: `(1..=n).iter().fold(..)` is the idiom,
+        // and the ones that only walk the elements never build a list.
+        Value::Range { .. } => "List",
+        Value::Record(_) | Value::Tag(..) | Value::Tuple(_) | Value::Unit => return None,
         Value::Closure(..) | Value::Builtin(..) => return None,
     })
 }

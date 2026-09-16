@@ -17,8 +17,10 @@ See [The new direction](#the-new-direction) for what changed and why.
 ([round 3f](#round-3f-v4-builtins-and-the-first-real-gate)) and **V5**
 ([round 3g](#round-3g-v5-both-engines-pass-every-gate)) and **V6**
 ([round 3h](#round-3h-v6-one-engine)). **The tree-walker is gone and the VM is the
-engine.** Round 3 is finished; what is left has numbers attached and is listed in
-[After V6](#after-v6).
+engine.** Round 3 is finished, and working through what it left behind
+([After V6](#after-v6-four-retired-one-landed-one-blocked)) retired four of the seven
+items with measurements, landed a 66× memory ceiling, and left one blocked on node
+identity in the AST.
 
 Everything in the history sections below is measured. Everything in the VM sections is
 a **target**, labelled as such, and lands only when `tests/bench.sh` agrees.
@@ -896,30 +898,118 @@ strings                        30ms                  5ms           5ms
 
 `Value` is 32 bytes, `Op` is 16, and the crate is `#![forbid(unsafe_code)]`.
 
-## After V6
+## After V6: four retired, one landed, one blocked
 
-Everything here has a number attached or a named cause. Nothing is speculative.
+The list V6 left behind had seven items. Working through them mostly produced
+*measurements that retired them*, which is what the method is for — and one of them
+turned out to be a 66× memory ceiling that the list had described wrongly.
 
-- **Operand-shape dispatch** in `Bin` — worth about **24%** on `fib`, priced in
-  [round 3c](#round-3c-v1-closures-and-the-clone-that-was-costing-40) with a throwaway
-  fast path. Needs the checker's types threaded through the compiler so `AddInt` can be
-  emitted where both sides are known to be `Int`.
-- **Field access by slot** instead of by name. A record is a `Vec<(&str, Value)>` and
-  `GetField` compares strings; resolving a field to an index needs the record's type at
-  the access site. The other half of the `matching`/`records` gap.
-- **The callback boundary.** A builtin's callback re-enters the VM through
-  `eval::call_function`, which nests a Rust frame — the last place the Rust stack bounds
-  a Roc program. Lowering the callback-taking builtins (`List.map`, `fold`, `filter`)
-  into bytecode removes it.
-- **Lazy iterators** (item 11). Still the only thing that addresses `strings` at 18.9×
-  roc's memory, and still orthogonal to everything else.
-- **A shared cell for a captured `var`**, which is what the four deliberate refusals
-  need. Nothing in roc's suite wants it yet.
-- **`Value` to 16 bytes** by boxing `Range` and shrinking `Builtin`'s owned `String` to
-  a `&'static str`. `Value` is moved on every register write, so the width is a tax on
-  everything.
-- **A JIT.** Cranelift takes the same IR. It is a strictly larger correctness surface
-  and the VM had to exist first; now it does.
+### Landed: a range stays a range
+
+The list said lazy iterators were worth having because `strings` used 18.9× roc's
+memory. That was wrong twice: `strings` peaks at 3.0 MB, which is what *any* program
+costs here (a hello-world is under the sampler's resolution), and `roc` on the same file
+peaks at **67.7 MB**, because it compiles. There is no string memory problem.
+
+The real ceiling was next door, and measuring for the wrong one found it:
+
+```
+(1..=2_000_000).iter().fold(0, |a, x| a + x)
+  before     208ms    190.4 MB
+  after      153ms      2.9 MB      66x less memory, 26% faster
+```
+
+`.iter()` on a range built the list of its elements — two million `Value`s before the
+first one was looked at. Now it returns the range unchanged, and the list builtins that
+only *walk* their elements walk a range instead of a list: `len` and `is_empty` from the
+bounds without touching anything, `fold`, `fold_try`, `keep_if`, `drop_if`, `contains`
+and `map` through an `Elements` iterator that yields from either. `map`'s output is still
+a list, because it is one; `from_iter` is where a range becomes one.
+
+It also fixed a divergence the old code had documented and accepted: roc inspects a range
+as `<opaque>`, and `.iter()` returning a list made rocflight show `[1, 2, 3]`.
+`tests/bench/iter_range.roc` keeps the ceiling from coming back.
+
+Also landed, small: `Value::Builtin` holds a `&'static str` rather than an owned
+`String`, so `xs.map(Str.inspect)` builds its name at compile time instead of `format!`ing
+one per evaluation.
+
+### Retired: field access by slot
+
+The premise was that field lookup by name is half the remaining `matching`/`records` gap.
+It is not. Replacing the name comparison with a bare length check — no string comparison
+at all, wrong but fast — changed nothing:
+
+```
+              name compare     length check only
+records            8.8ms             8.8ms
+records_tail      10.6ms            10.6ms
+matching          23.0ms            22.7ms
+```
+
+Records in real Roc code have a handful of fields, and a scan over three or four
+`&str`s is not where the time goes. An inline cache, a slot table and the type
+information to build one would all have been for nothing. **Not doing it.**
+
+### Retired: pooling the machines that run callbacks
+
+`xs.map(f)` re-enters the VM once per element, and each re-entry built a fresh `Vm` —
+two `Vec`s and a grow. Pooling them, so the register file is allocated once:
+
+```
+600,000 callbacks     unpooled 69ms     pooled 68ms
+```
+
+1.5%, which is noise. Reverted: 25 lines and a thread-local for nothing.
+
+### Retired: `Value` to 16 bytes
+
+The list said this followed from boxing `Range` and shrinking `Builtin`'s `String`.
+It does not. With `Builtin` shrunk, **five** variants are 24 bytes wide:
+
+```
+Str(Rc<str>)            16
+Builtin(&str, usize)    24   <- was 32
+Record(Vec) List(Vec) Tuple(Vec) Tag(&str, Rc<Vec>) Range{i64,i64,bool}    24
+Closure(Rc)              8
+```
+
+`Value` is 32 and stays 32 until `Record`, `List`, `Tuple`, `Tag` and `Range` are *all*
+boxed — which is every builtin in the crate, for one word. The `Builtin` change is kept
+because it removes an allocation; the 16-byte target is withdrawn.
+
+### Blocked: specialised arithmetic opcodes
+
+This is the one item with a real number still attached — **24% of `fib`**, priced in
+[round 3c](#round-3c-v1-closures-and-the-clone-that-was-costing-40) — and it is blocked
+on something structural rather than on effort.
+
+`AddInt` can only be emitted where the compiler knows both operands are `Int`. The
+checker knows, but there is no way to ask it about a *particular* node: `Expr` has no
+node identity and no spans, so there is nowhere to hang a type on and nothing to key a
+side table by. **The prerequisite is node identity in the AST**, which is a parser
+change and the same missing piece that blocks per-instruction source spans for error
+locations (see [round 3b](#round-3b-v0-the-machine-runs)). Two items are waiting on it,
+which is what makes it the next real piece of work rather than a tidy-up.
+
+The alternative — a quickening scheme that rewrites `Bin` into `AddInt` the first time an
+instruction sees two `Int`s — needs the bytecode to be mutable while it runs, and would
+buy the same 24% for a mutable-code-in-the-hot-loop complication. Not before the typed
+route has been tried.
+
+### Not doing: a shared cell for a captured `var`
+
+The four deliberate refusals need it, and nothing in roc's own suite asks for any of
+them. It is written down in
+[round 3e](#round-3e-v3-var-loops-and-one-refusal) with the design; it stays written down
+until a real program wants it.
+
+### Not doing yet: a JIT
+
+Cranelift takes the VM's IR, and the VM now exists, which was the prerequisite. It is
+also a strictly larger correctness surface than everything above it put together, and
+the gates that would police it are the 98 golden pairs — which is the right gate, but a
+slow one to iterate against. A separate piece of work, not a follow-up task.
 
 ---
 
@@ -1295,10 +1385,10 @@ disruptive change to a tree-walker that is about to be deleted:
   copying that motivated it, and the VM's register file removes the per-call
   `Vec<Value>`; there may be nothing left.
 
-**Item 11 (lazy iterators) is the exception** — it is orthogonal to the VM, it is the
-only thing that addresses `strings` at 18.9× roc's memory, and it is the largest
-remaining *algorithmic* win. Do it after V6, or before V0 if the memory number is more
-annoying than the speed.
+**Item 11 (lazy iterators)** was the exception, and it is now mostly done — though for
+a different reason than this plan gave. `strings` was never 18.9× roc's memory; the
+ceiling was `.iter()` over a range, at 66×. See
+[After V6](#after-v6-four-retired-one-landed-one-blocked).
 
 ---
 

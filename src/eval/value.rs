@@ -18,7 +18,12 @@ pub enum Value {
     /// Float value (64-bit)
     Float(f64),
     /// Builtin function marker: name + arity
-    Builtin(String, usize),
+    /// One of the interpreter's own functions, passed as a value — `xs.map(Str.inspect)`.
+    ///
+    /// `&'static str`, not `String`: the name is `Module.name` from the compiler's own
+    /// tables, so it already lives as long as the program, and an owned `String` here
+    /// made this the widest arm of the enum — which every other `Value` paid for.
+    Builtin(&'static str, usize),
     /// A function value: a chunk to run, and the values it captured.
     ///
     /// Boxed, because this is otherwise the variant that would decide
