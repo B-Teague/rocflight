@@ -12,7 +12,7 @@ use rocflight::eval::{Evaluator, Value};
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
-fn parse(src: &str) -> Result<rocflight::ast::Expr<'static>, rocflight::error::ParseError> {
+fn parse(src: &str) -> Result<rocflight::ast::Expr, rocflight::error::ParseError> {
     let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
     Parser::new(&desugared).parse_expr()
 }

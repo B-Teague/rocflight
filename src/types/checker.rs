@@ -141,7 +141,7 @@ impl TypeChecker {
             Type::Tuple(items) => Type::Tuple(
                 items.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
             ),
-            Type::Record { fields: fields, .. } => Type::closed_record(
+            Type::Record { fields, .. } => Type::closed_record(
                 fields
                     .iter()
                     .map(|(n, t)| (n.clone(), Self::substitute_vars(t, mapping)))
@@ -189,7 +189,7 @@ impl TypeChecker {
                 Self::type_vars_in(result, out);
             }
             Type::Tuple(items) => items.iter().for_each(|t| Self::type_vars_in(t, out)),
-            Type::Record { fields: fields, .. } => {
+            Type::Record { fields, .. } => {
                 fields.iter().for_each(|(_, t)| Self::type_vars_in(t, out))
             }
             Type::TagUnion { tags, .. } => tags
@@ -647,7 +647,7 @@ impl TypeChecker {
                     other => other,
                 };
                 match resolved {
-                    Type::Record { fields: fields, .. } => fields
+                    Type::Record { fields, .. } => fields
                         .iter()
                         .find(|(name, _)| name == field)
                         .map(|(_, ty)| ty.clone())
@@ -770,7 +770,7 @@ impl TypeChecker {
             Expr::Lambda { params, body } => {
                 // For each parameter, allocate a fresh type variable
                 let mut param_types = vec![];
-                for _ in params {
+                for _ in params.iter() {
                     param_types.push(self.fresh_var());
                 }
 
@@ -1378,4 +1378,3 @@ impl Default for TypeChecker {
         Self::new()
     }
 }
-

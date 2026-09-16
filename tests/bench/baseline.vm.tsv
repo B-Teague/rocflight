@@ -1,0 +1,13 @@
+calls	6	2964
+closure_capture	2	3388
+closure_in_loop	9	2952
+list_ops	2	3384
+loop_mod	9	3012
+loop	9	2944
+matching_mod	22	2964
+matching	21	2980
+matching_tail	24	2968
+records_mod	8	2948
+records	8	2948
+records_tail	10	2900
+strings	5	3056

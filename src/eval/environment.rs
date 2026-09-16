@@ -105,7 +105,11 @@ impl Environment {
         let mut found: Vec<(&'static str, Value)> = Vec::new();
         let mut consider = |name: &'static str, value: &Value| {
             if name.ends_with(&suffix)
-                && matches!(value, Value::Lambda { .. })
+                // A VM closure counts: a nominal's method block is dispatched through
+                // here, and under the VM its methods are `Closure`s. Checking only for
+                // `Lambda` made `a + b` on a type that defines `plus` silently fall
+                // through to the built-in operator.
+                && matches!(value, Value::Lambda(..) | Value::Closure(..))
                 && !found.iter().any(|(seen, _)| *seen == name)
             {
                 found.push((name, value.clone()));

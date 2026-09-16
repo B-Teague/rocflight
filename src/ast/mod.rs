@@ -54,11 +54,11 @@ impl fmt::Display for BinOp {
 
 /// Top-level expression
 #[derive(Debug, Clone)]
-pub enum Expr<'a> {
+pub enum Expr {
     /// String literal: "hello"
     Str(&'static str),
     /// String interpolation: "x=${expr}"
-    StrInterp(Vec<StrPart<'a>>),
+    StrInterp(Vec<StrPart>),
     /// Integer literal: 42, -3
     Int(i64),
     /// Float literal: 3.14, -2.5
@@ -72,19 +72,25 @@ pub enum Expr<'a> {
     },
     /// Binary operation: left op right
     BinOp {
-        left: Box<Expr<'a>>,
+        left: Box<Expr>,
         op: BinOp,
-        right: Box<Expr<'a>>,
+        right: Box<Expr>,
     },
     /// Lambda function: |x| body or |x, y| x + y
+    ///
+    /// `Rc`, not `Box` or `Vec`: evaluating this node builds a closure that has to own
+    /// its body and parameter list, and a `Box` made that a DEEP clone of every AST
+    /// node in the body — once per closure created, which inside a loop is once per
+    /// iteration. It also forced a lifetime transmute, since the clone was not
+    /// `'static`. Sharing is sound because the AST is immutable after parsing.
     Lambda {
-        params: Vec<&'static str>,
-        body: Box<Expr<'a>>,
+        params: std::rc::Rc<Vec<&'static str>>,
+        body: std::rc::Rc<Expr>,
     },
     /// Function call: f(x) or add(1, 2)
     Call {
-        func: Box<Expr<'a>>,
-        args: Vec<Expr<'a>>,
+        func: Box<Expr>,
+        args: Vec<Expr>,
     },
     /// Let binding: `x = value` followed by `body`.
     ///
@@ -94,43 +100,43 @@ pub enum Expr<'a> {
     Let {
         name: &'static str,
         annotation: Option<crate::types::Type>,
-        value: Box<Expr<'a>>,
-        body: Box<Expr<'a>>,
+        value: Box<Expr>,
+        body: Box<Expr>,
     },
     /// Empty record `{}` — Roc's unit value.
     Unit,
     /// Record literal: `{ x: 1, y: 2 }`. Fields keep source order here; only
     /// `Str.inspect` sorts them.
-    Record(Vec<(&'static str, Expr<'a>)>),
+    Record(Vec<(&'static str, Expr)>),
     /// Boolean literal, from `Bool.True` / `Bool.False`.
     Bool(bool),
     /// List literal: `[1, 2, 3]`, `[]`.
-    List(Vec<Expr<'a>>),
+    List(Vec<Expr>),
     /// Record update: `{ ..base, field: value }`.
     ///
     /// Builds a NEW record from `base` with the named fields replaced; records are not
     /// mutated. Note the spelling — `{ base & field: value }` is rejected by roc.
     RecordUpdate {
-        base: Box<Expr<'a>>,
-        fields: Vec<(&'static str, Expr<'a>)>,
+        base: Box<Expr>,
+        fields: Vec<(&'static str, Expr)>,
     },
     /// Range: `0..<3` (exclusive) or `1..=3` (inclusive).
     ///
     /// NOT a list — roc inspects a range as `<opaque>` and rejects passing one where a
     /// `List` is wanted. It is iterable by `for`.
     Range {
-        start: Box<Expr<'a>>,
-        end: Box<Expr<'a>>,
+        start: Box<Expr>,
+        end: Box<Expr>,
         inclusive: bool,
     },
     /// Tuple literal: `("Roc", 1)`.
     ///
     /// Heterogeneous and fixed-length, unlike a list. `(1)` is NOT a one-tuple — it
     /// is a parenthesised expression — so this always holds two or more elements.
-    Tuple(Vec<Expr<'a>>),
+    Tuple(Vec<Expr>),
     /// Positional tuple access: `pair.0`. Zero-based.
     TupleIndex {
-        tuple: Box<Expr<'a>>,
+        tuple: Box<Expr>,
         index: usize,
     },
     /// Pattern match: `match scrutinee { pattern => body ... }`.
@@ -139,8 +145,8 @@ pub enum Expr<'a> {
     /// in order and the first whose pattern matches (and whose guard holds) wins, so
     /// order is significant.
     Match {
-        scrutinee: Box<Expr<'a>>,
-        arms: Vec<MatchArm<'a>>,
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
     },
     /// Conditional expression: `if cond a else b`.
     ///
@@ -148,9 +154,9 @@ pub enum Expr<'a> {
     /// `if`. `else if` is not a separate form: it is an `If` whose `otherwise` is
     /// another `If`.
     If {
-        condition: Box<Expr<'a>>,
-        then_branch: Box<Expr<'a>>,
-        otherwise: Box<Expr<'a>>,
+        condition: Box<Expr>,
+        then_branch: Box<Expr>,
+        otherwise: Box<Expr>,
     },
     /// `var x = value` then `body` — a REBINDABLE binding.
     ///
@@ -158,8 +164,8 @@ pub enum Expr<'a> {
     /// redeclaration), and only a `var` may appear on the left of an assignment.
     VarDecl {
         name: &'static str,
-        value: Box<Expr<'a>>,
-        body: Box<Expr<'a>>,
+        value: Box<Expr>,
+        body: Box<Expr>,
     },
     /// `x = value` where `x` is an existing `var` — updates it IN PLACE.
     ///
@@ -167,32 +173,32 @@ pub enum Expr<'a> {
     /// there would be discarded and the value read after the loop unchanged.
     Assign {
         name: &'static str,
-        value: Box<Expr<'a>>,
-        body: Box<Expr<'a>>,
+        value: Box<Expr>,
+        body: Box<Expr>,
     },
     /// `for name in iterable { body }`. Evaluates to `{}`.
     For {
         name: &'static str,
-        iterable: Box<Expr<'a>>,
-        body: Box<Expr<'a>>,
+        iterable: Box<Expr>,
+        body: Box<Expr>,
     },
     /// `while condition { body }`. Evaluates to `{}`.
     While {
-        condition: Box<Expr<'a>>,
-        body: Box<Expr<'a>>,
+        condition: Box<Expr>,
+        body: Box<Expr>,
     },
     /// `return value` — leaves the enclosing FUNCTION immediately.
     ///
     /// Unlike `break`, which leaves a loop, this unwinds to the lambda boundary.
-    Return(Box<Expr<'a>>),
+    Return(Box<Expr>),
     /// `crash "message"` — aborts the program.
-    Crash(Box<Expr<'a>>),
+    Crash(Box<Expr>),
     /// `expect condition` — checks an assertion.
     ///
     /// A failure is REPORTED, not fatal: roc prints to stderr and carries on.
-    Expect(Box<Expr<'a>>),
+    Expect(Box<Expr>),
     /// `dbg value` — prints the value to stderr and carries on.
-    Dbg(Box<Expr<'a>>),
+    Dbg(Box<Expr>),
     /// `break` — leaves the nearest enclosing loop.
     ///
     /// There is no `continue`: it crashes the roc compiler on nightly-2026-09-03, so
@@ -207,9 +213,9 @@ pub enum Expr<'a> {
     /// Distinct from `FieldAccess`: `s.is_empty` reads a field, `s.is_empty()` calls a
     /// method, so the parens are what separate them.
     Dispatch {
-        receiver: Box<Expr<'a>>,
+        receiver: Box<Expr>,
         method: &'static str,
-        args: Vec<Expr<'a>>,
+        args: Vec<Expr>,
     },
     /// Optional field access: `config.?timeout`.
     ///
@@ -217,7 +223,7 @@ pub enum Expr<'a> {
     /// not. Only meaningful for a field declared `name ?: Type` on a nominal's backing
     /// record — using it on an ordinary field segfaults the roc compiler.
     OptionalField {
-        record: Box<Expr<'a>>,
+        record: Box<Expr>,
         field: &'static str,
     },
     /// Record field access: `point.x`.
@@ -226,13 +232,13 @@ pub enum Expr<'a> {
     /// lowercase receiver (`point.x`) is a field access while an uppercase one
     /// (`Str.inspect`) is a module member.
     FieldAccess {
-        record: Box<Expr<'a>>,
+        record: Box<Expr>,
         field: &'static str,
     },
     /// Tag application: `Ok(x)`, `Err(e)`, or a bare tag like `Red` (no args).
     Tag {
         name: &'static str,
-        args: Vec<Expr<'a>>,
+        args: Vec<Expr>,
     },
 }
 
@@ -241,13 +247,13 @@ pub enum Expr<'a> {
 
 /// One arm of a `match`: alternatives, an optional guard, and a body.
 #[derive(Debug, Clone)]
-pub struct MatchArm<'a> {
+pub struct MatchArm {
     /// `A | B => body` — the arm matches if ANY of these patterns match.
     pub patterns: Vec<Pattern>,
     /// `pattern if cond => body`. Checked only after the pattern matches, with the
     /// pattern's bindings in scope.
-    pub guard: Option<Expr<'a>>,
-    pub body: Expr<'a>,
+    pub guard: Option<Expr>,
+    pub body: Expr,
 }
 
 /// A `match` pattern.
@@ -353,14 +359,14 @@ impl fmt::Display for Pattern {
 
 /// Part of a string interpolation
 #[derive(Debug, Clone)]
-pub enum StrPart<'a> {
+pub enum StrPart {
     /// Literal part of string
     Literal(&'static str),
     /// Expression to interpolate: ${...}
-    Expr(&'a Expr<'a>),
+    Expr(&'static Expr),
 }
 
-impl<'a> fmt::Display for Expr<'a> {
+impl fmt::Display for Expr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Expr::Str(s) => write!(f, "\"{}\"", s),

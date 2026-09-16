@@ -33,7 +33,7 @@ mod phase5_tests {
         let expr = parser.parse_expr().unwrap();
         let mut evaluator = Evaluator::new();
         let result = evaluator.eval(&expr).unwrap();
-        assert!(matches!(result, Value::Lambda { .. }));
+        assert!(matches!(result, Value::Lambda(..)));
     }
 
     #[test]

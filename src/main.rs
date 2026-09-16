@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Roc Interpreter CLI
 //!
 //! Usage: rocflight <file.roc>
@@ -51,6 +53,7 @@ fn cli() {
         eprintln!("  --emit-desugared    Write the desugared source to .rocflight/cache/");
         eprintln!("  --show-platforms    Report each real platform the app resolves");
         eprintln!("  --test              Run the file's `expect`s and report, like `roc test`");
+        eprintln!("  --vm                Run on the register VM instead of the tree-walker");
         eprintln!("  --clear-cache       Delete .rocflight/cache/desugared and exit");
         process::exit(1);
     }
@@ -62,6 +65,7 @@ fn cli() {
     let mut emit_desugared = false;
     let mut show_platforms = false;
     let mut test_mode = false;
+    let mut use_vm = false;
     let mut filename = None;
 
     for arg in &args[1..] {
@@ -89,6 +93,9 @@ fn cli() {
             }
             "--test" => {
                 test_mode = true;
+            }
+            "--vm" => {
+                use_vm = true;
             }
             "--show-platforms" => {
                 show_platforms = true;
@@ -120,6 +127,7 @@ fn cli() {
         emit_desugared,
         show_platforms,
         test_mode,
+        use_vm,
     ) {
         eprintln!("Error: {}", e);
         process::exit(1);
@@ -135,6 +143,7 @@ fn run(
     emit_desugared: bool,
     show_platforms: bool,
     test_mode: bool,
+    use_vm: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Step 1: Load and desugar file.
     //
@@ -247,6 +256,47 @@ fn run(
         })
         .collect::<Result<_, _>>()?;
 
+    // Step 4 (--vm): compile to bytecode and run that instead.
+    //
+    // Anything the VM cannot compile is an error naming the construct, never a silent
+    // fall-through to the tree-walker: which engine ran a program has to be knowable.
+    if use_vm {
+        let unit = rocflight::vm::compile::Unit {
+            // A module's top level is compiled into the SAME program, ahead of the
+            // app's, which is how `hello` from `import Hello exposing [hello]` ends up
+            // in scope — the tree-walker gets there by evaluating each module into the
+            // shared global scope first.
+            modules: module_asts
+                .iter()
+                .map(|(module_ast, type_name, exposed)| rocflight::vm::compile::Module {
+                    ast: module_ast,
+                    type_name: Box::leak(type_name.clone().into_boxed_str()),
+                    exposed: exposed
+                        .iter()
+                        .map(|name| &*Box::leak(name.clone().into_boxed_str()) as &'static str)
+                        .collect(),
+                })
+                .collect(),
+            app: &ast,
+            entry: app_entry_point.as_deref(),
+            ingested,
+        };
+        let program = std::rc::Rc::new(rocflight::vm::compile_unit(&unit)?);
+        let value = rocflight::vm::run(&program)?;
+
+        // `--test` reports the `expect` tally the way `roc test` does. The tally is
+        // process-wide and both engines feed the same one, so this is the same report.
+        if test_mode {
+            return report_tests();
+        }
+        // A module's own value is its output, exactly as below. An app's output comes
+        // from its effects, so there is nothing to print.
+        if app_entry_point.is_none() {
+            println!("{}", value);
+        }
+        return Ok(());
+    }
+
     // Step 4: Evaluate
     let mut evaluator = Evaluator::new();
     for (module_ast, type_name, exposed) in &module_asts {
@@ -285,16 +335,7 @@ fn run(
     };
 
     if test_mode {
-        let (ran, failed) = rocflight::eval::expect_tally();
-        if failed == 0 {
-            println!("All ({}) tests passed", ran);
-        } else {
-            println!("Ran {} tests:", ran);
-            println!("    {} passed", ran - failed);
-            println!("    {} failed", failed);
-            process::exit(1);
-        }
-        return Ok(());
+        return report_tests();
     }
 
     match app_entry_point {
@@ -304,6 +345,23 @@ fn run(
         None => println!("{}", _value),
     }
 
+    Ok(())
+}
+
+/// Report the `expect` tally, the way `roc test` does.
+///
+/// The tally is process-wide, and both engines add to the same one, so this is one
+/// function rather than one per engine.
+fn report_tests() -> Result<(), Box<dyn Error>> {
+    let (ran, failed) = rocflight::eval::expect_tally();
+    if failed == 0 {
+        println!("All ({}) tests passed", ran);
+    } else {
+        println!("Ran {} tests:", ran);
+        println!("    {} passed", ran - failed);
+        println!("    {} failed", failed);
+        process::exit(1);
+    }
     Ok(())
 }
 
@@ -325,11 +383,8 @@ fn invoke_app_entry_point(
 
     // Match on the entry point type
     match entry_fn {
-        lambda @ Value::Lambda { .. } => {
-            let arity = match &lambda {
-                Value::Lambda { params, .. } => params.len(),
-                _ => unreachable!("matched above"),
-            };
+        Value::Lambda(l) => {
+            let arity = l.params.len();
 
             // The entry point takes the command-line arguments — a LIST, matching
             // `main! : List(Str) => ...`. Passing a string here made `args` the wrong
@@ -349,7 +404,7 @@ fn invoke_app_entry_point(
             };
 
             // Shared with every other call, so `return` unwinds here too.
-            rocflight::eval::apply(lambda, args)?;
+            rocflight::eval::apply(Value::Lambda(l), args)?;
 
             Ok(())
         }

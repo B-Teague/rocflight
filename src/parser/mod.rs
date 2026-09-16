@@ -49,7 +49,7 @@ pub struct Parser {
     /// roc loads a module completely and only then runs its tests, so an `expect` may
     /// use a function declared below it. Running them in source order called functions
     /// that did not exist yet.
-    deferred_expects: Vec<Expr<'static>>,
+    deferred_expects: Vec<Expr>,
     /// Local modules brought in by `import Hello exposing [hello]`, as
     /// `(module path, exposed names)`. The path is relative to the importing file and
     /// names a `.roc` beside it — `Dir/Hello` is `Dir/Hello.roc`.
@@ -60,11 +60,11 @@ pub struct Parser {
     /// Defaults collected while parsing the record type of the current declaration,
     /// as `(field, default expression)`. Moved into `nominal_defaults` when the
     /// declaration completes.
-    field_defaults: Vec<(String, Expr<'static>)>,
+    field_defaults: Vec<(String, Expr)>,
     /// Optional field names collected the same way.
     optional_fields: Vec<String>,
     /// Per-nominal field defaults, so `Name.{ ... }` can fill the omitted ones.
-    nominal_defaults: Vec<(String, Vec<(String, Expr<'static>)>)>,
+    nominal_defaults: Vec<(String, Vec<(String, Expr)>)>,
     /// Method names promised by a `where` clause, so the checker may dispatch them on
     /// a type variable that inference has not resolved.
     where_methods: Vec<String>,
@@ -82,7 +82,7 @@ pub struct Parser {
     ///
     /// Wrapped around the program so they are ordinary bindings: `Secret.reveal` is
     /// then a plain lookup, and `s.reveal()` a dispatch that finds it.
-    methods: Vec<(&'static str, Option<Type>, Expr<'static>)>,
+    methods: Vec<(&'static str, Option<Type>, Expr)>,
     /// Type variables seen so far in the annotation being parsed.
     ///
     /// A repeated name must mean the SAME variable: `pair : a, a -> a` constrains both
@@ -120,7 +120,7 @@ impl Parser {
 
     /// Load and parse file (with desugaring)
     /// Returns: (AST, app_entry_point)
-    pub fn from_file(path: &str) -> Result<(Expr<'static>, Option<String>), ParseError> {
+    pub fn from_file(path: &str) -> Result<(Expr, Option<String>), ParseError> {
         // Step 1: Load file
         let source = std::fs::read_to_string(path)
             .map_err(|e| ParseError {
@@ -148,7 +148,7 @@ impl Parser {
 
     /// Parse expression (entry point)
     /// Handles: let bindings, function calls, literals, top-level definitions
-    pub fn parse_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    pub fn parse_expr(&mut self) -> Result<Expr, ParseError> {
         // Counted from the very start: a nominal's method block is parsed by
         // `skip_trivia` in the loop below, so a lambda inside it re-enters this
         // function before the main expression is reached.
@@ -183,7 +183,7 @@ impl Parser {
     ///
     /// The file's value — usually `main!` — stays last, so what the program evaluates
     /// to is unchanged.
-    fn append_to_body(program: &mut Expr<'static>, extra: Vec<Expr<'static>>) {
+    fn append_to_body(program: &mut Expr, extra: Vec<Expr>) {
         let mut cursor = program;
         while let Expr::Let { body, .. } = cursor {
             cursor = body;
@@ -202,7 +202,7 @@ impl Parser {
     }
 
     /// The body of `parse_expr`, without the method-block wrapping.
-    fn parse_expr_inner(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_expr_inner(&mut self) -> Result<Expr, ParseError> {
         self.skip_whitespace();
 
         // Skip app and import declarations at the top level
@@ -687,7 +687,7 @@ impl Parser {
     ///
     /// `Cfg.{ host: "a" }` for `Cfg := { host: Str, port: U16 ?? 8080 }` becomes
     /// `{ host: "a", port: 8080 }`. Fields the construction supplied are left alone.
-    fn fill_defaults(&self, type_name: &str, built: Expr<'static>) -> Expr<'static> {
+    fn fill_defaults(&self, type_name: &str, built: Expr) -> Expr {
         let Some((_, defaults)) = self.nominal_defaults.iter().find(|(n, _)| n == type_name)
         else {
             return built;
@@ -717,7 +717,7 @@ impl Parser {
     ///
     /// Shared by bare tags (`Ok(x)`) and nominal-qualified ones (`Animal.Dog(x)`),
     /// which build the same value.
-    fn finish_tag(&mut self, name: &'static str) -> Result<Expr<'static>, ParseError> {
+    fn finish_tag(&mut self, name: &'static str) -> Result<Expr, ParseError> {
         let mut args = Vec::new();
         if self.input[self.pos..].starts_with('(') {
             self.pos += 1; // Skip '('
@@ -1283,7 +1283,7 @@ impl Parser {
     }
 
     /// Parse let binding or regular expression
-    fn parse_let_or_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_let_or_expr(&mut self) -> Result<Expr, ParseError> {
         self.skip_trivia();
 
         let rest = &self.input[self.pos..];
@@ -1470,7 +1470,7 @@ impl Parser {
     /// parsed and sequenced after. Not done inside `parse_let_or_expr` itself: a
     /// lambda body without braces goes through it too, and would swallow the rest of
     /// the file.
-    fn parse_top_level(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_top_level(&mut self) -> Result<Expr, ParseError> {
         let value = self.parse_let_or_expr()?;
         // A top-level test waits for the whole file, so it is set aside here and put
         // back at the end by `parse_expr`.
@@ -1508,7 +1508,7 @@ impl Parser {
     ///
     /// `??` binds looser than arithmetic — `x ?? 1 + 2` is `x ?? (1 + 2)`, verified
     /// against roc — which is why the right side is parsed at the or-level below.
-    fn parse_or_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_or_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_or_inner()?;
 
         loop {
@@ -1547,7 +1547,7 @@ impl Parser {
     }
 
     /// Parse logical OR: a || b
-    fn parse_or_inner(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_or_inner(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_and_expr()?;
 
         loop {
@@ -1576,7 +1576,7 @@ impl Parser {
     }
 
     /// Parse logical AND: a && b
-    fn parse_and_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_and_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_comparison_expr()?;
 
         loop {
@@ -1609,7 +1609,7 @@ impl Parser {
     }
 
     /// Parse comparison: a == b, a < b, etc.
-    fn parse_comparison_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_comparison_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_range_expr()?;
 
         loop {
@@ -1654,7 +1654,7 @@ impl Parser {
     ///
     /// Non-associative — `a..<b..<c` is not a range of ranges — so this reads at most
     /// one operator and does not loop.
-    fn parse_range_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_range_expr(&mut self) -> Result<Expr, ParseError> {
         let left = self.parse_additive_expr()?;
         self.skip_whitespace();
 
@@ -1677,7 +1677,7 @@ impl Parser {
     }
 
     /// Parse addition/subtraction: a + b, a - b
-    fn parse_additive_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_additive_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_multiplicative_expr()?;
 
         loop {
@@ -1724,7 +1724,7 @@ impl Parser {
     }
 
     /// Parse multiplication/division: a * b, a / b
-    fn parse_multiplicative_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_multiplicative_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_unary_expr()?;
 
         loop {
@@ -1772,7 +1772,7 @@ impl Parser {
     ///
     /// A negative literal (`-5`) is handled by the number lexer instead, so it stays
     /// one token rather than becoming a negate call on 5.
-    fn parse_unary_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_unary_expr(&mut self) -> Result<Expr, ParseError> {
         self.skip_whitespace();
         let rest = &self.input[self.pos..];
 
@@ -1801,7 +1801,7 @@ impl Parser {
     /// languages. Verified against roc: `1 + 2 |> inc` is `1 + inc(2)` = 4, and
     /// `2 * 3 |> inc` is `2 * inc(3)` = 8. That is why this level sits between the
     /// multiplicative operators and the call level rather than at the top.
-    fn parse_pipe_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_pipe_expr(&mut self) -> Result<Expr, ParseError> {
         let mut left = self.parse_call_expr()?;
 
         loop {
@@ -1830,7 +1830,7 @@ impl Parser {
     }
 
     /// Parse function call or primary expression
-    fn parse_call_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_call_expr(&mut self) -> Result<Expr, ParseError> {
         let mut expr = self.parse_primary_expr()?;
 
         loop {
@@ -1977,7 +1977,7 @@ impl Parser {
     /// newline. Content is RAW — `\\t` inside one is a backslash and a `t`, not a tab —
     /// but `${...}` interpolation still works, which is why the parts are built rather
     /// than the text interned whole.
-    fn parse_multiline_string(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_multiline_string(&mut self) -> Result<Expr, ParseError> {
         let mut content = String::new();
         let mut first = true;
 
@@ -2019,7 +2019,7 @@ impl Parser {
     ///
     /// The result is an `Int` because that is what roc makes of it: `'a' + 1` is 98,
     /// and a grapheme literal unifies with any number type.
-    fn parse_grapheme_literal(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_grapheme_literal(&mut self) -> Result<Expr, ParseError> {
         let open = self.pos;
         self.pos += 1; // opening quote
 
@@ -2082,7 +2082,7 @@ impl Parser {
         Ok(Expr::Int(ch as i64))
     }
 
-    fn parse_primary_expr(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
         self.skip_whitespace();
 
         let rest = &self.input[self.pos..];
@@ -2303,7 +2303,7 @@ impl Parser {
     }
 
     /// Parse `Module.name` after an uppercase identifier, if a `.name` follows.
-    fn try_parse_qualified(&mut self, module: &'static str) -> Option<Expr<'static>> {
+    fn try_parse_qualified(&mut self, module: &'static str) -> Option<Expr> {
         let rest = &self.input[self.pos..];
         if !rest.starts_with('.') || !rest[1..].starts_with(is_ident_start) {
             return None;
@@ -2359,10 +2359,10 @@ impl Parser {
     /// error into one of its own.
     fn propagate_error_pattern(
         ok: Pattern,
-        value: Expr<'static>,
-        continuation: Expr<'static>,
-        mapper: Option<Expr<'static>>,
-    ) -> Expr<'static> {
+        value: Expr,
+        continuation: Expr,
+        mapper: Option<Expr>,
+    ) -> Expr {
         let propagated = match mapper {
             Some(map) => Expr::Tag {
                 name: "Err",
@@ -2395,7 +2395,7 @@ impl Parser {
     /// Arms are separated by newlines; a comma between them is allowed but not
     /// required. Arms are kept in source order because matching stops at the first
     /// one that succeeds.
-    fn parse_match(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_match(&mut self) -> Result<Expr, ParseError> {
         self.pos += 5; // Skip "match"
         self.skip_whitespace();
 
@@ -2448,7 +2448,7 @@ impl Parser {
     }
 
     /// Parse one arm: `A | B if guard => body`.
-    fn parse_match_arm(&mut self) -> Result<MatchArm<'static>, ParseError> {
+    fn parse_match_arm(&mut self) -> Result<MatchArm, ParseError> {
         let mut patterns = vec![self.parse_pattern()?];
 
         // Alternatives: `A | B | C`. Careful not to eat `||`.
@@ -2635,7 +2635,7 @@ impl Parser {
     ///
     /// `else if` is parsed by recursing, which builds an `If` whose `otherwise` is
     /// another `If` — there is no separate else-if node.
-    fn parse_if(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_if(&mut self) -> Result<Expr, ParseError> {
         self.pos += 2; // Skip "if"
         self.skip_whitespace();
 
@@ -2665,7 +2665,7 @@ impl Parser {
     }
 
     /// Parse a list literal: `[1, 2, 3]`, `[]`. A trailing comma is allowed.
-    fn parse_list(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_list(&mut self) -> Result<Expr, ParseError> {
         self.pos += 1; // Skip '['
         let mut items = Vec::new();
 
@@ -2720,9 +2720,9 @@ impl Parser {
     fn destructure_at_top_level(
         &mut self,
         pattern: Pattern,
-        value: Expr<'static>,
-        body: Expr<'static>,
-    ) -> Result<Expr<'static>, ParseError> {
+        value: Expr,
+        body: Expr,
+    ) -> Result<Expr, ParseError> {
         // A record destructuring binds by FIELD NAME rather than position, but is
         // otherwise the same shape, so both lower to indexing into one temporary.
         let items: Vec<(Accessor, Pattern)> = match pattern {
@@ -3039,7 +3039,7 @@ impl Parser {
     ///
     /// Shared by ordinary calls and by static dispatch, which differ only in what they
     /// do with the result.
-    fn parse_call_arguments(&mut self) -> Result<Vec<Expr<'static>>, ParseError> {
+    fn parse_call_arguments(&mut self) -> Result<Vec<Expr>, ParseError> {
         self.pos += 1; // Skip '('
         self.skip_whitespace();
         let mut args = Vec::new();
@@ -3078,7 +3078,7 @@ impl Parser {
     /// Parse `for name in iterable { body }`.
     ///
     /// The loop's value is `{}` — it is a statement, not something you bind.
-    fn parse_for(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_for(&mut self) -> Result<Expr, ParseError> {
         self.pos += 3; // Skip "for"
         self.skip_whitespace();
 
@@ -3121,7 +3121,7 @@ impl Parser {
     }
 
     /// Parse `while condition { body }`. Its value is `{}`.
-    fn parse_while(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_while(&mut self) -> Result<Expr, ParseError> {
         self.pos += 5; // Skip "while"
         self.skip_whitespace();
 
@@ -3143,7 +3143,7 @@ impl Parser {
     /// Every site that accepts a braced construct must go through here. A lambda
     /// body used to call `parse_block` directly, so `|n| { v: n }` parsed the record
     /// as a block and failed on `v: n`.
-    fn parse_braced(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_braced(&mut self) -> Result<Expr, ParseError> {
         if self.looks_like_record() {
             self.parse_record()
         } else {
@@ -3198,12 +3198,12 @@ impl Parser {
     }
 
     /// Parse a record literal: `{ x: 1, y: f(2) }`.
-    fn parse_record(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_record(&mut self) -> Result<Expr, ParseError> {
         self.pos += 1; // Skip '{'
         let mut fields = Vec::new();
         // `{ ..base, field: value }` is an UPDATE. roc rejects `{ base & field: v }`,
         // so this spelling is the only one.
-        let mut base: Option<Expr<'static>> = None;
+        let mut base: Option<Expr> = None;
 
         loop {
             self.skip_whitespace();
@@ -3293,7 +3293,7 @@ impl Parser {
     /// innermost body, so the block's value is the last expression's value.
     ///
     /// `{}` is the empty record, Roc's unit value.
-    fn parse_block(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_block(&mut self) -> Result<Expr, ParseError> {
         self.pos += 1; // Skip '{'
         self.skip_whitespace();
 
@@ -3306,7 +3306,7 @@ impl Parser {
         // (binding target, annotation, value, uses `?`) per statement; the last is
         // the block's result.
         // `(target, annotation, value, propagates, error mapper)`.
-        type Stmt = (BindTarget, Option<Type>, Expr<'static>, bool, Option<Expr<'static>>);
+        type Stmt = (BindTarget, Option<Type>, Expr, bool, Option<Expr>);
         let mut stmts: Vec<Stmt> = Vec::new();
 
         loop {
@@ -3571,7 +3571,7 @@ impl Parser {
     }
 
     /// Parse lambda expression: |params| body
-    fn parse_lambda(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_lambda(&mut self) -> Result<Expr, ParseError> {
         self.skip_whitespace();
 
         let rest = &self.input[self.pos..];
@@ -3650,7 +3650,7 @@ impl Parser {
             };
         }
 
-        Ok(Expr::Lambda { params, body: Box::new(body) })
+        Ok(Expr::Lambda { params: std::rc::Rc::new(params), body: std::rc::Rc::new(body) })
     }
 
     /// Skip whitespace
@@ -3672,7 +3672,7 @@ impl Parser {
     }
 
     /// Parse string literal: "..."
-    fn parse_string(&mut self) -> Result<Expr<'static>, ParseError> {
+    fn parse_string(&mut self) -> Result<Expr, ParseError> {
         let rest = &self.input[self.pos..];
         // The sub-parser for each `${...}` needs the nominal declarations too, or
         // `Animal.Dog(x)` inside an interpolation parses as a qualified CALL instead of
@@ -3694,8 +3694,8 @@ impl Parser {
 fn parse_string_literal<'input>(
     input: &'input str,
     nominals: &[(&'static str, Type)],
-    nominal_defaults: &[(String, Vec<(String, Expr<'static>)>)],
-) -> Result<(&'input str, Expr<'static>), ParseError> {
+    nominal_defaults: &[(String, Vec<(String, Expr)>)],
+) -> Result<(&'input str, Expr), ParseError> {
     // Check for opening quote
     if !input.starts_with('"') {
         return Err(ParseError {
@@ -3907,7 +3907,7 @@ fn scan_digits(bytes: &[u8], mut pos: usize, accept: impl Fn(u8) -> bool) -> (us
 ///
 /// Digit separators are allowed throughout. Verified against roc: `1_000_000` is
 /// 1000000, `1e3` is 1000, `1.5e-3` is 0.0015, `0xFF_FF` is 65535.
-fn parse_number_literal(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
     let bytes = input.as_bytes();
     let mut pos = 0;
 
@@ -4040,7 +4040,7 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr<'static>), ParseError
 }
 
 /// Parse identifier: x, main, birds
-fn parse_identifier(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
+fn parse_identifier(input: &str) -> Result<(&str, Expr), ParseError> {
     let mut pos = 0;
     let mut chars = input.chars();
 
@@ -4083,8 +4083,8 @@ fn parse_identifier(input: &str) -> Result<(&str, Expr<'static>), ParseError> {
 fn parse_interpolation_parts(
     content: &str,
     nominals: &[(&'static str, Type)],
-    nominal_defaults: &[(String, Vec<(String, Expr<'static>)>)],
-) -> Result<Vec<StrPart<'static>>, ParseError> {
+    nominal_defaults: &[(String, Vec<(String, Expr)>)],
+) -> Result<Vec<StrPart>, ParseError> {
     let mut parts = Vec::new();
     let mut current_literal = String::new();
     let mut pos = 0;
@@ -4212,7 +4212,7 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
             name: name.clone(),
             backing: Box::new(substitute_type_vars(backing, pairs)),
         },
-        Type::Record { fields: fields, .. } => Type::closed_record(
+        Type::Record { fields, .. } => Type::closed_record(
             fields
                 .iter()
                 .map(|(n, t)| (n.clone(), substitute_type_vars(t, pairs)))

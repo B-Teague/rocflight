@@ -272,34 +272,15 @@ impl Evaluator {
                 self.returning = Some(self.eval(value)?);
                 Err(EvalError::return_signal())
             }
-            Expr::Crash(message) => {
-                let text = match self.eval(message)? {
-                    Value::Str(s) => s.to_string(),
-                    other => other.to_string(),
-                };
-                Err(EvalError { message: format!("crash: {}", text) })
-            }
+            Expr::Crash(message) => Err(crash_error(&self.eval(message)?)),
             Expr::Expect(condition) => {
-                // A failure is reported and execution continues — roc prints to stderr
-                // and carries on rather than aborting.
-                expect_ran();
-                match self.eval(condition)? {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) => {
-                        expect_failed();
-                        eprintln!("Expect failed: expect failed")
-                    }
-                    other => {
-                        return Err(EvalError {
-                            message: format!("`expect` needs a Bool, got {}", other),
-                        })
-                    }
-                }
+                let value = self.eval(condition)?;
+                run_expect(&value)?;
                 Ok(Value::Unit)
             }
             Expr::Dbg(value) => {
                 let shown = self.eval(value)?;
-                eprintln!("[dbg] {}", inspect(&shown));
+                run_dbg(&shown);
                 Ok(Value::Unit)
             }
             Expr::Break => Err(EvalError::break_signal()),
@@ -332,54 +313,18 @@ impl Evaluator {
                     return apply(func, values);
                 }
 
-                // `.iter()` turns a range or list into an iterator. Here that is
-                // simply the list of its elements.
-                // ponytail: EAGER — a real iterator is lazy, so an infinite one would
-                // hang and `Str.inspect` shows a list where roc shows `<opaque>`.
-                // Nothing in the examples depends on either.
-                if *method == "iter" && args.is_empty() {
-                    match &receiver_value {
-                        Value::List(items) => return Ok(Value::List(items.clone())),
-                        Value::Range { start, end, inclusive } => {
-                            let last = if *inclusive { *end } else { *end - 1 };
-                            return Ok(Value::List((*start..=last).map(Value::Int).collect()));
-                        }
-                        _ => {}
-                    }
-                }
-
-                // `Ok`/`Err` carry no module, but they answer the Try methods. Done
-                // here rather than in `module_for` because the payload has to be
-                // rebuilt around the result.
-                if let Value::Tag(tag, payload) = &receiver_value {
-                    if matches!(*tag, "Ok" | "Err") {
-                        if let Some(result) =
-                            self.try_method(tag, payload, method, args)?
-                        {
-                            return Ok(result);
-                        }
-                    }
-                }
-
-                let module = module_for(&receiver_value).ok_or_else(|| EvalError {
-                    message: format!("Cannot dispatch `{}` on {}", method, receiver_value),
-                })?;
-
-                // The receiver becomes the FIRST argument, which is why roc's builtins
-                // take their subject first: `xs.map(f)` is `List.map(xs, f)`.
-                let mut values = Vec::with_capacity(args.len() + 1);
-                values.push(receiver_value);
+                let mut values = Vec::with_capacity(args.len());
                 for arg in args {
                     values.push(self.eval(arg)?);
                 }
-                self.call_builtin_values(module, method, values)
+                dispatch_builtin(self, receiver_value, method, values)
             }
             Expr::OptionalField { record, field } => {
                 match self.eval(record)? {
                     Value::Record(fields) => Ok(match fields.iter().find(|(f, _)| f == field) {
-                        Some((_, value)) => Value::Tag("Ok", vec![value.clone()]),
+                        Some((_, value)) => Value::tag("Ok", vec![value.clone()]),
                         // Absent, which is the point of an optional field.
-                        None => Value::Tag("Err", vec![Value::Tag("MissingField", vec![])]),
+                        None => Value::tag("Err", vec![Value::tag("MissingField", vec![])]),
                     }),
                     other => Err(EvalError {
                         message: format!("Cannot read optional field `{}` on {}", field, other),
@@ -413,7 +358,7 @@ impl Evaluator {
                     .iter()
                     .map(|a| self.eval(a))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(Value::Tag(name, vals))
+                Ok(Value::tag(name, vals))
             }
             Expr::StrInterp(parts) => {
                 let mut result = String::new();
@@ -423,26 +368,7 @@ impl Evaluator {
                         crate::ast::StrPart::Expr(e) => {
                             // Evaluate nested expression and convert to string
                             match self.eval(e) {
-                                Ok(v) => {
-                                    // Convert value to string without quotes
-                                    let s = match &v {
-                                        Value::Str(s) => s.to_string(),  // No extra quotes for strings
-                                        Value::Int(n) => n.to_string(),
-                                        // Matches `Value`'s own Display: no trailing
-                                        // `.0` on a whole float.
-                                        Value::Float(f) => f.to_string(),
-                                        Value::Builtin(name, arity) => format!("<{}/{}>", name, arity),
-                                        Value::Lambda { params, .. } => format!("<lambda |{}|>", params.join(", ")),
-                                        Value::Unit => "{}".to_string(),
-                                        Value::Tag(..) => v.to_string(),
-                                        Value::Bool(..)
-                                        | Value::Record(..)
-                                        | Value::List(..)
-                                        | Value::Tuple(..)
-                                        | Value::Range { .. } => v.to_string(),
-                                    };
-                                    result.push_str(&s);
-                                }
+                                Ok(v) => result.push_str(&interpolated(&v)),
                                 Err(e) => return Err(e),
                             }
                         }
@@ -502,25 +428,19 @@ impl Evaluator {
                 if let Some(result) = self.dispatch_operator(*op, &left_val, &right_val)? {
                     return Ok(result);
                 }
-                self.apply_binop(*op, left_val, right_val)
+                Self::apply_binop(*op, &left_val, &right_val)
             }
             Expr::Lambda { params, body } => {
-                // Create a closure capturing the current environment
-                // SAFETY: We transmute to 'static because the parsed AST remains
-                // valid for the lifetime of the program. The body is part of the
-                // parsed source, which we keep in memory.
-                let static_body = unsafe {
-                    std::mem::transmute::<std::rc::Rc<Expr<'_>>, std::rc::Rc<Expr<'static>>>(
-                        std::rc::Rc::new(body.as_ref().clone())
-                    )
-                };
-                Ok(Value::Lambda {
-                    params: std::rc::Rc::new(params.clone()),
-                    body: static_body,
+                // A closure over the current environment. Both halves are shared with
+                // the AST node rather than copied: the body used to be deep-cloned
+                // here, every node of it, on every closure creation.
+                Ok(Value::Lambda(std::rc::Rc::new(crate::eval::value::LambdaData {
+                    params: params.clone(),
+                    body: body.clone(),
                     env: self.env.clone(),
                     // Filled in by the `let` that binds it, if any.
                     self_name: None,
-                })
+                })))
             }
             Expr::Call { func, args } => {
                 // Handle builtin functions and calls
@@ -529,7 +449,7 @@ impl Evaluator {
                         // A nominal's method block binds `Type.method` as an ordinary
                         // name, so check the environment before the builtins.
                         let qualified = format!("{}.{}", module, name);
-                        if let Some(func @ Value::Lambda { .. }) = self.env.lookup(&qualified) {
+                        if let Some(func @ Value::Lambda(..)) = self.env.lookup(&qualified) {
                             let mut arg_vals = Vec::with_capacity(args.len());
                             for arg in args {
                                 arg_vals.push(self.eval(arg)?);
@@ -544,7 +464,7 @@ impl Evaluator {
                             match val {
                                 // A builtin bound to a name — `my_concat = Str.concat`
                                 // — is callable the same way a lambda is.
-                                callable @ (Value::Lambda { .. } | Value::Builtin(..)) => {
+                                callable @ (Value::Lambda(..) | Value::Builtin(..)) => {
                                     let mut arg_vals = Vec::with_capacity(args.len());
                                     for arg in args {
                                         arg_vals.push(self.eval(arg)?);
@@ -583,7 +503,7 @@ impl Evaluator {
                         // Evaluate the function expression (e.g., for chained calls like f()(x))
                         let func_val = self.eval(func)?;
                         match func_val {
-                            lambda @ Value::Lambda { .. } => {
+                            lambda @ Value::Lambda(..) => {
                                 let mut arg_vals = Vec::with_capacity(args.len());
                                 for arg in args {
                                     arg_vals.push(self.eval(arg)?);
@@ -606,12 +526,9 @@ impl Evaluator {
                 // A lambda bound by a `let` may call itself. Record the name on the
                 // closure so `apply` can put it back in scope for the body.
                 let val = match val {
-                    Value::Lambda { params, body, env, .. } => Value::Lambda {
-                        params,
-                        body,
-                        env,
-                        self_name: Some(name),
-                    },
+                    Value::Lambda(l) => {
+                        Value::Lambda(std::rc::Rc::new(l.with_self_name(name)))
+                    }
                     other => other,
                 };
 
@@ -645,20 +562,18 @@ impl Evaluator {
     /// cannot come from the builtin table, which is keyed by module.
     ///
     /// `None` means the method is not one of these, and the caller carries on.
-    fn try_method(
-        &mut self,
+    /// The `Try` methods — `Ok`/`Err` answer these whatever module they came from.
+    ///
+    /// Takes VALUES: it always evaluated every argument up front anyway, and the VM's
+    /// dispatch opcode has nothing else to give it.
+    pub fn try_method(
         tag: &str,
         payload: &[Value],
         method: &str,
-        args: &[Expr],
+        evaluated: Vec<Value>,
     ) -> Result<Option<Value>, EvalError> {
         let is_ok = tag == "Ok";
         let inner = payload.first().cloned().unwrap_or(Value::Unit);
-
-        let mut evaluated = Vec::with_capacity(args.len());
-        for arg in args {
-            evaluated.push(self.eval(arg)?);
-        }
         let first = || evaluated.first().cloned().unwrap_or(Value::Unit);
 
         Ok(Some(match method {
@@ -666,9 +581,9 @@ impl Evaluator {
             "is_err" => Value::Bool(!is_ok),
             // Rebuild the same tag around the mapped payload; the other side passes
             // through untouched.
-            "map_ok" if is_ok => Value::Tag("Ok", vec![apply(first(), vec![inner])?]),
-            "map_err" if !is_ok => Value::Tag("Err", vec![apply(first(), vec![inner])?]),
-            "map_ok" | "map_err" => Value::Tag(
+            "map_ok" if is_ok => Value::tag("Ok", vec![apply(first(), vec![inner])?]),
+            "map_err" if !is_ok => Value::tag("Err", vec![apply(first(), vec![inner])?]),
+            "map_ok" | "map_err" => Value::tag(
                 if is_ok { "Ok" } else { "Err" },
                 payload.to_vec(),
             ),
@@ -680,7 +595,7 @@ impl Evaluator {
                 }
             }
             "on_err" if !is_ok => apply(first(), vec![inner])?,
-            "on_err" => Value::Tag("Ok", payload.to_vec()),
+            "on_err" => Value::tag("Ok", payload.to_vec()),
             _ => return Ok(None),
         }))
     }
@@ -772,8 +687,8 @@ impl Evaluator {
                 let items = as_list(args[0].clone())?;
                 let picked = if name == "first" { items.first() } else { items.last() };
                 Ok(match picked {
-                    Some(v) => Value::Tag("Ok", vec![v.clone()]),
-                    None => Value::Tag("Err", vec![Value::Tag("ListWasEmpty", vec![])]),
+                    Some(v) => Value::tag("Ok", vec![v.clone()]),
+                    None => Value::tag("Err", vec![Value::tag("ListWasEmpty", vec![])]),
                 })
             }
             "get" => {
@@ -784,8 +699,8 @@ impl Evaluator {
                     _ => usize::MAX,
                 };
                 Ok(match items.get(index) {
-                    Some(v) => Value::Tag("Ok", vec![v.clone()]),
-                    None => Value::Tag("Err", vec![Value::Tag("OutOfBounds", vec![])]),
+                    Some(v) => Value::tag("Ok", vec![v.clone()]),
+                    None => Value::tag("Err", vec![Value::tag("OutOfBounds", vec![])]),
                 })
             }
             "keep_if" | "drop_if" => {
@@ -827,13 +742,13 @@ impl Evaluator {
                 for item in items {
                     match apply(func.clone(), vec![acc.clone(), item])? {
                         Value::Tag("Ok", payload) => {
-                            acc = payload.into_iter().next().unwrap_or(Value::Unit)
+                            acc = payload.first().cloned().unwrap_or(Value::Unit)
                         }
                         stop @ Value::Tag("Err", _) => return Ok(stop),
                         other => acc = other,
                     }
                 }
-                Ok(Value::Tag("Ok", vec![acc]))
+                Ok(Value::tag("Ok", vec![acc]))
             }
             // An iterator is already a list here, so collecting one is a no-op.
             "from_iter" => {
@@ -856,36 +771,11 @@ impl Evaluator {
     /// `echo!` writes its argument to stdout with no trailing newline — matching
     /// `roc run`, which is why the test .roc files spell newlines explicitly.
     fn call_host_effect(&mut self, name: &str, args: &[Expr]) -> Result<Value, EvalError> {
-        let (params, _) = crate::platform::host::lookup(name).ok_or_else(|| EvalError {
-            message: format!("Unknown host effect '{}'", name),
-        })?;
-
-        if args.len() != params.len() {
-            return Err(EvalError {
-                message: format!(
-                    "{} expects {} argument(s), got {}",
-                    name,
-                    params.len(),
-                    args.len()
-                ),
-            });
+        let mut values = Vec::with_capacity(args.len());
+        for arg in args {
+            values.push(self.eval(arg)?);
         }
-
-        match name {
-            "echo!" => {
-                let val = self.eval(&args[0])?;
-                match val {
-                    Value::Str(s) => print!("{}", s),
-                    other => print!("{}", other),
-                }
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                Ok(Value::Unit)
-            }
-            _ => Err(EvalError {
-                message: format!("Host effect '{}' is declared but not implemented", name),
-            }),
-        }
+        host_effect(name, values)
     }
 
     /// Call builtin function from a module
@@ -898,7 +788,7 @@ impl Evaluator {
         self.call_builtin_values(module, name, values)
     }
 
-    fn call_builtin_values(
+    pub fn call_builtin_values(
         &mut self,
         module: &str,
         name: &str,
@@ -936,8 +826,8 @@ impl Evaluator {
                 }
             };
             return Ok(match text.trim().parse::<i64>() {
-                Ok(n) => Value::Tag("Ok", vec![Value::Int(n)]),
-                Err(_) => Value::Tag("Err", vec![Value::Tag("BadNumStr", vec![])]),
+                Ok(n) => Value::tag("Ok", vec![Value::Int(n)]),
+                Err(_) => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
             });
         }
 
@@ -1005,7 +895,7 @@ impl Evaluator {
                         } else {
                             Value::Float(value)
                         };
-                        return Ok(if wraps { Value::Tag("Ok", vec![value]) } else { value });
+                        return Ok(if wraps { Value::tag("Ok", vec![value]) } else { value });
                     }
                 }
             }
@@ -1065,7 +955,7 @@ impl Evaluator {
                     println!("{}", text);
                 }
                 // `line! : Str => Try({}, [StdoutErr(IOErr), ..])`
-                Ok(Value::Tag("Ok", vec![Value::Unit]))
+                Ok(Value::tag("Ok", vec![Value::Unit]))
             }
             ("Stdout", "write!") | ("Stderr", "write!") => {
                 if args.len() != 1 {
@@ -1085,7 +975,7 @@ impl Evaluator {
                     print!("{}", text);
                     let _ = std::io::stdout().flush();
                 }
-                Ok(Value::Tag("Ok", vec![Value::Unit]))
+                Ok(Value::tag("Ok", vec![Value::Unit]))
             }
             ("Str", "is_empty") => {
                 if args.len() != 1 {
@@ -1113,22 +1003,6 @@ impl Evaluator {
                 }
                 Ok(str_value(inspect(&val)))
             }
-            ("Stdout", "line!") => {
-                if args.len() != 1 {
-                    return Err(EvalError {
-                        message: format!("Stdout.line! expects 1 argument, got {}", args.len()),
-                    });
-                }
-                let val = args[0].clone();
-                // Print to stdout, handling string formatting
-                let output = match &val {
-                    Value::Str(s) => s.to_string(),
-                    _ => val.to_string(),
-                };
-                println!("{}", output);
-                // Return empty value
-                Ok(str_value(String::new()))
-            }
             // `haystack.split_first(needle)` → `Ok({ before, after })`, or
             // `Err(NotFound)`. Splits at the FIRST occurrence only.
             ("Str", "split_first") => {
@@ -1141,7 +1015,7 @@ impl Evaluator {
                     }
                 };
                 Ok(match text.find(needle) {
-                    Some(i) => Value::Tag(
+                    Some(i) => Value::tag(
                         "Ok",
                         vec![Value::Record(vec![
                             ("before", str_value(text[..i].to_string())),
@@ -1151,7 +1025,7 @@ impl Evaluator {
                             ),
                         ])],
                     ),
-                    None => Value::Tag("Err", vec![Value::Tag("NotFound", vec![])]),
+                    None => Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
                 })
             }
             // `Str.join_with(list, separator)`, the subject first as always.
@@ -1250,8 +1124,8 @@ impl Evaluator {
                     })
                     .collect();
                 Ok(match String::from_utf8(raw) {
-                    Ok(text) => Value::Tag("Ok", vec![str_value(text)]),
-                    Err(_) => Value::Tag("Err", vec![Value::Tag("BadUtf8", vec![])]),
+                    Ok(text) => Value::tag("Ok", vec![str_value(text)]),
+                    Err(_) => Value::tag("Err", vec![Value::tag("BadUtf8", vec![])]),
                 })
             }
             ("Str", "to_utf8") => {
@@ -1298,7 +1172,7 @@ impl Evaluator {
     ///
     /// Dispatch is by method NAME, not by type, because values carry no nominal tag at
     /// runtime — the same search `Dispatch` already does.
-    fn dispatch_operator(
+    pub fn dispatch_operator(
         &mut self,
         op: BinOp,
         left: &Value,
@@ -1335,14 +1209,26 @@ impl Evaluator {
         }))
     }
 
-    fn apply_binop(&self, op: BinOp, left: Value, right: Value) -> Result<Value, EvalError> {
+    /// Apply a binary operator to two already-evaluated operands.
+    ///
+    /// An associated function rather than a method: it needs no evaluator state, and
+    /// the VM backend calls it too. Operator SEMANTICS live in exactly one place, so
+    /// the two engines cannot drift on what `//` does to a negative number.
+    ///
+    /// The operands are BORROWED. No arm here needs to own them — every one either
+    /// copies a scalar out or builds a new value — and cloning them cost the VM 40% of
+    /// `fib`: two 32-byte `Value` clones per arithmetic instruction, for two integers.
+    /// The alternative was a fast path for `Int` inside the VM's `Bin` opcode, which
+    /// would have been a second implementation of Roc's arithmetic; this is the same
+    /// win with one.
+    pub fn apply_binop(op: BinOp, left: &Value, right: &Value) -> Result<Value, EvalError> {
         match (op, left, right) {
             // Arithmetic on integers
             (BinOp::Add, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a + b)),
             (BinOp::Sub, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a - b)),
             (BinOp::Mul, Value::Int(a), Value::Int(b)) => Ok(Value::Int(a * b)),
             (BinOp::Div, Value::Int(a), Value::Int(b)) => {
-                if b == 0 {
+                if *b == 0 {
                     Err(EvalError { message: "Division by zero".to_string() })
                 } else {
                     Ok(Value::Int(a / b))
@@ -1350,7 +1236,7 @@ impl Evaluator {
             }
             // `//` truncating division and `%` remainder — integers only in Roc.
             (BinOp::IntDiv, Value::Int(a), Value::Int(b)) => {
-                if b == 0 {
+                if *b == 0 {
                     Err(EvalError { message: "Division by zero".to_string() })
                 } else {
                     // Roc's `//` truncates toward zero, which is Rust's `/` for i64.
@@ -1358,7 +1244,7 @@ impl Evaluator {
                 }
             }
             (BinOp::Rem, Value::Int(a), Value::Int(b)) => {
-                if b == 0 {
+                if *b == 0 {
                     Err(EvalError { message: "Division by zero".to_string() })
                 } else {
                     Ok(Value::Int(a % b))
@@ -1369,31 +1255,31 @@ impl Evaluator {
             (BinOp::Sub, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a - b)),
             (BinOp::Mul, Value::Float(a), Value::Float(b)) => Ok(Value::Float(a * b)),
             (BinOp::Div, Value::Float(a), Value::Float(b)) => {
-                if b == 0.0 {
+                if *b == 0.0 {
                     Err(EvalError { message: "Division by zero".to_string() })
                 } else {
                     Ok(Value::Float(a / b))
                 }
             }
             // Mixed int/float arithmetic
-            (BinOp::Add, Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 + b)),
-            (BinOp::Add, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + b as f64)),
-            (BinOp::Sub, Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 - b)),
-            (BinOp::Sub, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - b as f64)),
-            (BinOp::Mul, Value::Int(a), Value::Float(b)) => Ok(Value::Float(a as f64 * b)),
-            (BinOp::Mul, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * b as f64)),
+            (BinOp::Add, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
+            (BinOp::Add, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a + *b as f64)),
+            (BinOp::Sub, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 - b)),
+            (BinOp::Sub, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a - *b as f64)),
+            (BinOp::Mul, Value::Int(a), Value::Float(b)) => Ok(Value::Float(*a as f64 * b)),
+            (BinOp::Mul, Value::Float(a), Value::Int(b)) => Ok(Value::Float(a * *b as f64)),
             (BinOp::Div, Value::Int(a), Value::Float(b)) => {
-                if b == 0.0 {
+                if *b == 0.0 {
                     Err(EvalError { message: "Division by zero".to_string() })
                 } else {
-                    Ok(Value::Float(a as f64 / b))
+                    Ok(Value::Float(*a as f64 / b))
                 }
             }
             (BinOp::Div, Value::Float(a), Value::Int(b)) => {
-                if b == 0 {
+                if *b == 0 {
                     Err(EvalError { message: "Division by zero".to_string() })
                 } else {
-                    Ok(Value::Float(a / b as f64))
+                    Ok(Value::Float(a / *b as f64))
                 }
             }
             // String concatenation
@@ -1402,20 +1288,20 @@ impl Evaluator {
                 Ok(str_value(concatenated))
             }
             // Comparison operators — these yield Bool in Roc, not 0/1.
-            (BinOp::Eq, a, b) => Ok(Value::Bool(values_equal(&a, &b))),
-            (BinOp::Ne, a, b) => Ok(Value::Bool(!values_equal(&a, &b))),
-            (BinOp::Lt, a, b) => compare(&a, &b, |o| o == std::cmp::Ordering::Less),
-            (BinOp::Le, a, b) => compare(&a, &b, |o| o != std::cmp::Ordering::Greater),
-            (BinOp::Gt, a, b) => compare(&a, &b, |o| o == std::cmp::Ordering::Greater),
-            (BinOp::Ge, a, b) => compare(&a, &b, |o| o != std::cmp::Ordering::Less),
+            (BinOp::Eq, a, b) => Ok(Value::Bool(values_equal(a, b))),
+            (BinOp::Ne, a, b) => Ok(Value::Bool(!values_equal(a, b))),
+            (BinOp::Lt, a, b) => compare(a, b, |o| o == std::cmp::Ordering::Less),
+            (BinOp::Le, a, b) => compare(a, b, |o| o != std::cmp::Ordering::Greater),
+            (BinOp::Gt, a, b) => compare(a, b, |o| o == std::cmp::Ordering::Greater),
+            (BinOp::Ge, a, b) => compare(a, b, |o| o != std::cmp::Ordering::Less),
             // `and` / `or` are Bool-only in Roc. Both operands are already
             // evaluated, so these do not short-circuit — see the ponytail note.
-            (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a && b)),
-            (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(a || b)),
+            (BinOp::And, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a && *b)),
+            (BinOp::Or, Value::Bool(a), Value::Bool(b)) => Ok(Value::Bool(*a || *b)),
             // Numeric operands to `and`/`or`, kept for the `1 && 0` spelling used
             // before Bool existed. ponytail: drop once nothing relies on it.
-            (BinOp::And, a, b) => Ok(Value::Bool(is_truthy(&a) && is_truthy(&b))),
-            (BinOp::Or, a, b) => Ok(Value::Bool(is_truthy(&a) || is_truthy(&b))),
+            (BinOp::And, a, b) => Ok(Value::Bool(is_truthy(a) && is_truthy(b))),
+            (BinOp::Or, a, b) => Ok(Value::Bool(is_truthy(a) || is_truthy(b))),
             (_op, _left, _right) => {
                 Err(EvalError {
                     message: "Invalid operands for operator".to_string(),
@@ -1573,6 +1459,151 @@ fn inspect(value: &Value) -> String {
 /// Bindings are pushed onto `bindings` rather than bound directly so a partial match
 /// leaves no trace: a nested pattern can bind several names and then fail on the last
 /// element, and those names must not leak into the next arm.
+/// Run one `expect` against an already-evaluated condition.
+///
+/// A failure is reported and execution CONTINUES — roc prints to stderr and carries on
+/// rather than aborting — and the tally is process-wide, which is what `roc test`
+/// reports. Shared with the VM's `Expect` opcode.
+pub fn run_expect(value: &Value) -> Result<(), EvalError> {
+    expect_ran();
+    match value {
+        Value::Bool(true) => Ok(()),
+        Value::Bool(false) => {
+            expect_failed();
+            eprintln!("Expect failed: expect failed");
+            Ok(())
+        }
+        other => Err(EvalError {
+            message: format!("`expect` needs a Bool, got {}", other),
+        }),
+    }
+}
+
+/// `dbg value` — to stderr, so it never mixes into a program's output.
+pub fn run_dbg(value: &Value) {
+    eprintln!("[dbg] {}", inspect(value));
+}
+
+/// `crash "message"`. A Str crashes with its text; anything else with its rendering.
+pub fn crash_error(value: &Value) -> EvalError {
+    let text = match value {
+        Value::Str(s) => s.to_string(),
+        other => other.to_string(),
+    };
+    EvalError { message: format!("crash: {}", text) }
+}
+
+/// How a value renders INSIDE a string interpolation.
+///
+/// Not the same as `Display`: a `Str` interpolates without its quotes. Shared with the
+/// VM's `Interp` opcode so `"x=${s}"` cannot come out differently on the two engines.
+pub fn interpolated(value: &Value) -> String {
+    match value {
+        Value::Str(s) => s.to_string(),
+        Value::Int(n) => n.to_string(),
+        // Matches `Value`'s own Display: no trailing `.0` on a whole float.
+        Value::Float(f) => f.to_string(),
+        Value::Builtin(name, arity) => format!("<{}/{}>", name, arity),
+        other => other.to_string(),
+    }
+}
+
+/// Dispatch `method` on an evaluated receiver, the BUILTIN way.
+///
+/// A nominal's own method block is not consulted here: the tree-walker looks that up in
+/// its environment and the VM resolves it at compile time, and both then call the
+/// method directly. Everything after that point is this function, shared, so the two
+/// engines cannot disagree about what `xs.map(f)` or `Ok(1).with_default(0)` means.
+pub fn dispatch_builtin(
+    ev: &mut Evaluator,
+    receiver: Value,
+    method: &str,
+    args: Vec<Value>,
+) -> Result<Value, EvalError> {
+    // `.iter()` turns a range or list into an iterator. Here that is simply the list
+    // of its elements.
+    //
+    // ponytail: EAGER — a real iterator is lazy, so an infinite one would hang and
+    // `Str.inspect` shows a list where roc shows `<opaque>`. Nothing in the examples
+    // depends on either.
+    if method == "iter" && args.is_empty() {
+        match &receiver {
+            Value::List(items) => return Ok(Value::List(items.clone())),
+            Value::Range { start, end, inclusive } => {
+                let last = if *inclusive { *end } else { *end - 1 };
+                return Ok(Value::List((*start..=last).map(Value::Int).collect()));
+            }
+            _ => {}
+        }
+    }
+
+    // `Ok`/`Err` carry no module, but they answer the Try methods. Done here rather
+    // than in `module_for` because the payload has to be rebuilt around the result.
+    if let Value::Tag(tag, payload) = &receiver {
+        if matches!(*tag, "Ok" | "Err") {
+            if let Some(result) = Evaluator::try_method(tag, payload, method, args.clone())? {
+                return Ok(result);
+            }
+        }
+    }
+
+    let module = module_for(&receiver).ok_or_else(|| EvalError {
+        message: format!("Cannot dispatch `{}` on {}", method, receiver),
+    })?;
+
+    // The receiver becomes the FIRST argument, which is why roc's builtins take their
+    // subject first: `xs.map(f)` is `List.map(xs, f)`.
+    let mut values = Vec::with_capacity(args.len() + 1);
+    values.push(receiver);
+    values.extend(args);
+    ev.call_builtin_values(module, method, values)
+}
+
+/// Run one of the default host's effects on already-evaluated arguments.
+///
+/// Shared with the VM's `CallHost` opcode. The host is the only reason a pure language
+/// prints anything, so both engines have to reach the same one.
+pub fn host_effect(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+    let (params, _) = crate::platform::host::lookup(name).ok_or_else(|| EvalError {
+        message: format!("Unknown host effect '{}'", name),
+    })?;
+    if args.len() != params.len() {
+        return Err(EvalError {
+            message: format!("{} expects {} argument(s), got {}", name, params.len(), args.len()),
+        });
+    }
+    match name {
+        "echo!" => {
+            match &args[0] {
+                Value::Str(s) => print!("{}", s),
+                other => print!("{}", other),
+            }
+            use std::io::Write;
+            let _ = std::io::stdout().flush();
+            Ok(Value::Unit)
+        }
+        _ => Err(EvalError {
+            message: format!("Host effect '{}' is declared but not implemented", name),
+        }),
+    }
+}
+
+/// Does a LITERAL pattern — `1`, `3.5`, `"hello"` — match `value`?
+///
+/// Its own function because the VM's `TestLit` opcode calls it too, and because these
+/// rules are NOT `values_equal`'s: a pattern matches a value of the same kind only, so
+/// `1` does not match `1.0`, where `1 == 1.0` is `True`. Two engines disagreeing about
+/// that would be a wrong answer in a `match`, not an error.
+pub fn literal_pattern_matches(pattern: &Pattern, value: &Value) -> bool {
+    match (pattern, value) {
+        (Pattern::Int(expected), Value::Int(n)) => n == expected,
+        // The same tolerance `values_equal` uses for two floats.
+        (Pattern::Float(expected), Value::Float(n)) => (n - expected).abs() < 1e-10,
+        (Pattern::Str(expected), Value::Str(s)) => &**s == *expected,
+        _ => false,
+    }
+}
+
 fn pattern_matches<'a>(
     pattern: &Pattern,
     value: &Value,
@@ -1584,11 +1615,9 @@ fn pattern_matches<'a>(
             bindings.push((name, value.clone()));
             true
         }
-        Pattern::Int(expected) => matches!(value, Value::Int(n) if n == expected),
-        Pattern::Float(expected) => {
-            matches!(value, Value::Float(n) if (n - expected).abs() < 1e-10)
+        Pattern::Int(_) | Pattern::Float(_) | Pattern::Str(_) => {
+            literal_pattern_matches(pattern, value)
         }
-        Pattern::Str(expected) => matches!(value, Value::Str(s) if &**s == *expected),
         // A nominal's backing record. Values carry no nominal wrapper — roc erases it,
         // as `Str.inspect` showing the bare record confirms — so this matches an
         // ordinary record.
@@ -1686,41 +1715,32 @@ fn pattern_matches<'a>(
 /// invoke a callback too.
 pub fn apply(func: Value, args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
-        Value::Lambda { params, body, env, self_name } => {
-            if args.len() != params.len() {
+        Value::Lambda(l) => {
+            if args.len() != l.params.len() {
                 return Err(EvalError {
                     message: format!(
                         "Lambda expects {} argument(s), got {}",
-                        params.len(),
+                        l.params.len(),
                         args.len()
                     ),
                 });
             }
-            // The environment AS CAPTURED, before the call frame is pushed. The
-            // self-binding has to use this one: binding a closure whose environment
-            // already contains the call frame would nest a copy of the environment at
-            // every recursive step, and 500 levels of that exhausts the stack.
-            let captured = self_name.map(|_| env.clone());
-
-            let mut lambda_eval = Evaluator { env, returning: None };
+            // The environment AS CAPTURED, before the call frame is pushed.
+            let mut lambda_eval = Evaluator { env: l.env.clone(), returning: None };
             lambda_eval.env.push_scope();
             // Tie the recursive knot: the body may call the function by its own name,
-            // which its captured environment predates.
-            if let (Some(name), Some(captured)) = (self_name, captured) {
-                lambda_eval.env.bind(
-                    name,
-                    Value::Lambda {
-                        params: params.clone(),
-                        body: body.clone(),
-                        env: captured,
-                        self_name: Some(name),
-                    },
-                );
+            // which its captured environment predates. The closure to bind is THIS
+            // one, unchanged — `l` already holds the captured environment, the one
+            // that predates this call frame, so the binding is a refcount bump. The
+            // hand-rebuilt closure this replaces had to be careful not to capture the
+            // frame it was being bound into; an `Rc` cannot make that mistake.
+            if let Some(name) = l.self_name {
+                lambda_eval.env.bind(name, Value::Lambda(l.clone()));
             }
-            for (param, arg) in params.iter().zip(args.into_iter()) {
+            for (param, arg) in l.params.iter().zip(args.into_iter()) {
                 lambda_eval.env.bind(param, arg);
             }
-            match lambda_eval.eval(&body) {
+            match lambda_eval.eval(&l.body) {
                 // `return` unwinds to here — the function boundary — and its value is
                 // the call's result.
                 Err(e) if e.is_return() => Ok(lambda_eval
@@ -1730,6 +1750,9 @@ pub fn apply(func: Value, args: Vec<Value>) -> Result<Value, EvalError> {
                 other => other,
             }
         }
+        // A closure the VM built, reaching a builtin's callback: `xs.map(|x| x * 2)`
+        // compiled by the VM still ends up in `List.map`, which is the tree-walker's.
+        Value::Closure(closure) => crate::vm::call_closure(&closure, args),
         // A builtin passed as a value — `xs.map(Str.inspect)`.
         Value::Builtin(qualified, _) => {
             let (module, name) = qualified.split_once('.').ok_or_else(|| EvalError {
@@ -1778,7 +1801,7 @@ pub fn expect_tally() -> (usize, usize) {
 /// `None` for records and tags: a nominal's methods would be found through its
 /// declared type, but values carry no nominal wrapper (roc erases it), so there is
 /// nothing at runtime to dispatch on. See the phase-20 notes.
-fn module_for(value: &Value) -> Option<&'static str> {
+pub fn module_for(value: &Value) -> Option<&'static str> {
     Some(match value {
         Value::Int(_) => "I64",
         Value::Float(_) => "F64",
@@ -1790,6 +1813,6 @@ fn module_for(value: &Value) -> Option<&'static str> {
         | Value::Tuple(_)
         | Value::Range { .. }
         | Value::Unit => return None,
-        Value::Lambda { .. } | Value::Builtin(..) => return None,
+        Value::Lambda(..) | Value::Closure(..) | Value::Builtin(..) => return None,
     })
 }

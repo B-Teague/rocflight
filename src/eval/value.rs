@@ -21,25 +21,22 @@ pub enum Value {
     Float(f64),
     /// Builtin function marker: name + arity
     Builtin(String, usize),
-    /// Lambda closure: params + body + captured environment
-    Lambda {
-        /// `Rc` for the same reason as `body`: the closure is rebuilt on every call,
-        /// and a plain `Vec` meant a heap allocation per call to copy a handful of
-        /// names that never change.
-        params: std::rc::Rc<Vec<&'static str>>,
-        /// `Rc` rather than `Box`: `apply` rebuilds the closure on every call to tie
-        /// the recursive knot, and a `Box` made that a DEEP clone of the whole function
-        /// body — every AST node, on every call.
-        body: std::rc::Rc<Expr<'static>>,
-        env: Environment,
-        /// The name this closure was bound to, when it was bound by a `let`.
-        ///
-        /// A closure captures its environment as it was BEFORE its own binding
-        /// existed, so a recursive call cannot find itself there. `apply` rebinds the
-        /// closure under this name in the call frame, which ties the knot without
-        /// making the environment shared and mutable.
-        self_name: Option<&'static str>,
-    },
+    /// A closure. Boxed, because this variant is what decides `size_of::<Value>()`.
+    ///
+    /// Inline it was four fields wide — 56 bytes, of which 32 was the `Environment` —
+    /// and every OTHER variant paid for it, since an enum is as big as its widest arm.
+    /// `Value` is moved constantly (every binding, argument, list element and return),
+    /// so the width is a tax on the whole interpreter and not just on closures. Behind
+    /// an `Rc` the arm is 8 bytes and a closure clone is a refcount bump.
+    Lambda(std::rc::Rc<LambdaData>),
+    /// A function value produced by the register VM.
+    ///
+    /// A separate variant from `Lambda` because the two engines represent a function
+    /// differently and deliberately: the tree-walker's holds an AST body and a captured
+    /// `Environment`, while this holds a chunk id and the values it captured, decided
+    /// at compile time. Only the VM constructs it, and only the VM calls it; it renders
+    /// identically so that a program's OUTPUT cannot tell which engine ran it.
+    Closure(std::rc::Rc<crate::vm::Closure>),
     /// Empty record `{}` — Roc's unit value.
     Unit,
     /// Record value. Fields keep insertion order; `Str.inspect` sorts a copy.
@@ -56,8 +53,51 @@ pub enum Value {
     /// would show `[0, 1, 2]` where roc shows `<opaque>` and would wrongly satisfy a
     /// `List` parameter.
     Range { start: i64, end: i64, inclusive: bool },
-    /// Tag value: `Ok(x)`, `Err(e)`, `Red`.
-    Tag(&'static str, Vec<Value>),
+    /// A tag value: `Ok(x)`, `Err(e)`, `Red`.
+    ///
+    /// The payload is behind an `Rc` for the same reason `Lambda` is: with a `Vec`
+    /// inline this was the widest arm of the enum, so every `Value` in the program
+    /// was as big as a tag. It also makes cloning a tag a refcount bump instead of a
+    /// fresh allocation and a copy of every element, which is what passing one to a
+    /// function does.
+    ///
+    /// Build one with `Value::tag`, which takes an ordinary `Vec`.
+    Tag(&'static str, std::rc::Rc<Vec<Value>>),
+}
+
+/// The body of a closure. See `Value::Lambda`.
+pub struct LambdaData {
+    /// Shared with the `Expr::Lambda` node this closure came from.
+    pub params: std::rc::Rc<Vec<&'static str>>,
+    /// Shared with the AST, not cloned: see `Expr::Lambda`.
+    pub body: std::rc::Rc<Expr>,
+    pub env: Environment,
+    /// The name this closure was bound to, when it was bound by a `let`.
+    ///
+    /// A closure captures its environment as it was BEFORE its own binding existed, so
+    /// a recursive call cannot find itself there. `apply` rebinds the closure under
+    /// this name in the call frame, which ties the knot without making the environment
+    /// shared and mutable.
+    pub self_name: Option<&'static str>,
+}
+
+impl LambdaData {
+    /// The same closure, bound to `name` so its body can call itself.
+    pub fn with_self_name(&self, name: &'static str) -> Self {
+        LambdaData {
+            params: self.params.clone(),
+            body: self.body.clone(),
+            env: self.env.clone(),
+            self_name: Some(name),
+        }
+    }
+}
+
+impl Value {
+    /// A tag value. Wraps the payload so call sites stay readable.
+    pub fn tag(name: &'static str, payload: Vec<Value>) -> Value {
+        Value::Tag(name, std::rc::Rc::new(payload))
+    }
 }
 
 impl fmt::Debug for Value {
@@ -67,9 +107,8 @@ impl fmt::Debug for Value {
             Value::Int(n) => write!(f, "Int({})", n),
             Value::Float(n) => write!(f, "Float({})", n),
             Value::Builtin(name, arity) => write!(f, "Builtin({}, {})", name, arity),
-            Value::Lambda { params, .. } => {
-                write!(f, "Lambda(|{}| ...)", params.join(", "))
-            }
+            Value::Lambda(l) => write!(f, "Lambda(|{}| ...)", l.params.join(", ")),
+            Value::Closure(c) => write!(f, "Closure(|{}| ...)", c.params.join(", ")),
             Value::Unit => write!(f, "Unit"),
             Value::Bool(b) => write!(f, "Bool({})", b),
             Value::List(items) => write!(f, "List({:?})", items),
@@ -119,7 +158,8 @@ impl fmt::Display for Value {
                 write!(f, "{}", n)
             }
             Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
-            Value::Lambda { params, .. } => write!(f, "<lambda |{}|>", params.join(", ")),
+            Value::Lambda(l) => write!(f, "<lambda |{}|>", l.params.join(", ")),
+            Value::Closure(c) => write!(f, "<lambda |{}|>", c.params.join(", ")),
             Value::Unit => write!(f, "{{}}"),
             Value::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
             Value::List(items) => {
@@ -149,5 +189,23 @@ impl fmt::Display for Value {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Value;
+
+    /// `Value` is moved on every binding, argument, list element and return, so its
+    /// width is a tax on the whole interpreter — and a register VM's main job is moving
+    /// them. It was 64 bytes until `Lambda` and `Tag` were boxed. This is the guard
+    /// against a new inline field quietly putting it back.
+    #[test]
+    fn value_stays_narrow() {
+        assert_eq!(
+            std::mem::size_of::<Value>(),
+            32,
+            "Value grew — box the new variant's payload instead"
+        );
     }
 }

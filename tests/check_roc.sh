@@ -21,17 +21,23 @@
 #         this means the feature is not implemented yet, or the two files differ by
 #         more than sugar. Reported as pending; fatal only under --strict.
 #
-# Usage: tests/check_roc.sh [--strict] [path-under-tests/roc]
+# --vm runs the interpreter's REGISTER VM instead of its tree-walker, so the INTERP
+# gate becomes "the VM matches roc on both files". A pair the VM cannot compile yet is
+# reported as pending rather than failed; `tests/vm_coverage.sh` is what counts those.
+#
+# Usage: tests/check_roc.sh [--strict] [--vm] [path-under-tests/roc]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROC=${ROC:-roc}
 ROCFLIGHT=${ROCFLIGHT:-./target/debug/rocflight}
 
 strict=0
+vm=()
 root=tests/roc
 for arg in "$@"; do
   case "$arg" in
     --strict) strict=1 ;;
+    --vm) vm=(--vm) ;;
     *) root=$arg ;;
   esac
 done
@@ -45,7 +51,7 @@ amber() { printf '\033[33m%s\033[0m' "$1"; }
 fail_msg() { printf '  %s %s — %s\n' "$(red FAIL)" "$1" "$2"; fail=$((fail+1)); }
 
 # The interpreter prints its own progress line to stderr; strip it before diffing.
-run_interp() { "$ROCFLIGHT" "$1" 2>&1 | grep -v '^\[Desugaring\]'; }
+run_interp() { "$ROCFLIGHT" "${vm[@]}" "$1" 2>&1 | grep -v '^\[Desugaring\]'; }
 
 if [ ! -x "$ROCFLIGHT" ]; then
   echo "note: $ROCFLIGHT not built — running PAIR checks only (cargo build to enable INTERP)"

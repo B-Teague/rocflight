@@ -7,6 +7,8 @@
 #
 #   tests/bench.sh            measure, and compare against the baseline if one exists
 #   tests/bench.sh --save     measure and write the baseline (do this BEFORE a change)
+#   tests/bench.sh --vm       run on the register VM instead of the tree-walker, against
+#                             its own baseline; only the programs the VM can compile yet
 #   tests/bench.sh --runs 9   more repetitions, for a noisier machine
 #   tests/bench.sh calls      just one benchmark
 #
@@ -18,20 +20,26 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROCFLIGHT=${ROCFLIGHT:-$PWD/target/release/rocflight}
-BASELINE=${BASELINE:-tests/bench/baseline.tsv}
+BASELINE=""
 RUNS=5
 save=0
+vm=()
 only=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --save) save=1 ;;
+    # A separate baseline: comparing the VM's times against the tree-walker's saved
+    # ones would report every benchmark as a change and mean nothing.
+    --vm) vm=(--vm); BASELINE=${BASELINE:-tests/bench/baseline.vm.tsv} ;;
     --runs) RUNS=$2; shift ;;
     --baseline) BASELINE=$2; shift ;;
     *) only+=("$1") ;;
   esac
   shift
 done
+
+BASELINE=${BASELINE:-tests/bench/baseline.tsv}
 
 if [ ! -x "$ROCFLIGHT" ]; then
   echo "error: $ROCFLIGHT not built — run: cargo build --release" >&2
@@ -49,7 +57,7 @@ median_ms() {
   for _ in $(seq "$RUNS"); do
     local start end
     start=$(date +%s%N)
-    "$ROCFLIGHT" "$file" >/dev/null 2>&1
+    "$ROCFLIGHT" "${vm[@]}" "$file" >/dev/null 2>&1
     end=$(date +%s%N)
     times+=( $(( (end - start) / 1000000 )) )
   done
@@ -60,7 +68,7 @@ median_ms() {
 # catching here are order-of-magnitude ones.
 peak_kb() {
   local file=$1
-  "$ROCFLIGHT" "$file" >/dev/null 2>&1 &
+  "$ROCFLIGHT" "${vm[@]}" "$file" >/dev/null 2>&1 &
   local pid=$! peak=0 cur
   while kill -0 "$pid" 2>/dev/null; do
     cur=$(awk '/VmHWM/{print $2}' "/proc/$pid/status" 2>/dev/null)
@@ -91,7 +99,12 @@ for file in tests/bench/*.roc; do
 
   # Correctness first: a faster interpreter that prints something else is not faster.
   expected=$(grep -oP '(?<=^# expect: ).*' "$file" || true)
-  actual=$("$ROCFLIGHT" "$file" 2>&1 | grep -v '^\[Desugaring\]')
+  actual=$("$ROCFLIGHT" "${vm[@]}" "$file" 2>&1 | grep -v '^\[Desugaring\]')
+  # Under --vm, a program the VM cannot compile yet is skipped rather than failed:
+  # coverage is `tests/vm_coverage.sh`'s job, not this harness's.
+  if [ ${#vm[@]} -gt 0 ] && [[ "$actual" == *"Error: vm:"* ]]; then
+    continue
+  fi
   if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then
     printf '  %s %-18s wrong output: %s (wanted %s)\n' "$(red FAIL)" "$name" "$actual" "$expected"
     fail=$((fail+1)); continue

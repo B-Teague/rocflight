@@ -18,7 +18,7 @@ use rocflight::eval::Evaluator;
 use rocflight::parser::Parser;
 use rocflight::types::TypeChecker;
 
-fn build(src: &str) -> rocflight::ast::Expr<'static> {
+fn build(src: &str) -> rocflight::ast::Expr {
     let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
     Parser::new(&desugared).parse_expr().expect("parse failed")
 }
