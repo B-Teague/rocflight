@@ -204,6 +204,21 @@ fn the_low_level_section_declares_bare_ops() {
 }
 
 #[test]
+fn the_low_level_section_is_cut_to_what_the_other_members_reach() {
+    // Alone, it is loaded whole: 153 bare ops. Beside `Dict` and `Set` it keeps only
+    // the declarations their text reaches — a handful of ops and the `dict_*` helpers
+    // — and the other 269 are never parsed.
+    let whole = rocflight::builtin::load(&["(low level)"]).expect("loads");
+    let cut = rocflight::builtin::load(&["(low level)", "Dict", "Set"]).expect("loads");
+    let (whole, cut) = (&whole[0], &cut[0]);
+    assert!(whole.intrinsics.len() > 100, "got {}", whole.intrinsics.len());
+    assert!(cut.intrinsics.len() < 20, "got {:?}", cut.intrinsics);
+    for op in ["list_get_unsafe", "list_set_unsafe", "hasher_finish"] {
+        assert!(cut.intrinsics.contains(&op), "`Dict` reaches {op}: {:?}", cut.intrinsics);
+    }
+}
+
+#[test]
 fn low_level_ops_run() {
     use rocflight::eval::{call_builtin_values, Value};
     let call = |name: &str, args: Vec<Value>| {

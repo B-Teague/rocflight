@@ -360,7 +360,15 @@ impl Parser {
         // A platformless app may omit the header entirely: `main! = |_args| ...`
         // implies `app [main!] {}`. Verified against `roc run` on
         // nightly-2026-09-03, and against roc-compiler/test/echo/hello.roc.
-        if self.entry_point.is_none() && self.has_top_level_binding("main!") {
+        //
+        // Only the OUTERMOST parse asks: the scan reads every line of the file, and
+        // every braceless lambda body re-enters here, so asking at each depth made
+        // parsing a member of Builtin.roc quadratic — 11ms of the low-level section's
+        // 13ms, and a third of a second for `Num`.
+        if self.expr_depth == 1
+            && self.entry_point.is_none()
+            && self.has_top_level_binding("main!")
+        {
             self.entry_point = Some("main!".to_string());
         }
 
