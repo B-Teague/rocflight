@@ -44,35 +44,45 @@ thread_local! {
     static RUNNING: RefCell<Vec<(Rc<Program>, Globals)>> = const { RefCell::new(Vec::new()) };
 }
 
+/// Run `f` against the program currently running, if there is one.
+///
+/// A borrow rather than a clone of the `Rc`: these lookups happen inside `Str.inspect`
+/// and `==`, and the program is not going anywhere while an instruction of its own is
+/// executing.
+fn with_running<R>(f: impl FnOnce(&Program) -> R) -> Option<R> {
+    RUNNING.with(|r| r.borrow().last().map(|(program, _)| f(program)))
+}
+
 /// Every `Type.method` function in the running program, for a given method name.
 ///
-/// A nominal's method block compiles to top-level functions whose names carry a dot, so
-/// finding one is a scan of the chunk table, which is fixed once the program is
-/// compiled.
+/// A nominal's method block compiles to top-level functions whose names carry a dot,
+/// and the compiler indexed those by bare method name in `Program::methods_by_name` —
+/// so this is a table lookup, not a scan of every chunk with a formatted suffix.
 ///
 /// Used by the two builtins that dispatch on a user's own method: `Str.inspect` looking
 /// for a `to_inspect`, and operator dispatch looking for `plus`/`is_eq`/…
 pub fn methods_named(method: &str, receiver: &Value) -> Vec<(&'static str, Value)> {
-    let suffix = format!(".{}", method);
-    let Some((program, _)) = RUNNING.with(|r| r.borrow().last().cloned()) else {
-        return Vec::new();
-    };
-    program
-        .chunks
-        .iter()
-        .filter(|chunk| chunk.name.ends_with(&suffix))
-        // Only the nominals whose shape does not RULE the receiver out. Without this a
-        // lone `Try.is_eq` in scope answered every `==`, tuples and unrelated tags
-        // included, and `(1, "x") == (1, "x")` failed with "No match arm matched".
-        .filter(|chunk| match chunk.name.rsplit_once('.') {
-            Some((owner, _)) => program
-                .nominal_shapes
-                .get(owner)
-                .is_none_or(|shape| shape.admits(receiver)),
-            None => true,
-        })
-        .map(|chunk| (chunk.name, Value::Closure(Rc::clone(&chunk.bare))))
-        .collect()
+    with_running(|program| {
+        let Some(defined) = program.methods_by_name.get(method) else { return Vec::new() };
+        defined
+            .iter()
+            // Only the nominals whose shape does not RULE the receiver out. Without
+            // this a lone `Try.is_eq` in scope answered every `==`, tuples and unrelated
+            // tags included, and `(1, "x") == (1, "x")` failed with "No match arm
+            // matched".
+            .filter(|(qualified, _)| match qualified.rsplit_once('.') {
+                Some((owner, _)) => program
+                    .nominal_shapes
+                    .get(owner)
+                    .is_none_or(|shape| shape.admits(receiver)),
+                None => true,
+            })
+            .map(|(qualified, chunk)| {
+                (*qualified, Value::Closure(Rc::clone(&program.chunks[*chunk as usize].bare)))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Call a VM closure from outside the VM — from a builtin's callback.
@@ -87,6 +97,9 @@ pub fn call_closure(closure: &Rc<Closure>, args: Vec<Value>) -> Result<Value, Ev
     let (program, globals) = context.ok_or_else(|| EvalError {
         message: "vm: a closure was called with no VM running".to_string(),
     })?;
+    // A fresh register file per callback. Pooling them across callbacks was measured
+    // on `iter_range` (two million of these) and saved nothing: the allocation is not
+    // where a callback's time goes. Lowering `fold` and `map` into bytecode is.
     let mut vm = Vm { program, regs: Vec::new(), frames: Vec::new(), globals };
     vm.call(closure, args)
 }
@@ -162,6 +175,9 @@ pub enum Op {
     MakeList { dst: Reg, base: Reg, n: u16 },
     /// `dst = (regs[base .. base + n])`
     MakeTuple { dst: Reg, base: Reg, n: u16 },
+    /// `regs[list].push(regs[src])`, in place when nothing else holds the list —
+    /// which is so for the list a compiled `map` is building. `src` is left `Unit`.
+    ListPush { list: Reg, src: Reg },
     /// `dst = Name(regs[base .. base + n])`, the name from this chunk's `names`.
     MakeTag { dst: Reg, name: u16, base: Reg, n: u16 },
     /// `dst = { names[name .. name + n]: regs[base .. base + n] }`, in that order.
@@ -377,21 +393,20 @@ pub enum NominalShape {
 /// Unlike `methods_named` this needs no receiver: `Json.parse` looks up a nominal's
 /// `parser_for` knowing only the type it must produce.
 pub fn method_by_name(module: &str, method: &str) -> Option<Value> {
-    let (program, _) = RUNNING.with(|r| r.borrow().last().cloned())?;
-    let qualified = format!("{}.{}", module, method);
-    program
-        .chunks
-        .iter()
-        .find(|chunk| chunk.name == qualified)
-        .map(|chunk| Value::Closure(Rc::clone(&chunk.bare)))
+    with_running(|program| {
+        let chunk = *program.methods.get(&(module, method))?;
+        Some(Value::Closure(Rc::clone(&program.chunks[chunk as usize].bare)))
+    })
+    .flatten()
 }
 
-/// The shapes declared opaque in the running program.
-pub fn opaque_shapes() -> Vec<NominalShape> {
-    RUNNING
-        .with(|r| r.borrow().last().cloned())
-        .map(|(program, _)| program.opaque_shapes.clone())
-        .unwrap_or_default()
+/// Is `value` exactly the shape of a nominal the running program declared opaque?
+///
+/// Asked for every record, tag and tuple `Str.inspect` renders, nested ones included,
+/// so it borrows the shapes rather than copying them out each time.
+pub fn is_opaque(value: &Value) -> bool {
+    with_running(|program| program.opaque_shapes.iter().any(|shape| shape.is_exactly(value)))
+        .unwrap_or(false)
 }
 
 impl NominalShape {
@@ -504,7 +519,7 @@ impl Vm {
             // need the host to supply them.
             Some((chunk, arity)) => {
                 let args =
-                    if arity == 0 { Vec::new() } else { vec![Value::List(Vec::new())] };
+                    if arity == 0 { Vec::new() } else { vec![Value::list(Vec::new())] };
                 self.call_chunk(chunk, args)
             }
         }
@@ -765,11 +780,22 @@ impl Vm {
                 // ---- aggregates ----
                 Op::MakeList { dst, base: b, n } => {
                     let items = collect(regs, base + b as usize, n);
-                    regs[base + dst as usize] = Value::List(items);
+                    regs[base + dst as usize] = Value::list(items);
                 }
                 Op::MakeTuple { dst, base: b, n } => {
                     let items = collect(regs, base + b as usize, n);
                     regs[base + dst as usize] = Value::Tuple(items);
+                }
+                Op::ListPush { list, src } => {
+                    let item = std::mem::replace(&mut regs[base + src as usize], Value::Unit);
+                    match &mut regs[base + list as usize] {
+                        Value::List(items) => Rc::make_mut(items).push(item),
+                        other => {
+                            return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                message: format!("vm: pushed onto {}, which is not a list", other),
+                            }))
+                        }
+                    }
                 }
                 Op::MakeTag { dst, name, base: b, n } => {
                     let items = collect(regs, base + b as usize, n);
@@ -951,7 +977,7 @@ impl Vm {
                 Op::GetSlice { dst, obj, front, back } => {
                     let value = match &regs[base + obj as usize] {
                         Value::List(items) => {
-                            Value::List(items[front as usize..items.len() - back as usize].to_vec())
+                            Value::list(items[front as usize..items.len() - back as usize].to_vec())
                         }
                         other => unreachable_shape("a list", other)?,
                     };

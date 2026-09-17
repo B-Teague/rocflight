@@ -464,38 +464,6 @@ impl TypeChecker {
     /// `A -> (B -> C)` gives `([A, B], C)`. Used to push an annotation's parameter
     /// types into a lambda's scope, which is how a `match` on a parameter learns the
     /// parameter's declared union — and therefore whether the arms are exhaustive.
-    /// The variables a numeral currently stands for, itself included.
-    ///
-    /// A numeral's type must not be quantified — `birds = 3` has ONE type, and
-    /// `I64.to_str(birds)` is what fixes it. Generalising gives every use a fresh copy,
-    /// so nothing can reach the literal and it defaults to `Dec`. Unification moves the
-    /// variable around, so the whole chain has to be followed, not just the original.
-    fn numeral_tainted(&self) -> std::collections::HashSet<u32> {
-        let mut tainted = std::collections::HashSet::new();
-        for v in &self.numeral_vars {
-            tainted.insert(*v);
-            // Unification binds one variable to another, either way round, so a
-            // numeral's own variable and whatever it resolves to are both tainted.
-            let mut vars = Vec::new();
-            Self::type_vars_in(&self.subst.apply(&Type::TypeVar(*v)), &mut vars);
-            tainted.extend(vars);
-        }
-        // And anything that resolves INTO the set: `$sum` may be the one bound to the
-        // literal's variable rather than the other way about.
-        let resolved: Vec<u32> = self
-            .subst
-            .bound_vars()
-            .into_iter()
-            .filter(|v| {
-                let mut vars = Vec::new();
-                Self::type_vars_in(&self.subst.apply(&Type::TypeVar(*v)), &mut vars);
-                vars.iter().any(|w| tainted.contains(w))
-            })
-            .collect();
-        tainted.extend(resolved);
-        tainted
-    }
-
     /// `module_of`, but a numeral variable answers as the fractional type it will
     /// default to — an unresolved numeral still has a method block.
     fn module_named(&self, ty: &Type) -> Option<&'static str> {
@@ -515,7 +483,7 @@ impl TypeChecker {
     /// A type as the program will actually see it: the substitution applied, and any
     /// numeral left unpinned resolved to the `Dec` it defaults to.
     pub fn defaulted(&self, ty: &Type) -> Type {
-        self.default_numerals(&self.subst.apply(ty), &self.numeral_tainted())
+        self.default_numerals(&self.subst.apply(ty), &self.numeral_vars)
     }
 
     fn default_numerals(&self, ty: &Type, numerals: &std::collections::HashSet<u32>) -> Type {
@@ -962,19 +930,6 @@ impl TypeChecker {
                 // union of them, not just the first branch's type.
                 self.join(&then_type, &else_type)
             }
-            Expr::VarDecl { name, value, body, .. } => {
-                let bound = self.synth(value)?;
-                self.bind(name, bound);
-                self.synth(body)
-            }
-            Expr::Assign { name, value, body, .. } => {
-                // A reassignment must agree with what the `var` already holds.
-                let assigned = self.synth(value)?;
-                if let Some(existing) = self.lookup(name) {
-                    self.unify(&existing, &assigned)?;
-                }
-                self.synth(body)
-            }
             Expr::For { name, iterable, body, .. } => {
                 let iterable_type = self.synth(iterable)?;
                 let element = match self.subst.apply(&iterable_type) {
@@ -1318,10 +1273,10 @@ impl TypeChecker {
             // A nominal's method block binds `Type.method` as an ordinary name, so a
             // qualified reference resolves from the environment before falling back to
             // "some function" — `Counter.start` is a Counter, not a function.
-            Expr::Qualified { module, name, .. } if self.declared(module, name).is_some() => {
-                Ok(self.declared(module, name).expect("checked by the guard"))
-            }
-            Expr::Qualified { module: _, name: _, .. } => {
+            Expr::Qualified { module, name, .. } => {
+                if let Some(declared) = self.declared(module, name) {
+                    return Ok(declared);
+                }
                 // Qualified names are typically functions from builtins
                 // Create a function type that can accept arguments
                 // Input type: fresh var, Output type: fresh var
@@ -1527,19 +1482,44 @@ impl TypeChecker {
 
                 Ok(self.subst.apply(&current_type))
             }
-            Expr::Let { name, annotation, value, body, .. } => {
-                // `Graph.from_dict = …` is a METHOD, and its siblings are in scope
-                // unqualified while its value is checked.
-                let owns = name.rsplit_once('.').map(|(owner, _)| owner.to_string());
-                if let Some(owner) = owns.clone() {
-                    self.enclosing_type.push(owner);
+            // The statement spine — a block's `let`s, `var`s and assignments — is
+            // walked in a loop rather than by recursing once per statement, so a
+            // block's depth is bounded by memory rather than by the Rust stack, which
+            // 6,000 statements overflowed.
+            Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => {
+                let mut cursor = expr;
+                loop {
+                    match cursor {
+                        Expr::Let { name, annotation, value, body, .. } => {
+                            // `Graph.from_dict = …` is a METHOD, and its siblings are
+                            // in scope unqualified while its value is checked.
+                            let owns = name.rsplit_once('.').map(|(owner, _)| owner.to_string());
+                            if let Some(owner) = owns.clone() {
+                                self.enclosing_type.push(owner);
+                            }
+                            let checked = self.check_let(name, annotation, value);
+                            if owns.is_some() {
+                                self.enclosing_type.pop();
+                            }
+                            checked?;
+                            cursor = body;
+                        }
+                        Expr::VarDecl { name, value, body, .. } => {
+                            let bound = self.synth(value)?;
+                            self.bind(name, bound);
+                            cursor = body;
+                        }
+                        Expr::Assign { name, value, body, .. } => {
+                            // A reassignment must agree with what the `var` already holds.
+                            let assigned = self.synth(value)?;
+                            if let Some(existing) = self.lookup(name) {
+                                self.unify(&existing, &assigned)?;
+                            }
+                            cursor = body;
+                        }
+                        other => return self.synth(other),
+                    }
                 }
-                let checked = self.check_let(name, annotation, value);
-                if owns.is_some() {
-                    self.enclosing_type.pop();
-                }
-                checked?;
-                self.synth(body)
             }
         }
     }
@@ -1589,9 +1569,21 @@ impl TypeChecker {
 
                         let mut generics = Vec::new();
                         Self::type_vars_in(&inferred, &mut generics);
-                        let outer = self.env_type_vars();
-                        let numerals = self.numeral_tainted();
-                        generics.retain(|v| !outer.contains(v) && !numerals.contains(v));
+                        // A numeral's type must not be quantified — `birds = 3` has
+                        // ONE type, and `I64.to_str(birds)` is what fixes it.
+                        // Generalising would give every use a fresh copy, so nothing
+                        // could reach the literal and it would default to `Dec`.
+                        // `unify` marks every variable a numeral's is bound to, either
+                        // way round, so membership here is the whole test.
+                        generics.retain(|v| !self.numeral_vars.contains(v));
+                        // Walking the environment costs every binding in scope, so
+                        // only a binding that still has something to quantify pays it.
+                        // Most do not: a monomorphic `let` is the common case, and a
+                        // block of thousands of them was quadratic.
+                        if !generics.is_empty() {
+                            let outer = self.env_type_vars();
+                            generics.retain(|v| !outer.contains(v));
+                        }
                         generics.dedup();
 
                         self.bind_poly(name, inferred, generics);
@@ -2115,15 +2107,16 @@ impl TypeChecker {
         }
     }
 
-    /// Occurs check: prevent infinite types
+    /// Occurs check: prevent infinite types.
+    ///
+    /// Every compound type is looked inside, not just lists and functions. A variable
+    /// bound to a record containing itself — `{ ..p, next: p }` — made `apply` recurse
+    /// for ever, and the checker went down with a stack overflow instead of a message.
     fn occurs_check(&self, var: u32, ty: &Type) -> bool {
         let ty = self.subst.apply(ty);
-        match ty {
-            Type::TypeVar(v) => v == var,
-            Type::List(inner) => self.occurs_check(var, &inner),
-            Type::Function(a, b) => self.occurs_check(var, &a) || self.occurs_check(var, &b),
-            _ => false,
-        }
+        let mut vars = Vec::new();
+        Self::type_vars_in(&ty, &mut vars);
+        vars.contains(&var)
     }
 }
 
@@ -2177,10 +2170,9 @@ fn module_of(ty: &Type) -> Option<&'static str> {
 
         // `c : Counter` dispatches into `Counter`'s own method block. This is the case
         // the runtime cannot reconstruct, which is why the compiler has to.
-        // Leaked because a method name is `&'static str` everywhere else in the
-        // compiler. `dispatch_modules` is called once per run, and a program has a
-        // bounded number of nominals.
-        Type::Nominal { name, .. } => Box::leak(name.clone().into_boxed_str()),
+        // Interned because a method name is `&'static str` everywhere else in the
+        // compiler, and this is asked once per dispatch node.
+        Type::Nominal { name, .. } => crate::memory::string_pool::intern(name),
         _ => return None,
     })
 }

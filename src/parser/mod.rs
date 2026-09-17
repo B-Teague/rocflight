@@ -273,33 +273,42 @@ impl Parser {
     /// in it is a binding to `_`. A `_` bound to another chain is the flattened group
     /// `compile_unit` also looks through, so this descends into one.
     fn lift_expects(program: &mut Expr, out: &mut Vec<Expr>) {
-        // Take the expects off the front of this spine, then walk what is left.
-        while matches!(program, Expr::Let { name: "_", value, .. } if matches!(**value, Expr::Expect(..)))
-        {
-            let Expr::Let { value, body, .. } =
-                std::mem::replace(program, Expr::Unit(crate::ast::fresh_node_unlocated()))
-            else {
-                unreachable!("matched a Let")
-            };
-            out.push(*value);
-            *program = *body;
-        }
-        match program {
+        // A loop down the spine, recursing only into a nested group: a file of ten
+        // thousand declarations must not cost ten thousand Rust frames here.
+        let mut cursor = program;
+        loop {
+            // Take the expects off the front of this spine, then walk what is left.
+            while matches!(cursor, Expr::Let { name: "_", value, .. } if matches!(**value, Expr::Expect(..)))
+            {
+                let Expr::Let { value, body, .. } =
+                    std::mem::replace(cursor, Expr::Unit(crate::ast::fresh_node_unlocated()))
+                else {
+                    unreachable!("matched a Let")
+                };
+                out.push(*value);
+                *cursor = *body;
+            }
             // A `_` bound to another chain is the flattened group `compile_unit` also
-            // looks through.
-            Expr::Let { name: "_", value, body, .. } if matches!(**value, Expr::Let { .. }) => {
-                Self::lift_expects(value, out);
-                Self::lift_expects(body, out);
+            // looks through. Decided before the mutable match: a guard that binds
+            // fields mutably is a second borrow the checker refuses.
+            let nested = matches!(&*cursor, Expr::Let { name: "_", value, .. } if matches!(**value, Expr::Let { .. }));
+            match cursor {
+                Expr::Let { value, body, .. } => {
+                    if nested {
+                        Self::lift_expects(value, out);
+                    }
+                    cursor = body;
+                }
+                // A chain can END in an expect rather than binding one to `_`, which
+                // is the shape a group of declarations followed by a test produces.
+                Expr::Expect(..) => {
+                    let lifted =
+                        std::mem::replace(cursor, Expr::Unit(crate::ast::fresh_node_unlocated()));
+                    out.push(lifted);
+                    return;
+                }
+                _ => return,
             }
-            Expr::Let { body, .. } => Self::lift_expects(body, out),
-            // A chain can END in an expect rather than binding one to `_`, which is
-            // the shape a group of declarations followed by a test actually produces.
-            Expr::Expect(..) => {
-                let lifted =
-                    std::mem::replace(program, Expr::Unit(crate::ast::fresh_node_unlocated()));
-                out.push(lifted);
-            }
-            _ => {}
         }
     }
 
@@ -1644,8 +1653,31 @@ impl Parser {
         }
     }
 
-    /// Parse let binding or regular expression
+    /// Parse let binding or regular expression.
+    ///
+    /// A loop over the file's chain of bindings rather than a call per binding, so a
+    /// module of ten thousand declarations is bounded by memory rather than by the
+    /// Rust stack — 20,000 of them overflowed it. Each step parses one statement; the
+    /// bindings are folded into the chain from the back once its end is reached.
     fn parse_let_or_expr(&mut self) -> Result<Expr, ParseError> {
+        let mut bindings = Vec::new();
+        let mut tail = loop {
+            match self.parse_statement()? {
+                Step::Binding(binding) => bindings.push(binding),
+                Step::Done(expr) => break expr,
+            }
+        };
+        for mut binding in bindings.into_iter().rev() {
+            let Expr::Let { body, .. } = &mut binding else { unreachable!("a binding is a Let") };
+            *body = Box::new(tail);
+            tail = binding;
+        }
+        Ok(tail)
+    }
+
+    /// One statement of a chain: a binding that carries on, or the expression the
+    /// chain ends in.
+    fn parse_statement(&mut self) -> Result<Step, ParseError> {
         self.skip_trivia();
 
         let rest = &self.input[self.pos..];
@@ -1711,7 +1743,7 @@ impl Parser {
             // Parse body expression
             let body = Box::new(self.parse_let_or_expr()?);
 
-            Ok(Expr::Let { id: self.node(), name, annotation: None, value, body })
+            Ok(Step::Done(Expr::Let { id: self.node(), name, annotation: None, value, body }))
         } else {
             // Top-level destructuring: `(a, b) = value`, then the rest of the file.
             // Same shape as inside a block, and likewise a one-arm match.
@@ -1758,7 +1790,7 @@ impl Parser {
                         });
                     }
                     let body = self.parse_let_or_expr()?;
-                    return self.destructure_at_top_level(pattern, value, body);
+                    return self.destructure_at_top_level(pattern, value, body).map(Step::Done);
                 }
             }
 
@@ -1793,33 +1825,39 @@ impl Parser {
                             // The body refers to the name rather than cloning the
                             // value: cloning doubled the AST and made the evaluator
                             // build the value twice, discarding the second copy.
-                            return Ok(Expr::Let { id: self.node(),
+                            return Ok(Step::Done(Expr::Let { id: self.node(),
                                 name,
                                 annotation,
                                 value,
                                 body: Box::new(Expr::Ident(name, self.node())),
-                            });
+                            }));
                         } else {
                             // Continue parsing the rest of the chain.
                             self.skip_trivia();
                             if self.input[self.pos..].is_empty() {
                                 // Trailing annotations/comments only: this binding is
                                 // the last one, so its value is the file's value.
-                                return Ok(Expr::Let { id: self.node(),
+                                return Ok(Step::Done(Expr::Let { id: self.node(),
                                     name,
                                     annotation,
                                     value,
                                     body: Box::new(Expr::Ident(name, self.node())),
-                                });
+                                }));
                             }
-                            let body = Box::new(self.parse_let_or_expr()?);
-                            return Ok(Expr::Let { id: self.node(), name, annotation, value, body });
+                            // The rest of the chain is the body; `parse_let_or_expr`
+                            // fills it in once the chain ends.
+                            return Ok(Step::Binding(Expr::Let { id: self.node(),
+                                name,
+                                annotation,
+                                value,
+                                body: Box::new(Expr::Unit(crate::ast::fresh_node_unlocated())),
+                            }));
                         }
                     }
                 }
             }
 
-            self.parse_or_expr()
+            self.parse_or_expr().map(Step::Done)
         }
     }
 
@@ -5027,4 +5065,12 @@ enum Accessor {
 /// Leak a field name so it lives as long as the AST.
 fn leak_field(name: &str) -> &'static str {
     Box::leak(name.to_string().into_boxed_str())
+}
+
+/// One step of a file's statement chain, for `Parser::parse_let_or_expr`.
+enum Step {
+    /// A binding whose body is a placeholder until the chain's end is known.
+    Binding(Expr),
+    /// The expression the chain ends in.
+    Done(Expr),
 }

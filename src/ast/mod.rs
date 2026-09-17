@@ -443,6 +443,55 @@ pub enum Expr {
 
 
 impl Expr {
+    /// This node's direct sub-expressions, in source order.
+    ///
+    /// Exhaustive over `Expr` on purpose, like the compiler's own match: a variant
+    /// added to the AST has to say what it contains, or a walk that relies on this
+    /// would silently stop short.
+    pub fn children(&self) -> Vec<&Expr> {
+        match self {
+            Expr::Str(..) | Expr::Int(..) | Expr::Float(..) | Expr::Ident(..)
+            | Expr::Qualified { .. } | Expr::Unit(_) | Expr::Bool(..) | Expr::Break(_) => Vec::new(),
+            Expr::StrInterp(parts, _) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    StrPart::Expr(e) => Some(*e),
+                    StrPart::Literal(_) => None,
+                })
+                .collect(),
+            Expr::BinOp { left, right, .. } => vec![left, right],
+            Expr::Lambda { body, .. } => vec![body],
+            Expr::Call { func, args, .. } => {
+                std::iter::once(&**func).chain(args.iter()).collect()
+            }
+            Expr::Let { value, body, .. }
+            | Expr::VarDecl { value, body, .. }
+            | Expr::Assign { value, body, .. } => vec![value, body],
+            Expr::Record(fields, _) => fields.iter().map(|(_, v)| v).collect(),
+            Expr::RecordUpdate { base, fields, .. } => {
+                std::iter::once(&**base).chain(fields.iter().map(|(_, v)| v)).collect()
+            }
+            Expr::List(items, _) | Expr::Tuple(items, _) => items.iter().collect(),
+            Expr::Tag { args, .. } => args.iter().collect(),
+            Expr::Range { start, end, .. } => vec![start, end],
+            Expr::TupleIndex { tuple, .. } => vec![tuple],
+            Expr::Match { scrutinee, arms, .. } => std::iter::once(&**scrutinee)
+                .chain(arms.iter().flat_map(|arm| arm.guard.iter().chain(std::iter::once(&arm.body))))
+                .collect(),
+            Expr::If { condition, then_branch, otherwise, .. } => {
+                vec![condition, then_branch, otherwise]
+            }
+            Expr::For { iterable, body, .. } => vec![iterable, body],
+            Expr::While { condition, body, .. } => vec![condition, body],
+            Expr::Return(inner, _) | Expr::Crash(inner, _) | Expr::Expect(inner, _)
+            | Expr::Dbg(inner, _) => vec![inner],
+            Expr::Dispatch { receiver, args, .. } => {
+                std::iter::once(&**receiver).chain(args.iter()).collect()
+            }
+            Expr::OptionalField { record, .. } | Expr::FieldAccess { record, .. } => vec![record],
+        }
+    }
+
     /// This node's identity, for looking it up in a side table.
     pub fn id(&self) -> NodeId {
         match self {

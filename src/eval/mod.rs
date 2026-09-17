@@ -103,7 +103,9 @@ pub fn try_method(
 /// the first element was looked at. A range knows its elements from three integers, so
 /// the ones that only need to WALK the elements walk them instead.
 enum Elements {
-    List(std::vec::IntoIter<Value>),
+    /// Walked in place: the list is shared with whoever else holds it, and each
+    /// element is cloned as it is reached rather than the whole list up front.
+    List(std::rc::Rc<Vec<Value>>, usize),
     Range(std::ops::RangeInclusive<i128>),
 }
 
@@ -112,7 +114,11 @@ impl Iterator for Elements {
 
     fn next(&mut self) -> Option<Value> {
         match self {
-            Elements::List(items) => items.next(),
+            Elements::List(items, at) => {
+                let item = items.get(*at).cloned();
+                *at += 1;
+                item
+            }
             Elements::Range(range) => range.next().map(Value::Int),
         }
     }
@@ -135,7 +141,7 @@ impl Elements {
 /// A List or a Range, as something to iterate.
 fn elements(value: Value, name: &str) -> Result<Elements, EvalError> {
     match value {
-        Value::List(items) => Ok(Elements::List(items.into_iter())),
+        Value::List(items) => Ok(Elements::List(items, 0)),
         Value::Range { start, end, inclusive } => {
             let last = if inclusive { end } else { end - 1 };
             Ok(Elements::Range(start..=last))
@@ -157,14 +163,27 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
     };
 
-    let as_list = |v: Value| -> Result<Vec<Value>, EvalError> {
+    // Takes the argument OUT of `args`: when nothing else holds the list, the `Vec`
+    // comes back without a copy and the operation below mutates it in place.
+    let mut args = args;
+    let as_list = |v: &mut Value| -> Result<Vec<Value>, EvalError> {
+        match std::mem::replace(v, Value::Unit) {
+            Value::List(items) => Ok(value::into_items(items)),
+            other => Err(EvalError {
+                message: format!("List.{} needs a List, got {}", name, other),
+            }),
+        }
+    };
+    // A read leaves the list where it is: taking it would copy a shared one, and
+    // `xs.get(i)` in a loop over `xs` was quadratic for exactly that reason.
+    fn peek<'a>(v: &'a Value, name: &str) -> Result<&'a [Value], EvalError> {
         match v {
             Value::List(items) => Ok(items),
             other => Err(EvalError {
                 message: format!("List.{} needs a List, got {}", name, other),
             }),
         }
-    };
+    }
 
     match name {
         // `List.repeat(item, n)` — n copies. `Dict` allocates its bucket table this way.
@@ -178,18 +197,18 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                     })
                 }
             };
-            Ok(Value::List(vec![args[0].clone(); count]))
+            Ok(Value::list(vec![args[0].clone(); count]))
         }
 
         // Capacity is an allocation hint, and not observable through the API: roc's own
         // docs describe these as avoiding reallocation, never as changing a value.
         "reserve" | "release_excess_capacity" => {
             expect(if name == "reserve" { 2 } else { 1 }, args.len())?;
-            Ok(Value::List(as_list(args[0].clone())?))
+            as_list(&mut args[0]).map(Value::list)
         }
         "with_capacity" => {
             expect(1, args.len())?;
-            Ok(Value::List(Vec::new()))
+            Ok(Value::list(Vec::new()))
         }
 
         // A range knows its length from its bounds, so neither of these walks anything.
@@ -217,7 +236,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             for item in items {
                 out.push(call_function(func.clone(), vec![item])?);
             }
-            Ok(Value::List(out))
+            Ok(Value::list(out))
         }
         "fold" => {
             expect(3, args.len())?;
@@ -231,34 +250,34 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
         "concat" => {
             expect(2, args.len())?;
-            let mut items = as_list(args[0].clone())?;
-            items.extend(as_list(args[1].clone())?);
-            Ok(Value::List(items))
+            let mut items = as_list(&mut args[0])?;
+            items.extend(as_list(&mut args[1])?);
+            Ok(Value::list(items))
         }
         "append" => {
             expect(2, args.len())?;
-            let mut items = as_list(args[0].clone())?;
+            let mut items = as_list(&mut args[0])?;
             items.push(args[1].clone());
-            Ok(Value::List(items))
+            Ok(Value::list(items))
         }
         "prepend" => {
             expect(2, args.len())?;
             let mut items = vec![args[1].clone()];
-            items.extend(as_list(args[0].clone())?);
-            Ok(Value::List(items))
+            items.extend(as_list(&mut args[0])?);
+            Ok(Value::list(items))
         }
         // roc spells it `rev`; `reverse` is kept because this interpreter answered to
         // it before the name was checked against `Builtin.roc`.
         "rev" | "reverse" => {
             expect(1, args.len())?;
-            let mut items = as_list(args[0].clone())?;
+            let mut items = as_list(&mut args[0])?;
             items.reverse();
-            Ok(Value::List(items))
+            Ok(Value::list(items))
         }
         // `Ok(first)` or `Err(ListWasEmpty)`, matching roc.
         "first" | "last" => {
             expect(1, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let items = peek(&args[0], name)?;
             let picked = if name == "first" { items.first() } else { items.last() };
             Ok(match picked {
                 Some(v) => Value::tag("Ok", vec![v.clone()]),
@@ -267,7 +286,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
         "get" => {
             expect(2, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let items = peek(&args[0], name)?;
             let index = match args[1] {
                 Value::Int(n) if n >= 0 => n as usize,
                 _ => usize::MAX,
@@ -289,11 +308,11 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                     out.push(item);
                 }
             }
-            Ok(Value::List(out))
+            Ok(Value::list(out))
         }
         "take_first" | "take_last" | "drop_first" | "drop_last" => {
             expect(2, args.len())?;
-            let items = as_list(args[0].clone())?;
+            let items = peek(&args[0], name)?;
             let n = match args[1] {
                 Value::Int(n) if n >= 0 => (n as usize).min(items.len()),
                 _ => 0,
@@ -304,7 +323,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                 "drop_first" => items[n..].to_vec(),
                 _ => items[..items.len() - n].to_vec(),
             };
-            Ok(Value::List(taken))
+            Ok(Value::list(taken))
         }
         // `fold_try` stops at the first `Err`, which is the whole point: the
         // accumulator is a Try and the fold short-circuits.
@@ -328,7 +347,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         // `.iter()` no longer materializes one — so this is where it becomes a list.
         "from_iter" => {
             expect(1, args.len())?;
-            Ok(Value::List(elements(args[0].clone(), name)?.collect()))
+            Ok(Value::list(elements(args[0].clone(), name)?.collect()))
         }
         "contains" => {
             expect(2, args.len())?;
@@ -498,9 +517,9 @@ fn hash_bytes(value: &Value) -> Option<Vec<u8>> {
         // A list or a tuple hashes as its elements in order; a tag as its name then its
         // payload. Records are not hashed — roc derives that from the shape, which
         // rocflight has no access to here.
-        Value::List(items) | Value::Tuple(items) => {
+        Value::List(_) | Value::Tuple(_) => {
             let mut bytes = Vec::new();
-            for item in items {
+            for item in value.sequence().expect("matched a sequence") {
                 bytes.extend(hash_bytes(item)?);
             }
             bytes
@@ -789,8 +808,11 @@ pub fn low_level_arity(name: &str) -> Option<usize> {
 /// Run one low-level op. `low_level_arity` decides what reaches here.
 fn call_low_level(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
     let wrong = |what: &str| EvalError { message: format!("{} needs {}", name, what) };
-    let list = |v: &Value| match v {
-        Value::List(items) => Ok(items.clone()),
+    // Moved out of `args`, so a list nothing else holds is mutated in place — which is
+    // what `Dict`'s bucket writes count on being cheap.
+    let mut args = args;
+    let list = |v: &mut Value| match std::mem::replace(v, Value::Unit) {
+        Value::List(items) => Ok(value::into_items(items)),
         other => Err(EvalError { message: format!("{} needs a List, got {}", name, other) }),
     };
     let index = |v: &Value| match v {
@@ -801,41 +823,51 @@ fn call_low_level(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         // "unsafe" means the CALLER has already proved the index is in bounds. Roc
         // elides the check; rocflight cannot elide a Rust bounds check, so an
         // out-of-range index is a message rather than a panic.
+        // A read: the list stays where it is, no copy.
         "list_get_unsafe" | "u8_list_get_unsafe" => {
-            let (items, i) = (list(&args[0])?, index(&args[1])?);
+            let i = index(&args[1])?;
+            let Value::List(items) = &args[0] else {
+                return Err(EvalError { message: format!("{} needs a List, got {}", name, args[0]) });
+            };
             items.get(i).cloned().ok_or_else(|| EvalError {
                 message: format!("{}: index {} is past the end of a list of {}", name, i, items.len()),
             })
         }
         "list_set_unsafe" => {
-            let (mut items, i) = (list(&args[0])?, index(&args[1])?);
+            let i = index(&args[1])?;
+            let mut items = list(&mut args[0])?;
             *items.get_mut(i).ok_or_else(|| wrong("an index within the list"))? = args[2].clone();
-            Ok(Value::List(items))
+            Ok(Value::list(items))
         }
         "list_swap_unsafe" => {
-            let (mut items, i, j) = (list(&args[0])?, index(&args[1])?, index(&args[2])?);
+            let (i, j) = (index(&args[1])?, index(&args[2])?);
+            let mut items = list(&mut args[0])?;
             if i >= items.len() || j >= items.len() {
                 return Err(wrong("two indices within the list"));
             }
             items.swap(i, j);
-            Ok(Value::List(items))
+            Ok(Value::list(items))
         }
         "list_append_unsafe" | "u8_list_append_unsafe" => {
-            let mut items = list(&args[0])?;
+            let mut items = list(&mut args[0])?;
             items.push(args[1].clone());
-            Ok(Value::List(items))
+            Ok(Value::list(items))
         }
         // Returns the new list paired with what was there, so a caller can reuse the
         // displaced value without a second lookup.
         "list_replace_unsafe" => {
-            let (mut items, i) = (list(&args[0])?, index(&args[1])?);
+            let i = index(&args[1])?;
+            let mut items = list(&mut args[0])?;
             let slot = items.get_mut(i).ok_or_else(|| wrong("an index within the list"))?;
             let prev = std::mem::replace(slot, args[2].clone());
-            Ok(Value::Record(vec![("list", Value::List(items)), ("prev", prev)]))
+            Ok(Value::Record(vec![("list", Value::list(items)), ("prev", prev)]))
         }
         // Capacity is a hint about allocation, which is not observable through the API.
-        "list_with_capacity" | "u8_list_with_capacity" => Ok(Value::List(Vec::new())),
-        "u8_list_len" => Ok(Value::Int(list(&args[0])?.len() as i128)),
+        "list_with_capacity" | "u8_list_with_capacity" => Ok(Value::list(Vec::new())),
+        "u8_list_len" => match &args[0] {
+            Value::List(items) => Ok(Value::Int(items.len() as i128)),
+            other => Err(EvalError { message: format!("{} needs a List, got {}", name, other) }),
+        },
         // `Hasher :: { state : U64 }`, and the digest IS the state: every `write_*`
         // has already mixed into it.
         "hasher_finish" => match &args[0] {
@@ -1217,7 +1249,7 @@ pub fn call_builtin_values(
                     })
                 }
             };
-            Ok(Value::List(
+            Ok(Value::list(
                 text.split(sep)
                     .map(|part| str_value(part.to_string()))
                     .collect(),
@@ -1253,7 +1285,7 @@ pub fn call_builtin_values(
                     })
                 }
             };
-            Ok(Value::List(
+            Ok(Value::list(
                 text.as_bytes().iter().map(|b| Value::Int(*b as i128)).collect(),
             ))
         }
@@ -1557,7 +1589,7 @@ fn inspect(value: &Value) -> String {
     // An OPAQUE nominal shows as `<opaque>`: roc will not print the inside of one, and
     // `AllSyntax`'s `Secret :: { key : Str }` relies on that to keep its key hidden.
     if matches!(value, Value::Record(_) | Value::Tag(..) | Value::Tuple(_))
-        && crate::vm::opaque_shapes().iter().any(|shape| shape.is_exactly(value))
+        && crate::vm::is_opaque(value)
     {
         return "<opaque>".to_string();
     }
@@ -1989,7 +2021,7 @@ fn json_read_as(
             cursor.space();
             if cursor.bytes.get(cursor.at) == Some(&b']') {
                 cursor.at += 1;
-                return Ok(Some(Value::List(items)));
+                return Ok(Some(Value::list(items)));
             }
             loop {
                 match json_read_as(cursor, &element)? {
@@ -2001,7 +2033,7 @@ fn json_read_as(
                     Some(b',') => cursor.at += 1,
                     Some(b']') => {
                         cursor.at += 1;
-                        return Ok(Some(Value::List(items)));
+                        return Ok(Some(Value::list(items)));
                     }
                     _ => return Ok(None),
                 }
@@ -2060,7 +2092,8 @@ fn json_encode(value: &Value) -> Result<String, EvalError> {
     Ok(match value {
         // A list drives each element's encoder and puts the separators in itself: the
         // element encoders know nothing about where they sit.
-        Value::List(items) | Value::Tuple(items) => {
+        Value::List(_) | Value::Tuple(_) => {
+            let items = value.sequence().expect("matched a sequence");
             let mut parts = Vec::with_capacity(items.len());
             for item in items {
                 parts.push(json_encode(item)?);
@@ -2115,7 +2148,8 @@ fn json_write(value: &Value) -> String {
         Value::Float(f) => f.to_string(),
         Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
         Value::Unit => "null".to_string(),
-        Value::List(items) | Value::Tuple(items) => {
+        Value::List(_) | Value::Tuple(_) => {
+            let items = value.sequence().expect("matched a sequence");
             let parts: Vec<String> = items.iter().map(json_write).collect();
             format!("[{}]", parts.join(","))
         }
@@ -2256,8 +2290,10 @@ impl JsonCursor<'_> {
         loop {
             self.space();
             let name = self.string()?;
-            // Field names outlive the program, as every other record's do.
-            let name: &'static str = Box::leak(name.into_boxed_str());
+            // Field names outlive the program, as every other record's do — interned,
+            // so a document with ten thousand objects leaks one copy of each name
+            // rather than ten thousand.
+            let name: &'static str = crate::memory::string_pool::intern(&name);
             self.space();
             if *self.bytes.get(self.at)? != b':' {
                 return None;
@@ -2284,7 +2320,7 @@ impl JsonCursor<'_> {
         self.space();
         if self.bytes.get(self.at) == Some(&b']') {
             self.at += 1;
-            return Some(Value::List(items));
+            return Some(Value::list(items));
         }
         loop {
             items.push(self.value()?);
@@ -2293,7 +2329,7 @@ impl JsonCursor<'_> {
                 b',' => self.at += 1,
                 b']' => {
                     self.at += 1;
-                    return Some(Value::List(items));
+                    return Some(Value::list(items));
                 }
                 _ => return None,
             }

@@ -185,14 +185,6 @@ impl Substitution {
         }
     }
 
-    /// Every variable this substitution binds.
-    ///
-    /// Used to follow unification in the other direction: a variable bound TO a
-    /// numeral's is as much a numeral as the original.
-    pub fn bound_vars(&self) -> Vec<u32> {
-        self.bindings.keys().copied().collect()
-    }
-
     /// Create empty substitution
     pub fn new() -> Self {
         Substitution {

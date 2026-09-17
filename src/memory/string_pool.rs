@@ -21,11 +21,10 @@ impl StringPool {
 
     /// Intern a string (get &'static str for this string)
     pub fn intern(&mut self, s: &str) -> &'static str {
-        // Check if already interned
-        for &interned in &self.strings {
-            if interned == s {
-                return interned;
-            }
+        // A hash lookup. This was a linear scan of the set, which made interning the
+        // n-th string cost n comparisons — quadratic over a file's literals.
+        if let Some(&interned) = self.strings.get(s) {
+            return interned;
         }
         // New string: leak it to get &'static str
         let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());

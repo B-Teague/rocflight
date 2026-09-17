@@ -209,7 +209,7 @@ fn low_level_ops_run() {
     let call = |name: &str, args: Vec<Value>| {
         call_builtin_values("LowLevel", name, args).unwrap_or_else(|e| panic!("{}: {}", name, e))
     };
-    let list = |ns: &[i128]| Value::List(ns.iter().map(|n| Value::Int(*n)).collect());
+    let list = |ns: &[i128]| Value::list(ns.iter().map(|n| Value::Int(*n)).collect());
 
     assert_eq!(call("list_get_unsafe", vec![list(&[7, 8, 9]), Value::Int(1)]).to_string(), "8");
     assert_eq!(

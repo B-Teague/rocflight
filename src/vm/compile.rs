@@ -842,23 +842,11 @@ impl Compiler {
                 Ok(())
             }
 
-            Expr::Let { name, value, body, .. } => {
-                self.bind(name, value, false)?;
-                let result = self.tail(body);
-                self.st().locals.pop();
+            Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => {
+                let (rest, pushed) = self.statements(e)?;
+                let result = self.tail(rest);
+                self.pop_locals(pushed);
                 result
-            }
-
-            Expr::VarDecl { name, value, body, .. } => {
-                self.bind(name, value, true)?;
-                let result = self.tail(body);
-                self.st().locals.pop();
-                result
-            }
-
-            Expr::Assign { name, value, body, .. } => {
-                self.assign(name, value)?;
-                self.tail(body)
             }
 
             // Every arm's body is in tail position too, so a function that is one
@@ -902,6 +890,164 @@ impl Compiler {
                 Ok(())
             }
         }
+    }
+
+    /// Compile the statements at the front of `e` — its `let`s, `var`s and
+    /// assignments — and answer the expression they lead to and how many locals they
+    /// pushed. A loop, not a recursion per statement: a block's depth is then bounded
+    /// by memory rather than by the Rust stack, which 6,000 statements overflowed.
+    ///
+    /// Each statement's instructions carry its own node, as they would have through
+    /// `expr`. The caller compiles the tail and pops the locals afterwards.
+    fn statements<'e>(&mut self, e: &'e Expr) -> Result<(&'e Expr, usize), String> {
+        let mut cursor = e;
+        let mut pushed = 0;
+        loop {
+            let enclosing = std::mem::replace(&mut self.node, cursor.id());
+            let next = match cursor {
+                Expr::Let { name, value, body, .. } => {
+                    pushed += 1;
+                    self.bind(name, value, false).map(|()| &**body)
+                }
+                // `var x = value` then the rest of the block. Like a `let`, except the
+                // binding may be assigned — which, compiled, is a write to its register.
+                Expr::VarDecl { name, value, body, .. } => {
+                    pushed += 1;
+                    self.bind(name, value, true).map(|()| &**body)
+                }
+                Expr::Assign { name, value, body, .. } => self.assign(name, value).map(|()| &**body),
+                other => {
+                    self.node = enclosing;
+                    return Ok((other, pushed));
+                }
+            };
+            self.node = enclosing;
+            cursor = next?;
+        }
+    }
+
+    fn pop_locals(&mut self, n: usize) {
+        let locals = &mut self.st().locals;
+        let keep = locals.len() - n;
+        locals.truncate(keep);
+    }
+
+    /// `xs.fold(init, f)` and `xs.map(f)` as a loop in THIS frame.
+    ///
+    /// The builtin versions re-enter the VM from Rust once per element — a fresh
+    /// machine, an argument `Vec` and a Rust frame each time — which was the whole of
+    /// `iter_range`'s 199ms. Compiled, each element is an `IterNext`, a move or two
+    /// and an ordinary `Call` on the same frame stack.
+    ///
+    /// Only for a receiver the checker proved is a list (or an iterator over one), and
+    /// only when no roc-defined method of that name is loaded, which the caller checks:
+    /// anything else still dispatches at run time. `None` when the method is not one
+    /// of these two.
+    fn list_loop(
+        &mut self,
+        method: &str,
+        receiver: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Reg>, String> {
+        let fold = match (method, args.len()) {
+            ("fold", 2) => true,
+            ("map", 1) => false,
+            _ => return Ok(None),
+        };
+        // The accumulator, or the list being built. Allocated first, so it sits below
+        // everything the loop uses and survives the temporaries being freed.
+        let dst = self.alloc()?;
+        if !fold {
+            self.emit(Op::MakeList { dst, base: dst, n: 0 });
+        }
+        let iter = self.expr(receiver)?;
+        self.reserve(iter)?;
+        let mark = self.st().next_reg;
+        let mut rest = args;
+        if fold {
+            let init = self.expr(&rest[0])?;
+            if init != dst {
+                self.emit(Op::Move { dst, src: init });
+            }
+            self.st().next_reg = mark;
+            rest = &rest[1..];
+        }
+        // A LITERAL lambda is compiled into the loop itself — no closure, no call —
+        // with its parameters bound to the loop's own registers. Its body sees the
+        // same names it would have captured, and they cannot have changed since:
+        // a captured `var` is refused outright. Only a body that stays put qualifies:
+        // a `return` would leave the enclosing function, a `break` its loop, and an
+        // assignment could reach a `var` the lambda would not have been allowed to.
+        let inline = match &rest[0] {
+            Expr::Lambda { params, body, .. }
+                if params.len() == if fold { 2 } else { 1 } && !escapes(body) =>
+            {
+                Some((params.clone(), body.clone()))
+            }
+            _ => None,
+        };
+        let func = if inline.is_some() {
+            0
+        } else {
+            let func = self.alloc()?;
+            let f = self.expr(&rest[0])?;
+            if f != func {
+                self.emit(Op::Move { dst: func, src: f });
+            }
+            self.st().next_reg = func + 1;
+            func
+        };
+        let idx = self.alloc()?;
+        self.constant(idx, Value::Int(0))?;
+        let item = self.alloc()?;
+
+        let top = self.here();
+        self.emit(Op::IterNext { dst: item, iter, idx, to: u32::MAX });
+        // The callback's arguments go in consecutive registers, where `Call` expects
+        // them; its frame then starts there.
+        let base = self.st().next_reg;
+        if let Some((params, body)) = inline {
+            let locals_before = self.st().locals.len();
+            let bound: &[(&'static str, Reg)] =
+                if fold { &[(params[0], dst), (params[1], item)] } else { &[(params[0], item)] };
+            for &(name, reg) in bound {
+                self.st().locals.push(Local { name, reg, is_var: false, captured: false });
+            }
+            let out = self.expr(&body)?;
+            self.st().locals.truncate(locals_before);
+            if fold {
+                if out != dst {
+                    self.emit(Op::Move { dst, src: out });
+                }
+            } else {
+                // `ListPush` takes its element out of the register. A body that is
+                // just a name answers with that name's own register, which must stay.
+                let src = if out < base {
+                    let copy = self.alloc()?;
+                    self.emit(Op::Move { dst: copy, src: out });
+                    copy
+                } else {
+                    out
+                };
+                self.emit(Op::ListPush { list: dst, src });
+            }
+        } else if fold {
+            self.reserve(base + 1)?;
+            self.emit(Op::Move { dst: base, src: dst });
+            self.emit(Op::Move { dst: base + 1, src: item });
+            self.emit(Op::Call { dst, func, base, argc: 2 });
+        } else {
+            self.reserve(base)?;
+            self.emit(Op::Move { dst: base, src: item });
+            // The result lands where the argument was: the callee's frame is dead by
+            // then, and it is pushed straight onto the list.
+            self.emit(Op::Call { dst: base, func, base, argc: 1 });
+            self.emit(Op::ListPush { list: dst, src: base });
+        }
+        self.emit(Op::Jump { to: top });
+        self.patch_to_here(top);
+        self.st().next_reg = dst + 1;
+        Ok(Some(dst))
     }
 
     /// Bind `name` to `value` in a fresh register, and push it as a local.
@@ -1026,10 +1172,10 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Let { name, value, body, .. } => {
-                self.bind(name, value, false)?;
-                let result = self.expr(body);
-                self.st().locals.pop();
+            Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => {
+                let (rest, pushed) = self.statements(e)?;
+                let result = self.expr(rest);
+                self.pop_locals(pushed);
                 result
             }
 
@@ -1247,20 +1393,6 @@ impl Compiler {
                 let dst = self.alloc()?;
                 self.emit(Op::MakeRange { dst, start: a, end: b, inclusive: *inclusive });
                 Ok(dst)
-            }
-
-            // `var x = value` then the rest of the block. Like a `let`, except the
-            // binding may be assigned — which, compiled, is a write to its register.
-            Expr::VarDecl { name, value, body, .. } => {
-                self.bind(name, value, true)?;
-                let result = self.expr(body);
-                self.st().locals.pop();
-                result
-            }
-
-            Expr::Assign { name, value, body, .. } => {
-                self.assign(name, value)?;
-                self.expr(body)
             }
 
             Expr::For { name, iterable, body, .. } => {
@@ -1561,6 +1693,15 @@ impl Compiler {
                     self.emit(Op::CallFn { dst, chunk, base: arg_base, argc });
                     return Ok(Some(dst));
                 }
+                // `List.fold(xs, init, f)` is `xs.fold(init, f)` with the receiver
+                // written first, and compiles to the same loop.
+                if *module == "List" {
+                    if let Some((receiver, rest)) = args.split_first() {
+                        if let Some(dst) = self.list_loop(name, receiver, rest)? {
+                            return Ok(Some(dst));
+                        }
+                    }
+                }
                 let name = self.names_run(&[module, name])?;
                 let (arg_base, argc) = self.arguments(args)?;
                 self.st().next_reg = arg_base;
@@ -1679,6 +1820,17 @@ impl Compiler {
         // the only candidate HERE is what made a loaded `Stream` answer `xs.map(f)`.
         let candidates: Vec<(&'static str, ChunkId, u16)> =
             if self.dispatch_modules.contains_key(&node) { candidates } else { Vec::new() };
+
+        // A list's `fold` or `map`, with nothing roc-defined answering to it: a loop
+        // in this frame rather than a builtin that re-enters the VM per element.
+        // `Iter` is what `.iter()` is declared to give; at run time it is the list.
+        if candidates.is_empty()
+            && matches!(self.dispatch_modules.get(&node), Some(&"List" | &"Iter"))
+        {
+            if let Some(dst) = self.list_loop(method, receiver, args)? {
+                return Ok(dst);
+            }
+        }
 
         // The receiver is the first argument either way — which is why roc's builtins
         // take their subject first: `xs.map(f)` is `List.map(xs, f)`.
@@ -1840,6 +1992,15 @@ impl Compiler {
     }
 }
 
+/// Would compiling this lambda body in place change where control goes?
+///
+/// Conservative: a `return` or `break` inside a NESTED lambda would be its own, but
+/// telling the two apart is not worth a mistake, and the fallback is only a call.
+fn escapes(e: &Expr) -> bool {
+    matches!(e, Expr::Return(..) | Expr::Break(_) | Expr::Assign { .. })
+        || e.children().into_iter().any(escapes)
+}
+
 /// A direct call's arity is known at compile time, so a wrong one need not wait for
 /// run time. The name makes it a better message than the tree-walker's.
 fn check_arity(name: &str, arity: u16, argc: u16) -> Result<(), String> {
@@ -1851,10 +2012,11 @@ fn check_arity(name: &str, arity: u16, argc: u16) -> Result<(), String> {
 
 /// `Module.name`, as one `&'static str` the name tables and lookups can share.
 ///
-/// Leaked, like every other identifier the parser produces: these live as long as the
-/// program does.
+/// Interned, like the identifiers the parser produces: this is asked for every
+/// qualified name the compiler meets, and the same `Str.concat` should not leak a
+/// fresh copy per call site.
 fn qualify(module: &str, name: &str) -> &'static str {
-    Box::leak(format!("{}.{}", module, name).into_boxed_str())
+    crate::memory::string_pool::intern(&format!("{}.{}", module, name))
 }
 
 fn func_name(func: &Expr) -> &'static str {

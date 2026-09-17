@@ -167,10 +167,32 @@ strings                        30ms                  5ms           5ms
 
 `strings` and `list_ops` are unchanged by the VM, because they are bound by allocation
 rather than by dispatch — which the plan predicted before any of it was written.
+What is left of `iter_range` is the VM's ordinary per-instruction cost: four
+instructions per element, at the same rate `loop` runs them.
 
-Four ceilings are gone rather than merely improved:
+Eight ceilings are gone rather than merely improved:
 
 - List work is **linear**, not quadratic.
+- Passing a list to a function is a **refcount bump**, not a copy. A register move
+  used to deep-copy a `Vec`, so a loop that handed 8,000 elements to each iteration
+  took four seconds; it takes six milliseconds, and `tests/bench/list_pass.roc` keeps
+  it that way.
+- Type-checking a block is **linear in its bindings**: every `let` used to rebuild the
+  set of numeral-tainted variables and walk the whole environment, so 3,000 bindings
+  cost 1.5 seconds. They cost 11 milliseconds.
+- A chain of statements is walked in a **loop**, not a Rust frame per statement, in
+  the parser, the checker and the compiler alike. 6,000 statements in one block
+  overflowed the stack; 20,000 run in 48 milliseconds, and the next limit is the
+  65,535 registers a frame may have. A file of 100,000 top-level declarations runs
+  too, though top-level names are still found by a linear scan, so it takes seconds.
+- `fold` and `map` on a list are **compiled into the frame** when the checker has
+  proved the receiver is a list and no roc-defined method answers to the name. The
+  builtin re-entered the VM from Rust once per element, with a fresh machine and an
+  argument `Vec` each time; a compiled loop makes the callback an ordinary `Call`. And
+  when the callback is a **literal lambda** whose body has no `return`, `break` or
+  assignment, the body is compiled into the loop with its parameters bound to the
+  loop's registers, so there is no call at all. `iter_range`, two million elements
+  folded: 199ms to 90ms.
 - Building a 40,000-character string peaks at 6 MB where it used to reach **710 MB**.
 - Recursion is heap-allocated frames, so 500,000 levels run in 4 MB — the tree-walker
   exhausted a 256 MB reserved stack at 200,000 — and a **tail call reuses its frame**,
@@ -179,7 +201,7 @@ Four ceilings are gone rather than merely improved:
 
 Names are resolved once, at compile time: a local is a register, a captured variable an
 index, a top-level name a slot, a top-level function a chunk id. Nothing compares a
-string at run time. `Value` is **32 bytes** (it was 80), with a guard test to keep it
+string at run time. `Value` is **48 bytes** (it was 80), with a guard test to keep it
 there, and the crate is `#![forbid(unsafe_code)]` — it contained exactly one `unsafe`, a
 lifetime transmute around the AST, and removing the lifetime removed the need for it.
 
@@ -226,6 +248,10 @@ compiler is worse than one that says where it doesn't:
   a type's `encoder_for` runs, but another format would need the real thing.
 - Iterators and `.iter()` are eager: `map` over a range still builds its output list.
 - `where` constraints are read for the names they promise, not verified.
+- A frame has at most 65,535 registers, and every `let` in a block takes one, so a
+  single block of that many bindings is refused at compile time.
+- A cyclic record type (`{ ..p, next: p }`) is refused by `roc` as anonymous recursion;
+  the checker here reports nothing and the program runs. It used to crash the checker.
 
 Full list, with the reasoning for each, in `IMPLEMENTATION_PHASES.md`; the builtin ones
 in `BUILTIN_PLAN.md`.

@@ -44,8 +44,17 @@ pub enum Value {
     Record(Vec<(&'static str, Value)>),
     /// Boolean.
     Bool(bool),
-    /// List value.
-    List(Vec<Value>),
+    /// A list.
+    ///
+    /// Behind an `Rc`, because a `Value` is cloned on every register move, every
+    /// argument and every global read, and a `Vec` clone is a copy of every element.
+    /// Passing a list to a function was therefore linear in its length, and a loop
+    /// that passed one on each iteration was quadratic: 8,000 elements took four
+    /// seconds. roc itself refcounts lists for the same reason.
+    ///
+    /// Build one with `Value::list`; take the `Vec` back out with `into_items`, which
+    /// copies only if something else still holds the list.
+    List(std::rc::Rc<Vec<Value>>),
     /// Tuple value. Fixed length, elements may differ in type.
     Tuple(Vec<Value>),
     /// A range of integers, `start` to `end`, `end` included only if `inclusive`.
@@ -71,6 +80,26 @@ impl Value {
     pub fn tag(name: &'static str, payload: Vec<Value>) -> Value {
         Value::Tag(name, std::rc::Rc::new(payload))
     }
+
+    /// A list value. Wraps the elements so call sites stay readable.
+    pub fn list(items: Vec<Value>) -> Value {
+        Value::List(std::rc::Rc::new(items))
+    }
+
+    /// The elements of `List` or a `Tuple`, for the operations that treat them alike.
+    pub fn sequence(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(items) => Some(items),
+            Value::Tuple(items) => Some(items),
+            _ => None,
+        }
+    }
+}
+
+/// A list's elements as an owned `Vec`: moved out when nothing else holds the list,
+/// copied otherwise. This is the same rule roc uses to mutate a unique list in place.
+pub fn into_items(items: std::rc::Rc<Vec<Value>>) -> Vec<Value> {
+    std::rc::Rc::try_unwrap(items).unwrap_or_else(|shared| (*shared).clone())
 }
 
 impl fmt::Debug for Value {
