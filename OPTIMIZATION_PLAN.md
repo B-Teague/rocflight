@@ -1432,9 +1432,9 @@ The reason is a correctness property worth more than the milliseconds: **edit a 
 file and it takes effect.** A disk cache buys 1-3ms of parse time and owes staleness
 detection, a cache key that has to include every input that can change a result (the
 file, its imports, the platform, the interpreter's own version), and a class of bug where
-the interpreter disagrees with the file on screen. `.rocflight/cache/desugared/` stays
-what it is: an opt-in, write-only dump for inspection under `--emit-desugared`, never
-read back.
+the interpreter disagrees with the file on screen. Nothing is written to disk and
+nothing is read back between runs: the desugaring is an in-memory step, inspectable
+under a debug build's `--show-desugared`.
 
 In memory, within one process, caching is free of all of that — the process cannot
 observe a mid-run edit anyway:

@@ -39,8 +39,8 @@ The interpreter features:
 
 ## 🔄 Desugaring Pipeline
 
-Every Roc source file passes through the desugarer before parsing. The emitted file
-is written to `.rocflight/cache/desugared/` and must itself pass `roc check`.
+Every Roc source file passes through the desugarer before parsing. What it emits must
+itself pass `roc check`.
 
 | Pass | Transformation | Status | Phase |
 |------|---|---|---|

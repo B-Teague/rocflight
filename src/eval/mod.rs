@@ -1083,48 +1083,6 @@ pub fn call_builtin_values(
                 }),
             }
         }
-        // Effects from a real platform. `Stdout.line!` and friends are declared by
-        // the platform but implemented in its compiled host, so the ones this
-        // interpreter can run are implemented here and the rest are reported as a
-        // gap rather than as an unknown name.
-        ("Stdout", "line!") | ("Stderr", "line!") => {
-            if args.len() != 1 {
-                return Err(EvalError {
-                    message: format!("{}.{} expects 1 argument, got {}", module, name, args.len()),
-                });
-            }
-            let text = match &args[0] {
-                Value::Str(s) => s.to_string(),
-                other => other.to_string(),
-            };
-            if module == "Stderr" {
-                eprintln!("{}", text);
-            } else {
-                println!("{}", text);
-            }
-            // `line! : Str => Try({}, [StdoutErr(IOErr), ..])`
-            Ok(Value::tag("Ok", vec![Value::Unit]))
-        }
-        ("Stdout", "write!") | ("Stderr", "write!") => {
-            if args.len() != 1 {
-                return Err(EvalError {
-                    message: format!("{}.{} expects 1 argument, got {}", module, name, args.len()),
-                });
-            }
-            let text = match &args[0] {
-                Value::Str(s) => s.to_string(),
-                other => other.to_string(),
-            };
-            use std::io::Write;
-            if module == "Stderr" {
-                eprint!("{}", text);
-                let _ = std::io::stderr().flush();
-            } else {
-                print!("{}", text);
-                let _ = std::io::stdout().flush();
-            }
-            Ok(Value::tag("Ok", vec![Value::Unit]))
-        }
         ("Str", "is_empty") => {
             if args.len() != 1 {
                 return Err(EvalError {
@@ -1299,15 +1257,27 @@ pub fn call_builtin_values(
             }
             Ok(str_value(result))
         }
-        _ => Err(EvalError {
-            // A platform that declares this really does provide it; the gap is
-            // this interpreter's, and the message should say which.
-            message: if crate::platform::real::is_declared(module, name) {
-                crate::platform::real::describe_gap(module, name)
-            } else {
-                format!("Unknown function {}.{}", module, name)
-            },
-        }),
+        _ => {
+            // A platform's hosted effect: the host's own code, reached through the
+            // registry when rocflight is linked into that host.
+            if let Some(answer) = crate::platform::hosted::call(module, name, &args) {
+                return answer.map_err(|message| EvalError { message });
+            }
+            Err(EvalError {
+                // A platform that declares this really does provide it: the gap is
+                // that its signature could not be laid out for the host (a type the
+                // loaded modules do not declare), and `--show-platforms` names which.
+                message: if crate::platform::real::is_declared(module, name) {
+                    format!(
+                        "`{}.{}` is an effect the platform declares, but its signature could \
+                         not be laid out for the host; run with --show-platforms to see why",
+                        module, name
+                    )
+                } else {
+                    format!("Unknown function {}.{}", module, name)
+                },
+            })
+        }
     }
 }
 
@@ -1643,7 +1613,7 @@ pub fn run_expect(value: &Value) -> Result<(), EvalError> {
         Value::Bool(true) => Ok(()),
         Value::Bool(false) => {
             ASSERT_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("Expect failed: expect failed");
+            report(Report::ExpectFailed, "expect failed");
             Ok(())
         }
         other => Err(EvalError {
@@ -1658,7 +1628,7 @@ pub fn run_test_expect(value: &Value) -> Result<(), EvalError> {
     match value {
         Value::Bool(false) => {
             expect_failed();
-            eprintln!("Expect failed: expect failed");
+            report(Report::ExpectFailed, "expect failed");
             Ok(())
         }
         _ => run_expect(value),
@@ -1667,7 +1637,34 @@ pub fn run_test_expect(value: &Value) -> Result<(), EvalError> {
 
 /// `dbg value` — to stderr, so it never mixes into a program's output.
 pub fn run_dbg(value: &Value) {
-    eprintln!("[dbg] {}", inspect(value));
+    report(Report::Dbg, &inspect(value));
+}
+
+/// What a program has to say outside its output: a `dbg`, a failed inline `expect`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Report {
+    Dbg,
+    ExpectFailed,
+}
+
+/// Where reports go. By default to stderr, the way `roc` prints them. When rocflight
+/// is linked into a platform's host the host owns the process and its `roc_dbg` /
+/// `roc_expect_failed` are what should hear them, so the host installs itself here.
+static REPORTER: std::sync::OnceLock<fn(Report, &str)> = std::sync::OnceLock::new();
+
+/// Route reports to `to` for the rest of the process. Only the first caller wins.
+pub fn set_reporter(to: fn(Report, &str)) {
+    let _ = REPORTER.set(to);
+}
+
+fn report(kind: Report, message: &str) {
+    match REPORTER.get() {
+        Some(to) => to(kind, message),
+        None => match kind {
+            Report::Dbg => eprintln!("[dbg] {}", message),
+            Report::ExpectFailed => eprintln!("Expect failed: {}", message),
+        },
+    }
 }
 
 /// `crash "message"`. A Str crashes with its text; anything else with its rendering.

@@ -16,6 +16,12 @@ pub mod cache;
 pub mod module;
 pub mod host;
 pub mod real;
+pub mod layout;
+pub mod marshal;
+pub mod abi;
+pub mod hosted;
+pub mod modules;
+pub mod driver;
 pub mod resolve;
 
 pub use loader::PlatformLoader;

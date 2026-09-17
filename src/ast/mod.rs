@@ -151,6 +151,20 @@ pub fn fresh_node_like(other: &Expr) -> NodeId {
     fresh_node(offset as usize)
 }
 
+/// How many nodes exist so far: a watermark, so nodes made after a point — another
+/// file's — can be told from the ones before it.
+pub fn node_count() -> usize {
+    NODES.with(|n| n.borrow().offsets.len())
+}
+
+/// Where a node started in its source, if that was recorded.
+pub fn offset_of(id: NodeId) -> Option<usize> {
+    NODES.with(|n| {
+        let offset = *n.borrow().offsets.get(id.index())?;
+        (offset != UNKNOWN).then_some(offset as usize)
+    })
+}
+
 /// Move a node to a different offset.
 ///
 /// For a node built somewhere that did not know where it was: the free functions that

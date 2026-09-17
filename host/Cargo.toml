@@ -1,0 +1,16 @@
+[package]
+name = "rocflight-host"
+version = "0.1.0"
+edition = "2021"
+description = "rocflight as the `app` a Roc platform's compiled host links against"
+
+# A static library: it fills the `app` slot in a platform's link recipe
+# (`targets: { x64musl: { inputs: ["crt1.o", "libhost.a", "libunwind.a", app, "libc.a"] } }`)
+# and exports the one symbol the host imports, `roc_main`. Built only by
+# `tests/check_host.sh`, for `x86_64-unknown-linux-musl`. See PLATFORM_HOST_PLAN.md.
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+rocflight = { path = ".." }

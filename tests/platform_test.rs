@@ -174,21 +174,3 @@ fn a_compiler_pin_is_skipped_rather_than_fetched() {
     let deps = vec![("roc".to_string(), "nightly-2026-09-03".to_string(), false)];
     assert!(real::verify_app(&deps, &[]).is_ok());
 }
-
-// --- the architectural limit ----------------------------------------------
-
-#[test]
-fn effects_this_interpreter_implements_are_listed() {
-    assert!(real::is_implemented("Stdout", "line!"));
-    assert!(real::is_implemented("Stderr", "write!"));
-    assert!(!real::is_implemented("File", "read_line!"));
-}
-
-#[test]
-fn a_declared_but_unrunnable_effect_explains_why() {
-    // The platform really does provide it; the gap is this interpreter's, and the
-    // message must say so rather than claiming the name is unknown.
-    let gap = real::describe_gap("File", "read_line!");
-    assert!(gap.contains("compiled host"), "got {}", gap);
-    assert!(gap.contains("Stdout.line!"), "it should say what IS available: {}", gap);
-}

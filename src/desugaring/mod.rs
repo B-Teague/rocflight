@@ -88,38 +88,6 @@ impl Desugarer {
 
 
 
-    /// Save desugared output to cache directory (both debug and release builds)
-    /// Cache structure: .rocflight/cache/desugared/<original_path>.desugared.roc
-    pub fn save_debug(&self, original_path: &str, desugared: &str) -> Result<(), std::io::Error> {
-        // Create cache directory structure
-        let cache_dir = ".rocflight/cache/desugared";
-        std::fs::create_dir_all(cache_dir)?;
-
-        // Create desugared file path in cache
-        // Use the original path as part of the cache filename for clarity
-        let filename = original_path
-            .replace("/", "_")
-            .replace("\\", "_")
-            .replace(".", "_");
-        let cache_path = format!("{}/{}.desugared.roc", cache_dir, filename);
-
-        // Write desugared content to cache
-        std::fs::write(&cache_path, desugared)?;
-        eprintln!("[Desugaring] Cached to: {}", cache_path);
-
-        Ok(())
-    }
-
-    /// Clear the desugaring cache
-    /// Call this when the binary is rebuilt to ensure fresh desugaring
-    pub fn clear_cache() -> Result<(), std::io::Error> {
-        let cache_dir = ".rocflight/cache/desugared";
-        if std::path::Path::new(cache_dir).exists() {
-            std::fs::remove_dir_all(cache_dir)?;
-            eprintln!("[Desugaring] Cache cleared: {}", cache_dir);
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

@@ -9,13 +9,20 @@ Two goals, in this order:
    feature is verified against the real `roc` binary, and a divergence is a bug.
 2. **As close to bare metal as safe Rust reaches.** Every optimization is measured
    against a benchmark suite, and none of them is allowed to cost goal 1. It began as a
-   tree-walker; a register VM replaced it, in safe Rust throughout — no `unsafe`, no
-   loss of Rust's memory-safety guarantees.
+   tree-walker; a register VM replaced it, in safe Rust throughout — no `unsafe` in
+   the interpreter, no loss of Rust's memory-safety guarantees. The one exception is
+   `host/`, the small crate that hands values to a platform's compiled host, which
+   is foreign code by definition (see `PLATFORM_HOST_PLAN.md`).
 
 ```bash
+cargo build -p rocflight-host --release --target x86_64-unknown-linux-musl  # once; needs `rustup target add x86_64-unknown-linux-musl`
 cargo build --release
 ./target/release/rocflight path/to/main.roc
 ```
+
+The first line builds the interpreter as a platform's `app`; the second embeds it, so
+the release binary is self-contained — copy it anywhere. Running an app on a real
+platform links the two together with `zig` (on the path), once per platform.
 
 ---
 
@@ -96,34 +103,62 @@ or WebAssembly.
 
 | | |
 |---|---|
-| Golden pairs | **98 / 98** across 20 phases |
-| Rust tests | **533** |
-| Language examples | **19 of 19** comparable ones match `roc` byte for byte |
+| Golden pairs | **99 / 99** across 20 phases |
+| Rust tests | **535** |
+| Language examples | **20** match `roc` byte for byte — Snake among them, on basic-cli's real host, including a whole game played key by key; 7 platform apps pending on language gaps (`PLATFORM_HOST_PLAN.md`) |
 | `Builtin.roc` | **12 of 12** members parse; 1,443 definitions in Roc, 1,109 intrinsics in Rust |
 
 ```bash
 tests/check_roc.sh --strict     # the 98 pairs — the definition of done
 tests/check_examples.sh         # roc-lang.org's own examples
 tests/check_builtin.sh --strict # the vendored Builtin.roc still parses
+tests/check_host.sh             # linked into basic-cli's real host, calling its effects
 cargo test --quiet              # the Rust side
 tests/bench.sh                  # performance, against a saved baseline
 ```
 
-Nine of the 28 examples can't be compared at all: `roc` itself refuses them with this
-compiler build, mostly platforms built for a different version. They're listed with
-their reasons in `tests/check_examples.sh`. Every one of the other 19 matches byte for
-byte, `Dict` and `Set` included — those run `Builtin.roc`'s own open-addressing table
-rather than a Rust stand-in. See `BUILTIN_PLAN.md`.
+Eight of the 28 examples are apps on basic-cli's compiled host. rocflight does not
+re-implement that host: `rocflight main.roc` links the interpreter INTO it — the
+platform's own recipe, `zig`'s lld, once per platform, about 100 ms — and runs the
+result, so `Stdout.line!` is the platform's Roc calling the platform's C. Snake runs
+that way and matches `roc` byte for byte. The other seven are PENDING on language gaps
+their platform modules expose (a string literal standing for a `Path`, package
+imports, two inference cases); `tests/check_examples.sh --strict` makes those fatal.
+The plan and what it measured is `PLATFORM_HOST_PLAN.md`. One example `roc` itself
+rejects. Every one of the other 19 matches byte for byte, `Dict` and `Set` included —
+those run `Builtin.roc`'s own open-addressing table rather than a Rust stand-in. See
+`BUILTIN_PLAN.md`.
 
-### CLI Options
+### The command line
 
---show-desugared    Print the desugared source before running");
---show-ast          Print the AST and its inferred type, then run");
---ast-only          Print the AST and its inferred type, do not run");
---emit-desugared    Write the desugared source to .rocflight/cache/");
---show-platforms    Report each real platform the app resolves");
---test              Run the file's `expect`s and report, like `roc test`");
---clear-cache       Delete .rocflight/cache/desugared and exit");
+It is `roc`'s, minus everything an interpreter has no business doing — there is no
+`build`, `bundle`, `install`, `glue`, `fmt`, `docs` or `repl`, and none of `roc`'s
+options, which all configure codegen, caching or parallelism that rocflight does not
+have. What is left is the part that runs a program:
+
+```
+rocflight [ROC_FILE] [ARGS]...   run it (default: main.roc, as `roc` does); the rest is the app's
+rocflight test [ROC_FILE]        run the file's top-level `expect`s, like `roc test`
+rocflight version                print the version
+rocflight help                   print the above
+```
+
+An app on a real platform is run by linking the interpreter into that platform's
+host. The release binary carries what it needs for that (`build.rs` embeds
+`librocflight_host.a`; the driver extracts it into `~/.cache/rocflight` on first use),
+and looks beside itself or at `ROCFLIGHT_LIB` first for development. `zig` must be on
+the path: it is the linker, as it is for basic-cli's own builds.
+
+There are no `--` options in the release binary, on purpose: everything that was one
+was a development aid, and a switch that changes how a program runs is a way to run it
+against something other than the real interpreter. `Builtin.roc` is the clearest case —
+it used to be selectable with `--load-builtins`, and it is not a choice, it is the
+runtime. Which of its members load is read off the source, every time.
+
+The pipeline can still be inspected, in **debug builds only**, where `rocflight help`
+lists `--show-desugared`, `--show-ast`, `--ast-only`, `--show-platforms` and
+`--builtins`. The release binary rejects all of them as unknown arguments, and the
+blocks behind them are compiled out of it entirely.
 
 ### How parity is enforced
 

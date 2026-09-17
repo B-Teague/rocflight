@@ -1,15 +1,11 @@
 //! Reading a real platform's Roc sources.
 //!
-//! What this can and cannot do, stated plainly:
-//!
-//! * It CAN read a platform's `.roc` sources — the `requires` entry-point type, the
-//!   `exposes` module list, the `hosted` symbol names, and each exposed module's
-//!   declared members with their signatures.
-//! * It CANNOT execute a platform's effects. A `hosted` function is implemented in the
-//!   platform's compiled host (`.a` / `.rh` files next to the sources); an
-//!   interpreter has nothing to call. So an effect runs only where this interpreter
-//!   supplies its own implementation, and otherwise reports exactly which one is
-//!   missing. That limit is architectural, not an oversight.
+//! This reads what a platform's header declares — the `requires` entry-point type, the
+//! `exposes` module list, the `hosted` symbol map, the `provides` entry, the link
+//! recipe — and each exposed module's declared members with their signatures. It
+//! implements none of the platform's effects: those are the host's compiled code,
+//! reached by linking the interpreter into that host (`platform::driver`) and calling
+//! through `platform::hosted`. Nothing a platform provides is re-implemented here.
 //!
 //! Shapes verified against basic-cli 0.22.0 on nightly-2026-09-03:
 //!
@@ -31,7 +27,7 @@
 //! }
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A platform read from its cached sources.
 #[derive(Debug, Clone)]
@@ -44,11 +40,12 @@ pub struct RealPlatform {
     pub exposes: Vec<String>,
     /// The entry-point signature from `requires { main! : ... }`, verbatim.
     pub requires: Option<String>,
-    /// Symbol names from the root's `hosted { "name": ..., }` block.
-    ///
-    /// Recorded so an unimplemented effect can be reported as "the platform declares
-    /// it, this interpreter does not implement it" rather than "unknown function".
-    pub hosted: Vec<String>,
+    /// The root's `hosted { "symbol": Host.member!, … }` block, in its order — which
+    /// is the host's dispatch order — as `(symbol, member)`.
+    pub hosted: Vec<(String, String)>,
+    /// The function `provides { "roc_main": main_for_host! }` names: what the host
+    /// calls, defined in Roc at the bottom of the platform's `main.roc`.
+    pub provides: Option<String>,
 }
 
 /// One member an exposed module declares, with its signature as written.
@@ -71,6 +68,7 @@ impl RealPlatform {
             exposes: parse_exposes(&text),
             requires: parse_requires(&text),
             hosted: parse_hosted(&text),
+            provides: parse_provides(&text),
         })
     }
 
@@ -144,8 +142,48 @@ fn parse_requires(text: &str) -> Option<String> {
     Some(inner.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
-/// Extract the symbol names from `hosted { "name": ..., }`.
-fn parse_hosted(text: &str) -> Vec<String> {
+/// The Roc after the platform header in `main.roc`: its imports and the function
+/// `provides` names. Parsed as a module of its own, it is what the host's `roc_main`
+/// runs — the exit-code mapping is the platform's Roc, not rocflight's.
+///
+/// The header is `platform ""` and its indented entries; the tail starts at the first
+/// unindented line after it.
+pub fn entry_source(text: &str) -> String {
+    let mut lines = text.lines();
+    for line in lines.by_ref() {
+        if line.starts_with("platform") {
+            break;
+        }
+    }
+    let tail: Vec<&str> = lines
+        .skip_while(|l| l.is_empty() || l.starts_with(['\t', ' ']) || l.starts_with('#'))
+        .collect();
+    tail.join("\n")
+}
+
+/// The link recipe for `target` from `targets: { x64musl: { inputs: [...] } }`, with
+/// the platform's files as names and the `app` slot as `"app"`.
+pub fn link_inputs(text: &str, target: &str) -> Option<Vec<String>> {
+    let line = text.lines().find(|l| l.trim_start().starts_with(&format!("{}:", target)))?;
+    let list = &line[line.find('[')? + 1..line.rfind(']')?];
+    Some(
+        list.split(',')
+            .map(|item| item.trim().trim_matches('"').to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    )
+}
+
+/// The entry point `provides { "roc_main": main_for_host! }` names.
+fn parse_provides(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| l.trim_start().starts_with("provides"))?;
+    let after = &line[line.find(':')? + 1..];
+    let name = after.trim().trim_end_matches('}').trim().trim_end_matches(',');
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Extract `(symbol, member)` pairs from `hosted { "symbol": Host.member!, }`.
+fn parse_hosted(text: &str) -> Vec<(String, String)> {
     let Some(start) = text.find("hosted") else {
         return Vec::new();
     };
@@ -170,19 +208,14 @@ fn parse_hosted(text: &str) -> Vec<String> {
         }
     }
 
-    let mut names = Vec::new();
-    let mut rest = &after[open..end];
-    while let Some(q) = rest.find('"') {
-        rest = &rest[q + 1..];
-        match rest.find('"') {
-            Some(close) => {
-                names.push(rest[..close].to_string());
-                rest = &rest[close + 1..];
-            }
-            None => break,
-        }
-    }
-    names
+    after[open..end]
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (symbol, member) = line.strip_prefix('"')?.split_once("\": ")?;
+            Some((symbol.to_string(), member.trim().trim_end_matches(',').to_string()))
+        })
+        .collect()
 }
 
 /// Extract `name : signature` declarations from a module.
@@ -265,21 +298,6 @@ pub fn load(alias: &str, url: &str) -> Result<RealPlatform, String> {
     RealPlatform::read(alias, sources)
 }
 
-/// Where a platform's compiled host lives, if it is present.
-///
-/// Only used to explain why an effect cannot run: the host is native code, so finding
-/// it does not make it callable from an interpreter.
-pub fn host_artifacts(sources: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(sources) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .filter(|n| n.ends_with(".a") || n.ends_with(".rh") || n.ends_with(".rm"))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,7 +321,22 @@ mod tests {
     #[test]
     fn hosted_symbol_names_are_collected() {
         let text = "\thosted {\n\t\t\"hosted_stdout_line\": Host.stdout_line!,\n\t\t\"hosted_dir_list\": Host.dir_list!,\n\t}\n";
-        assert_eq!(parse_hosted(text), vec!["hosted_stdout_line", "hosted_dir_list"]);
+        assert_eq!(
+            parse_hosted(text),
+            vec![
+                ("hosted_stdout_line".to_string(), "Host.stdout_line!".to_string()),
+                ("hosted_dir_list".to_string(), "Host.dir_list!".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn the_header_tail_and_link_recipe_are_read() {
+        let text = "platform \"\"\n\trequires { main! : A }\n\tprovides { \"roc_main\": main_for_host! }\n\ttargets: {\n\t\tx64musl: { inputs: [\"crt1.o\", \"libhost.a\", app, \"libc.a\"] },\n\t}\n\nimport Stderr\n\nmain_for_host! = |args| 0\n";
+        assert_eq!(parse_provides(text).as_deref(), Some("main_for_host!"));
+        assert_eq!(entry_source(text), "import Stderr\n\nmain_for_host! = |args| 0");
+        assert_eq!(link_inputs(text, "x64musl").unwrap(), ["crt1.o", "libhost.a", "app", "libc.a"]);
+        assert!(link_inputs(text, "x64mac").is_none());
     }
 
     #[test]
@@ -336,46 +369,11 @@ mod tests {
     }
 }
 
-/// Effects this interpreter implements itself, by platform module and member.
-///
-/// A platform's `hosted` functions live in its compiled host — native code a
-/// tree-walking interpreter cannot call. So an effect runs only where there is an
-/// implementation here. This table says which, and `describe_gap` explains the rest.
-pub const IMPLEMENTED: &[(&str, &str)] = &[
-    ("Stdout", "line!"),
-    ("Stdout", "write!"),
-    ("Stderr", "line!"),
-    ("Stderr", "write!"),
-];
-
-/// Is `Module.member` an effect this interpreter can run?
-pub fn is_implemented(module: &str, member: &str) -> bool {
-    IMPLEMENTED.iter().any(|(m, f)| *m == module && *f == member)
-}
-
-/// Explain why an effect the platform declares cannot be run here.
-///
-/// Kept separate from "unknown function" on purpose: the platform really does provide
-/// it, and the gap is this interpreter's, so the message should say so.
-pub fn describe_gap(module: &str, member: &str) -> String {
-    format!(
-        "`{}.{}` is provided by the platform's compiled host, which this interpreter \
-         cannot call. Implemented natively here: {}",
-        module,
-        member,
-        IMPLEMENTED
-            .iter()
-            .map(|(m, f)| format!("{}.{}", m, f))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
 /// Check an app's dependencies and imports against the platforms they name.
 ///
 /// Run before evaluation so a mistake is reported against the platform's own sources —
-/// "the platform does not expose that", "the platform declares that effect but this
-/// interpreter cannot run it" — rather than surfacing later as an unknown name.
+/// "the platform does not expose that" — rather than surfacing later as an unknown
+/// name.
 ///
 /// Returns the platforms that were loaded, so a caller can report what it found.
 pub fn verify_app(

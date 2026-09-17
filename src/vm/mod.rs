@@ -100,7 +100,7 @@ pub fn call_closure(closure: &Rc<Closure>, args: Vec<Value>) -> Result<Value, Ev
     // A fresh register file per callback. Pooling them across callbacks was measured
     // on `iter_range` (two million of these) and saved nothing: the allocation is not
     // where a callback's time goes. Lowering `fold` and `map` into bytecode is.
-    let mut vm = Vm { program, regs: Vec::new(), frames: Vec::new(), globals };
+    let mut vm = Vm { program, regs: Vec::new(), frames: Vec::new(), globals, entry_args: None };
     vm.call(closure, args)
 }
 
@@ -496,7 +496,14 @@ pub fn eval(ast: &crate::ast::Expr) -> Result<Value, EvalError> {
 /// The return value is the entry point's, or the top level's if there is none — which
 /// is what a module is.
 pub fn run(program: &Rc<Program>) -> Result<Value, EvalError> {
+    run_with_args(program, None)
+}
+
+/// Run, handing the entry point `args` — what a platform's host passes to `main!`.
+/// `None` is an empty argument list, which is all a platformless run can offer.
+pub fn run_with_args(program: &Rc<Program>, args: Option<Value>) -> Result<Value, EvalError> {
     let mut vm = Vm::new(program);
+    vm.entry_args = args;
     // Installed for as long as this program runs, so a builtin's callback can find the
     // machine to run a closure on.
     RUNNING.with(|r| r.borrow_mut().push((Rc::clone(program), Rc::clone(&vm.globals))));
@@ -514,12 +521,13 @@ impl Vm {
         match entry {
             None => Ok(value),
             // `main! : List(Str) => ...`, and the arity-0 spelling is also accepted.
-            //
-            // ponytail: argv is always empty, as in the tree-walker — real arguments
-            // need the host to supply them.
+            // The arguments are the host's to give; without one there are none.
             Some((chunk, arity)) => {
-                let args =
-                    if arity == 0 { Vec::new() } else { vec![Value::list(Vec::new())] };
+                let args = if arity == 0 {
+                    Vec::new()
+                } else {
+                    vec![self.entry_args.take().unwrap_or_else(|| Value::list(Vec::new()))]
+                };
                 self.call_chunk(chunk, args)
             }
         }
@@ -535,6 +543,8 @@ pub struct Vm {
     /// Top-level values, by slot. `None` until the top level assigns it, which is how
     /// a use-before-definition becomes a message instead of a wrong answer.
     globals: Globals,
+    /// What the entry point is called with, when a host supplied it. Taken on use.
+    entry_args: Option<Value>,
 }
 
 impl Vm {
@@ -544,6 +554,7 @@ impl Vm {
             regs: Vec::new(),
             frames: Vec::new(),
             globals: Rc::new(RefCell::new(vec![None; program.n_globals])),
+            entry_args: None,
         }
     }
 
@@ -910,7 +921,9 @@ impl Vm {
                     _ => ip = to as usize,
                 },
                 Op::TestRecord { obj, to } => {
-                    if !matches!(regs[base + obj as usize], Value::Record(_)) {
+                    // `{}` the value is `Unit`, and the pattern `{}` names no fields,
+                    // so it matches; a pattern with fields then fails on the read.
+                    if !matches!(regs[base + obj as usize], Value::Record(_) | Value::Unit) {
                         ip = to as usize;
                     }
                 }

@@ -77,7 +77,7 @@ Two consequences worth stating up front.
   the value.
 - **Startup cost.** Parsing Builtin.roc on every run is work rocflight does not do
   today. `ponytail: parse it at startup and measure; if it hurts, cache the desugared
-  AST the way `.rocflight/cache/` already has a place for.`
+  AST on disk.`
 
 ## 3. The parse gate
 
@@ -140,8 +140,8 @@ by the Roc authors against the real semantics.
 `tests/harvest_builtin.sh` walks the vendored file, tracks the nominal nesting by
 indent, and writes one file per fenced block to `tests/roc/builtin/<Module>/<nnn>.roc`.
 The output is committed and regenerated when the nightly moves. Each file is then an
-ordinary golden input: `roc test <f>` against `rocflight --test <f>`, which the
-`--test` split already makes comparable.
+ordinary golden input: `roc test <f>` against `rocflight test <f>`, which the
+`test` subcommand already makes comparable.
 
 One file per block, not per `expect`. Splitting per `expect` breaks 18 of them:
 `expect Dict.empty()` is the opening line of a multi-line chain, and
@@ -216,10 +216,13 @@ Three things came with it:
   not written is a runtime message (`low-level op \`u8_from_str\` is not implemented`) —
   the same way a missing `Str.repeat` already behaves, and it lets a member load and run
   everything that does not touch the gap.
-- **`--load-builtins=Dict` selects members** for work on them, and the default list is
-  empty.
+- **The source selects the members.** `builtin::needed_by` reads the file and loads
+  what it actually mentions; a program naming nothing loads nothing. This was briefly a
+  `--load-builtins=Dict` flag, which is gone: the module is part of the interpreter,
+  and choosing a different set of it would only be a way to run a program against a
+  runtime that is not the real one.
 
-**Why the default is empty, and what it costs.** Every member that defines anything
+**Why nothing loads unasked, and what it costs.** Every member that defines anything
 regresses the gates:
 
 | Loaded | Golden pairs | Examples |

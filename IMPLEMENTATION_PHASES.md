@@ -277,7 +277,7 @@ tests/check_examples.sh FizzBuzz # just one
 
 Each example is run under both `roc` and `rocflight` and the **combined stdout and
 stderr must match byte for byte**. Modules with no entry point are run with `roc test`
-against `rocflight --test`, which reports the same `expect` tally.
+against `rocflight test`, which reports the same `expect` tally.
 
 **Nine cannot be compared**: `roc` itself refuses them with the installed compiler —
 eight need a basic-cli platform or package built for a different compiler version
@@ -554,10 +554,11 @@ Two deliberate divergences from roc, both permissive rather than strict:
 destructuring**. That needs a runtime equality check at top level (or a non-scoping
 match), and no amount of type information changes it. It was mis-grouped.
 
-**Harness note:** `--ast-only` prints an AST line and a `:: type` line; the harness
-compares only the AST. Annotations are not sugar, so a desugared file's declared type
-is legitimately more specific than the sugared file's inferred one
-(`List(Str) -> ...` versus `$0 -> ...`) while the structure is identical.
+**Harness note:** `cargo test --test golden_ast_test` compares only the AST, not the
+inferred type. Annotations are not sugar, so a desugared file's declared type is
+legitimately more specific than the sugared file's inferred one (`List(Str) -> ...`
+versus `$0 -> ...`) while the structure is identical. A debug build's `--ast-only`
+prints both lines for eyeballing one pair.
 
 **Done:** nominal types (phase 14). Three rows. Notes worth keeping:
 
@@ -760,8 +761,8 @@ on the next line, and the caller skipped to the next line *again* — swallowing
 first `import`. It only showed up with a header present, which is why the no-header
 case kept passing.
 
-`--show-platforms` reports what resolved: sources directory, module count, hosted-effect
-count, and the `requires` signature.
+`--show-platforms`, in a debug build, reports what resolved: sources directory, module
+count, hosted-effect count, and the `requires` signature.
 
 **Done:** record update and destructuring (phase 09's remainder). Three rows.
 

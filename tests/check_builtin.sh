@@ -13,6 +13,8 @@
 # Re-sync when the pinned nightly moves:
 #     cp roc-compiler/src/build/roc/Builtin.roc src/roc/Builtin.roc && tests/check_builtin.sh
 #
+# `--builtins` is a development flag, so this needs the DEBUG binary: `cargo build`.
+#
 # Usage: tests/check_builtin.sh [--strict] [--names]
 set -uo pipefail
 cd "$(dirname "$0")/.."

@@ -15,17 +15,23 @@
 #   PAIR  both files pass `roc check`, the two `roc run` outputs agree, and the
 #         desugared file carries explicit annotations. Failing this means the test
 #         files are wrong. Always fatal.
-#   INTERP  rocflight matches roc on BOTH files, AND builds the same AST and infers
-#         the same type from both. The two files differ only in sugar, so the AST
-#         they produce must be identical — that is the point of the pair. Failing
-#         this means the feature is not implemented yet, or the two files differ by
-#         more than sugar. Reported as pending; fatal only under --strict.
+#   INTERP  rocflight matches roc on BOTH files. Failing this means the feature is
+#         not implemented yet. Reported as pending; fatal only under --strict.
+#
+# The two files also have to build the SAME AST — they differ only in sugar, which is
+# the point of the pair. That check needs no `roc` and no binary, so it is
+# `cargo test --test golden_ast_test` rather than part of this script.
 #
 # Usage: tests/check_roc.sh [--strict] [path-under-tests/roc]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROC=${ROC:-roc}
 ROCFLIGHT=${ROCFLIGHT:-./target/debug/rocflight}
+# An app on a real platform runs on that platform's host: rocflight links
+# `librocflight_host.a` into it (see PLATFORM_HOST_PLAN.md). Built by
+# `tests/check_host.sh`; without it, platform apps stop at their first effect.
+HOST_LIB=$PWD/target/x86_64-unknown-linux-musl/release/librocflight_host.a
+[ -z "${ROCFLIGHT_LIB:-}" ] && [ -f "$HOST_LIB" ] && export ROCFLIGHT_LIB=$HOST_LIB
 
 strict=0
 root=tests/roc
@@ -105,29 +111,13 @@ while IFS= read -r sugared; do
   [ "$int_sug" = "$roc_sug" ] || bad="sugared"
   [ "$int_des" = "$roc_des" ] || bad="${bad:+$bad, }desugared"
 
-  # Same sugar, same AST. Only checked when both files already run correctly,
-  # so an unimplemented feature is reported once rather than twice.
-  # Only the AST STRUCTURE is compared, not the `:: type` line `--ast-only` also
-  # prints. Annotations are not sugar: the desugared file declares types the sugared
-  # one leaves to inference, so its type line is legitimately more specific
-  # (`List(Str) -> ...` versus `$0 -> ...`). Comparing structure catches the thing
-  # that matters — that the two files describe the same program.
-  ast_note=""
-  if [ -z "$bad" ]; then
-    ast_sug=$("$ROCFLIGHT" --ast-only "$sugared" 2>&1 | grep -v '^:: ')
-    ast_des=$("$ROCFLIGHT" --ast-only "$des" 2>&1 | grep -v '^:: ')
-    if [ "$ast_sug" != "$ast_des" ]; then
-      bad="AST differs between the two files"
-      ast_note=yes
-    fi
-  fi
+  # Same sugar, same AST — that check lives in `cargo test --test golden_ast_test`,
+  # which walks these same pairs through the library and needs neither `roc` nor a
+  # built binary.
 
   if [ -n "$bad" ]; then
     if [ "$strict" -eq 1 ]; then
       fail_msg "$name" "$bad"
-      if [ -n "$ast_note" ]; then
-        diff <(printf '%s\n' "$ast_sug") <(printf '%s\n' "$ast_des") | sed 's/^/    /' | head -8
-      fi
       [ "$int_sug" != "$roc_sug" ] && printf '    sugared   roc=%s\n    sugared   int=%s\n' \
         "$(printf %s "$roc_sug" | head -1)" "$(printf %s "$int_sug" | head -1)"
       [ "$int_des" != "$roc_des" ] && printf '    desugared roc=%s\n    desugared int=%s\n' \

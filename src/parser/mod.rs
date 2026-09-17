@@ -18,7 +18,6 @@ use crate::ast::{Expr, StrPart, MatchArm, Pattern};
 use crate::types::Type;
 use crate::error::ParseError;
 use crate::memory::string_pool;
-use crate::desugaring::Desugarer;
 
 /// Roc parser
 pub struct Parser {
@@ -167,29 +166,6 @@ impl Parser {
             entry_point: None,
             source: None,
         }
-    }
-
-    /// Load and parse file (with desugaring)
-    /// Returns: (AST, app_entry_point)
-    pub fn from_file(path: &str) -> Result<(Expr, Option<String>), ParseError> {
-        // Step 1: Load file
-        let source = std::fs::read_to_string(path)
-            .map_err(|e| ParseError {
-                message: format!("Failed to read file: {}", e),
-                position: 0,
-            })?;
-
-        // Step 2: Desugar shorthand syntax
-        let desugarer = Desugarer::new(source.clone());
-        let desugared = desugarer.desugar()?;
-
-        // Step 3: Save desugared for debugging
-        let _ = desugarer.save_debug(path, &desugared);
-
-        // Step 4: Parse desugared code
-        let mut parser = Parser::new(&desugared);
-        let expr = parser.parse_expr()?;
-        Ok((expr, parser.app_entry_point()))
     }
 
     /// Get the app entry point if one was found

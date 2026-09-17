@@ -61,9 +61,8 @@ main! = |_args| {
 ```
 
 **Status: working.** `rocflight hello_world/main.roc` and `roc run
-hello_world/main.roc` both print `hello world`, and the interpreter's emitted
-`.rocflight/cache/desugared/hello_world_main_roc.desugared.roc` passes `roc check`
-and runs to the same output. That round trip — sugared in, valid annotated Roc out,
+hello_world/main.roc` both print `hello world`, and the desugaring the interpreter
+produces for it passes `roc check` and runs to the same output. That round trip — sugared in, valid annotated Roc out,
 same answer from both — is the property the whole test suite is built on.
 
 ### The entry-point model, corrected
@@ -343,13 +342,13 @@ special cases and the AST stays small.
 ```
 .roc → Desugarer → desugared .roc → Parser → AST → Type Checker → Evaluator
                         │
-                        └── written to .rocflight/cache/desugared/, and it must
-                            pass `roc check` on its own
+                        └── must pass `roc check` on its own
 ```
 
-The emitted file being **real, compilable Roc with explicit types** is the point,
+The desugared source being **real, compilable Roc with explicit types** is the point,
 not a debugging nicety: it is what lets every desugaring be checked by the actual
-compiler instead of trusted. `--show-desugared` prints it; `--clear-cache` clears it.
+compiler instead of trusted. A debug build prints it with `--show-desugared`; nothing
+is written to disk.
 
 ### What is sugar
 
@@ -550,8 +549,10 @@ that, a test panicking while holding the lock makes every later cache test fail 
 The desugaring the interpreter *emits* must also be valid Roc:
 
 ```bash
-./target/debug/rocflight hello_world/main.roc
-roc check .rocflight/cache/desugared/hello_world_main_roc.desugared.roc
+./target/debug/rocflight --show-desugared hello_world/main.roc 2>&1 \
+  | sed -n '/=== DESUGARED CODE ===/,/=== END DESUGARED CODE ===/p' \
+  | sed '1d;$d' > /tmp/desugared.roc
+roc check /tmp/desugared.roc
 ```
 
 Currently true for all 18 pairs plus `hello_world/main.roc`.
@@ -578,7 +579,7 @@ each file is for.
 
 ```
 src/
-  main.rs                 CLI: --show-desugared, --clear-cache
+  main.rs                 CLI: <file.roc>, test, version, help
   lib.rs                  exports
   error.rs                ParseError and friends
 

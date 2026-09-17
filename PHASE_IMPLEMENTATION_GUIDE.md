@@ -46,8 +46,8 @@ operator-precedence chain. Sugared-only checking could not see it.
 ### Same sugar in, same AST out
 
 A pair's two files differ **only in sugar**, so the interpreter must build the
-**same AST** and infer the **same type** from both. `tests/check_roc.sh` enforces it
-by diffing `--ast-only` output.
+**same AST** from both. `cargo test --test golden_ast_test` enforces it: it walks the
+same pairs through the library, so the check needs neither `roc` nor a built binary.
 
 This catches what output comparison cannot. Five pairs once had their bindings inside
 `main!`'s block in the sugared file but lifted to the top level in the desugared one.
@@ -55,7 +55,7 @@ Output matched, types matched, and the ASTs were structurally different — the 
 testing two different programs. If a desugaring genuinely has to restructure, the
 sugared file should be written to match.
 
-Inspect it directly:
+Inspect one pair directly, with a **debug** build:
 
 ```bash
 R=./target/debug/rocflight
@@ -64,10 +64,8 @@ diff <($R --ast-only F.roc) <($R --ast-only F.desugared.roc)
 
 ### No state carries between runs
 
-Every run re-reads and re-parses the source. Nothing is cached across runs:
-`.rocflight/cache/desugared/` is a write-only dump, never read back, and writing it is
-opt-in (`--emit-desugared`). So editing a `.roc` file always takes effect immediately,
-and a stale dump can never affect a run.
+Every run re-reads and re-parses the source. Nothing is cached across runs and nothing
+is written to disk, so editing a `.roc` file always takes effect immediately.
 
 ### The full requirement list
 
@@ -87,15 +85,19 @@ tests/check_roc.sh tests/roc/04_operators   # one phase
 tests/check_roc.sh --strict                 # interpreter parity required
 ```
 
-Interpreter flags for working on a pair:
+Interpreter flags for working on a pair. These exist in **debug builds only** — the
+release binary rejects them, and `rocflight help` lists whichever set applies to the
+binary you are holding:
 
 ```bash
 R=./target/debug/rocflight
-$R F.roc                    # run it (quiet: no dump, no progress noise)
+$R F.roc                    # run it
+$R test F.roc               # run its top-level `expect`s, like `roc test`
 $R --ast-only F.roc         # print the AST and inferred type, do not run
-$R --show-ast F.roc         # print both, then run
+$R --show-ast F.roc         # print both, then run; also lists every numeral the checker
+                            #   defaulted to a fraction, by line:col — a `Dec` where an
+                            #   `I64` was meant starts as one of these
 $R --show-desugared F.roc   # print the desugared source
-$R --emit-desugared F.roc   # also write the dump under .rocflight/cache/
 ```
 
 Two gates, because a pair can be correctly written while the interpreter is still
@@ -151,10 +153,9 @@ Anything else keeping an annotation is a bug in the pair, not an exception.
 
 ### Why the desugared file must compile
 
-The interpreter emits its desugared output to
-`.rocflight/cache/desugared/<path>.desugared.roc` (see `--show-desugared`). If
-that output is not valid Roc, it cannot be checked against the real compiler, and
-a desugaring bug stays invisible until it shows up as a wrong answer.
+The desugarer's output is what the parser actually sees (`--show-desugared` prints
+it). If that output is not valid Roc, it cannot be checked against the real compiler,
+and a desugaring bug stays invisible until it shows up as a wrong answer.
 
 So the desugarer **preserves type annotations** rather than deleting them. It used
 to strip them so the parser never saw them; that made the emitted file
@@ -355,11 +356,13 @@ All four values must be the same string. A feature that matches on the sugared f
 but not the desugared one is **not done** — that asymmetry is a real bug, not a
 formatting difference (see the golden-pair rule above for the case that proved it).
 
-Finally, the interpreter's own emitted desugaring must be valid Roc:
+Finally, the interpreter's own desugaring must be valid Roc:
 
 ```bash
-./target/debug/rocflight $F.roc
-roc check .rocflight/cache/desugared/tests_roc_09_records_field_access_roc.desugared.roc
+./target/debug/rocflight --show-desugared $F.roc 2>&1 \
+  | sed -n '/=== DESUGARED CODE ===/,/=== END DESUGARED CODE ===/p' \
+  | sed '1d;$d' > /tmp/desugared.roc
+roc check /tmp/desugared.roc
 ```
 
 That closes the loop, and it currently holds for all 18 pairs plus
