@@ -67,7 +67,8 @@ separate operator-overloading mechanism, because operators were never separate.
 which is the opposite of most languages that have it.
 
 **There is no character type.** `'a'` is the number `97`. It is a number literal with a
-different spelling, and `'a' + 1` is `98`.
+different spelling, so `'a' + 1` is `98` — and, being a bare literal, it inspects as
+`98.0` until something annotates it.
 
 **An unconstrained number literal is fractional.** `a = 7` then `a.to_str()` prints
 `7.0`, not `7`. Annotate it and you get `7`. Type annotations are not always decoration.
@@ -96,22 +97,23 @@ or WebAssembly.
 | | |
 |---|---|
 | Golden pairs | **98 / 98** across 20 phases |
-| Rust tests | **436** |
-| Language examples | **12 of 19** comparable ones match `roc` byte for byte |
+| Rust tests | **533** |
+| Language examples | **19 of 19** comparable ones match `roc` byte for byte |
+| `Builtin.roc` | **12 of 12** members parse; 1,443 definitions in Roc, 1,109 intrinsics in Rust |
 
 ```bash
 tests/check_roc.sh --strict     # the 98 pairs — the definition of done
 tests/check_examples.sh         # roc-lang.org's own examples
+tests/check_builtin.sh --strict # the vendored Builtin.roc still parses
 cargo test --quiet              # the Rust side
 tests/bench.sh                  # performance, against a saved baseline
 ```
 
 Nine of the 28 examples can't be compared at all: `roc` itself refuses them with this
-compiler build, mostly platforms built for a different version. The seven that run but
-don't match each need a subsystem this interpreter doesn't have — `Dict`, `Set`, the Json
-package, the encoder framework, record-builder syntax, `Dec`'s precision, and roc's
-fractional default for bare number literals. They're listed with their reasons in
-`tests/check_examples.sh`, left failing rather than skipped, because the gap is ours.
+compiler build, mostly platforms built for a different version. They're listed with
+their reasons in `tests/check_examples.sh`. Every one of the other 19 matches byte for
+byte, `Dict` and `Set` included — those run `Builtin.roc`'s own open-addressing table
+rather than a Rust stand-in. See `BUILTIN_PLAN.md`.
 
 ### CLI Options
 
@@ -205,6 +207,7 @@ tests/bench/     benchmark programs and the saved baseline
 | `PHASE_IMPLEMENTATION_GUIDE.md` | the golden-pair rule and how to add a feature |
 | `OPTIMIZATION_PLAN.md` | performance method, results, and the register-VM plan |
 | `TESTING_STRATEGY.md` | how the gates fit together |
+| `BUILTIN_PLAN.md` | how the vendored `Builtin.roc` is read, loaded and bounded |
 
 ---
 
@@ -213,13 +216,19 @@ tests/bench/     benchmark programs and the saved baseline
 Written down rather than hidden, because an interpreter that quietly disagrees with its
 compiler is worse than one that says where it doesn't:
 
-- An unconstrained number literal stays an integer; roc defaults it to fractional.
-- `Dec` is `f64`; roc's fixed-point decimal carries more digits.
-- Iterators and `.iter()` are eager.
-- Custom `to_inspect` is resolved by trial, since values carry no nominal tag at runtime.
+- A nominal's type ARGUMENTS are dropped: `Dict(Str, U64)` and `Dict(I64, Bool)` are one
+  type here, so an element's type is still a variable. `Type` has no parameterised
+  nominal.
+- Nominals are erased, so the runtime tells them apart by SHAPE. A record with exactly an
+  opaque nominal's fields inspects as `<opaque>` too, and a `Set` and a `Dict` are the
+  same shape — only the checker separates those.
+- The `Encoding` protocol's own members are Rust rather than roc's. JSON round-trips and
+  a type's `encoder_for` runs, but another format would need the real thing.
+- Iterators and `.iter()` are eager: `map` over a range still builds its output list.
 - `where` constraints are read for the names they promise, not verified.
 
-Full list, with the reasoning for each, in `IMPLEMENTATION_PHASES.md`.
+Full list, with the reasoning for each, in `IMPLEMENTATION_PHASES.md`; the builtin ones
+in `BUILTIN_PLAN.md`.
 
 ---
 
