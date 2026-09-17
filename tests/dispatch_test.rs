@@ -102,11 +102,14 @@ fn parens_separate_a_method_call_from_a_field_read() {
 
 #[test]
 fn dispatching_on_an_unresolved_type_is_rejected() {
-    // roc rejects this too. There is nothing to resolve the module from.
+    // roc rejects this too. It now says WHY in roc's own terms: `first` gives a
+    // `Try(item, [ListWasEmpty])` — read off `Builtin.roc`'s signature rather than
+    // guessed — and a Try has no `to_str`. The older, vaguer "unresolved receiver" was
+    // all this could say before the result type was known.
     let err = type_error("x = []\nx.first().to_str()");
     assert!(
-        err.contains("unresolved"),
-        "error should explain the receiver is unresolved, got {}",
+        err.contains("unresolved") || err.contains("does not have it"),
+        "error should explain why the dispatch cannot work, got {}",
         err
     );
 }
@@ -141,5 +144,9 @@ fn expressions_inside_interpolation_are_type_checked() {
     // inside `${...}` went unreported — which is what hid broken chained dispatch in
     // this project's own golden pair.
     let err = type_error(r#""v=${1 + "s"}""#);
-    assert!(err.contains("Cannot unify"), "got {}", err);
+    assert!(
+        err.contains("Cannot unify") || err.contains("A number cannot be used as Str"),
+        "got {}",
+        err
+    );
 }

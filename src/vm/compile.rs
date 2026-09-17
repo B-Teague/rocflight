@@ -116,6 +116,37 @@ pub struct Unit<'a> {
     /// `TypeChecker::integer_binops`. Empty is always safe: it just means every
     /// operator goes through the generic opcode.
     pub integer_binops: std::collections::HashSet<crate::ast::NodeId>,
+    /// Which module each `Dispatch` node's receiver belongs to, from
+    /// `TypeChecker::dispatch_modules`. Empty is always safe: it just means every
+    /// dispatch resolves the way it did before the checker was consulted.
+    pub dispatch_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    /// Which module each `BinOp` node's operands belong to, from
+    /// `TypeChecker::binop_modules`. Empty means no operator is dispatched.
+    pub binop_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    /// The nominals in scope, as `(name, backing)`, from `Parser::nominals`. What the
+    /// VM makes of them is `Program::nominal_shapes`.
+    pub nominals: Vec<(&'static str, crate::types::Type)>,
+    /// The names among `nominals` that were declared with `::`, the opaque form.
+    pub opaque_nominals: Vec<&'static str>,
+    /// Literal nodes the checker typed as `Dec`, from `TypeChecker::dec_literals`.
+    /// They are lowered as fixed-point values rather than integers or floats.
+    pub dec_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// Literal nodes nothing pinned down, from `TypeChecker::fractional_literals`.
+    /// roc defaults an unconstrained numeral to a fractional type.
+    pub fractional_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// `Json.parse` call sites and the type each must produce, from
+    /// `TypeChecker::parse_targets`. Passed to the builtin as an extra argument.
+    pub parse_targets: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    /// Bare names the builtin module DECLARES but does not define — its low-level ops.
+    ///
+    /// They are calls into Rust, so a missing one is a runtime message naming the op
+    /// rather than a compile error on a name that is, after all, declared. That is how
+    /// a qualified builtin like `Str.repeat` already behaves.
+    pub intrinsics: std::collections::HashSet<&'static str>,
+    /// `roc test` semantics: run the top-level `expect`s and tally them. A normal run
+    /// SKIPS them — roc only treats a top-level `expect` as a test — while an `expect`
+    /// inside a function body runs either way.
+    pub test_mode: bool,
 }
 
 /// Compile a single-file program.
@@ -126,6 +157,16 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
         entry,
         ingested: Vec::new(),
         integer_binops: std::collections::HashSet::new(),
+        dispatch_modules: std::collections::HashMap::new(),
+        binop_modules: std::collections::HashMap::new(),
+        nominals: Vec::new(),
+        opaque_nominals: Vec::new(),
+        dec_literals: std::collections::HashSet::new(),
+        fractional_literals: std::collections::HashSet::new(),
+        parse_targets: std::collections::HashMap::new(),
+        intrinsics: std::collections::HashSet::new(),
+        // The bare helper is what the unit tests and `vm::eval` use: run everything.
+        test_mode: true,
     })
 }
 
@@ -172,6 +213,14 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
                 statements.push(inner);
                 cursor = body;
             }
+            // `_ = <expr>` binds nothing: it is a statement run for its effect, and
+            // that is the shape a top-level `expect` arrives in. As a binding it
+            // would take a global slot under the name `_` and, worse, be compiled
+            // as an ordinary in-function `expect` rather than as a test.
+            Expr::Let { name: "_", value, body, .. } => {
+                statements.push(value.as_ref());
+                cursor = body;
+            }
             Expr::Let { name, value, body, .. } => {
                 bindings.push((name, value.as_ref()));
                 cursor = body;
@@ -216,6 +265,12 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         states: Vec::new(),
         node: ast.id(),
         integer_binops: unit.integer_binops.clone(),
+        dispatch_modules: unit.dispatch_modules.clone(),
+        binop_modules: unit.binop_modules.clone(),
+        dec_literals: unit.dec_literals.clone(),
+        fractional_literals: unit.fractional_literals.clone(),
+        parse_targets: unit.parse_targets.clone(),
+        intrinsics: unit.intrinsics.clone(),
     };
 
     for (name, value) in &bindings {
@@ -256,10 +311,19 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     // the declarations anyway; interleaving matters once those are compiled (V5).
     for statement in &statements {
         let save = c.st().next_reg;
-        c.expr(statement)?;
+        c.top_statement(statement, unit.test_mode)?;
         c.st().next_reg = save;
     }
-    c.tail(tail)?;
+    // A file whose last declaration is a top-level `expect` has it as the trailing
+    // expression rather than a statement. It is still a test, so it gets the same
+    // treatment and the top level's own value is `{}` either way.
+    if matches!(tail, Expr::Expect(..)) {
+        c.top_statement(tail, unit.test_mode)?;
+        let src = c.literal(Value::Unit)?;
+        c.emit(Op::Ret { src });
+    } else {
+        c.tail(tail)?;
+    }
     let top = c.states.pop().expect("pushed above");
     c.chunks[0] = Some(top.finish(0, 0));
 
@@ -275,7 +339,40 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         .into_iter()
         .map(|slot| slot.expect("every reserved chunk id was compiled"))
         .collect();
-    Ok(Program { chunks, n_globals: c.tops.globals.len(), top: 0, entry })
+    // The dispatch tables. Only the compiler knows which top-level functions are
+    // methods — they are the ones whose name is `Type.method` — and only the running
+    // value can resolve a dispatch the checker could not type.
+    let mut methods = std::collections::HashMap::new();
+    let mut methods_by_name: std::collections::HashMap<&'static str, Vec<(&'static str, ChunkId)>> =
+        std::collections::HashMap::new();
+    for (qualified, chunk, _) in &c.tops.fns {
+        if let Some((module, method)) = qualified.rsplit_once('.') {
+            let module: &'static str = Box::leak(module.to_string().into_boxed_str());
+            let method: &'static str = Box::leak(method.to_string().into_boxed_str());
+            methods.insert((module, method), *chunk);
+            methods_by_name.entry(method).or_default().push((qualified, *chunk));
+        }
+    }
+
+    Ok(Program {
+        chunks,
+        n_globals: c.tops.globals.len(),
+        top: 0,
+        entry,
+        methods,
+        methods_by_name,
+        nominal_shapes: unit
+            .nominals
+            .iter()
+            .map(|(name, backing)| (*name, crate::vm::shape_of(backing)))
+            .collect(),
+        opaque_shapes: unit
+            .nominals
+            .iter()
+            .filter(|(name, _)| unit.opaque_nominals.contains(name))
+            .map(|(_, backing)| crate::vm::shape_of(backing))
+            .collect(),
+    })
 }
 
 /// One function being compiled. `Compiler::states` is a stack of these, so a nested
@@ -400,6 +497,18 @@ struct Compiler {
     node: crate::ast::NodeId,
     /// Which `BinOp` nodes may use the integer-only opcode.
     integer_binops: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `Unit::dispatch_modules`.
+    dispatch_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    /// See `Unit::binop_modules`.
+    binop_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    /// See `Unit::dec_literals`.
+    dec_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `Unit::fractional_literals`.
+    fractional_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `Unit::parse_targets`.
+    parse_targets: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    /// Bare low-level names the builtin module declares; see `Unit::intrinsics`.
+    intrinsics: std::collections::HashSet<&'static str>,
 }
 
 impl Compiler {
@@ -501,6 +610,17 @@ impl Compiler {
     }
 
     /// Resolve a name the way the tree-walker's `lookup` would: innermost first.
+    /// The nominal whose method block is being compiled, from the function's own name.
+    ///
+    /// Inside `Graph :: … .{ … }` a sibling method is in scope UNQUALIFIED — roc lets
+    /// `from_list` call `from_dict(…)` — but it is bound here as `Graph.from_dict`.
+    fn enclosing_type(&self) -> Option<&'static str> {
+        self.states
+            .iter()
+            .rev()
+            .find_map(|state| state.name.rsplit_once('.').map(|(owner, _)| owner))
+    }
+
     fn resolve(&mut self, name: &'static str) -> Option<Found> {
         let level = self.states.len() - 1;
         if let Some(l) = self.states[level].local(name) {
@@ -675,6 +795,26 @@ impl Compiler {
         }
     }
 
+    /// A statement at the top level, where `expect` means something different.
+    ///
+    /// A top-level `expect` is a TEST: `roc test` runs it and tallies it, and a normal
+    /// `roc run` skips it entirely — the condition is never evaluated, so a call it
+    /// makes has no effects either. Every other statement runs both ways, and so does
+    /// an `expect` inside a function body, which is a runtime assertion rather than a
+    /// test and is never tallied.
+    fn top_statement(&mut self, statement: &Expr, test_mode: bool) -> Result<(), String> {
+        let Expr::Expect(condition, _) = statement else {
+            self.expr(statement)?;
+            return Ok(());
+        };
+        if !test_mode {
+            return Ok(());
+        }
+        let cond = self.expr(condition)?;
+        self.emit(Op::TestExpect { cond });
+        Ok(())
+    }
+
     /// Compile `e` in TAIL position: the code emitted ends the function, either by
     /// returning or by handing the frame to a tail call.
     fn tail(&mut self, e: &Expr) -> Result<(), String> {
@@ -803,8 +943,24 @@ impl Compiler {
 
     fn expr_inner(&mut self, e: &Expr) -> Result<Reg, String> {
         match e {
+            // A literal the checker typed as `Dec` is a FIXED-POINT value: `Dec` keeps
+            // eighteen decimal places exactly, which an f64 cannot.
+            Expr::Int(n, id) if self.dec_literals.contains(id) => {
+                self.literal(Value::Dec(n * crate::eval::DEC_SCALE))
+            }
+            // Nothing ever said what this numeral is, so it defaults — and roc's
+            // default is `Dec`, not a float. Checked against the compiler: a whole
+            // `F64` prints `1500`, a whole `Dec` prints `1500.0`, and `x = 1500` with
+            // no annotation prints `1500.0`.
+            Expr::Int(n, id) if self.fractional_literals.contains(id) => {
+                self.literal(Value::Dec(n.saturating_mul(crate::eval::DEC_SCALE)))
+            }
             Expr::Int(n, _) => self.literal(Value::Int(*n)),
-            Expr::Float(f, _) => self.literal(Value::Float(*f)),
+            // The literal as it was WRITTEN, not as the nearest double to it.
+            Expr::Float(_, exact, id) if self.dec_literals.contains(id) => {
+                self.literal(Value::Dec(*exact))
+            }
+            Expr::Float(f, ..) => self.literal(Value::Float(*f)),
             Expr::Bool(b, _) => self.literal(Value::Bool(*b)),
             Expr::Str(s, _) => self.literal(Value::Str(Rc::from(*s))),
             Expr::Unit(_) => self.literal(Value::Unit),
@@ -823,7 +979,11 @@ impl Compiler {
                 let b = self.expr(right)?;
                 self.st().next_reg = save;
                 let dst = self.alloc()?;
-                if self.tops.operator_methods {
+                // An operator is dispatched only when the CHECKER says its operands are
+                // a nominal that defines the matching method. `operator_methods` alone
+                // is a program-wide switch: it sent every `==` through a method search,
+                // so one `Try.is_eq` in scope answered for tuples and tags too.
+                if self.tops.operator_methods && self.operator_dispatches(id, *op) {
                     self.emit(Op::BinDispatch { dst, a, b, op: *op });
                 } else if self.integer_binops.contains(id)
                     && !matches!(op, crate::ast::BinOp::And | crate::ast::BinOp::Or)
@@ -881,6 +1041,26 @@ impl Compiler {
                 Ok(src)
             }
             Expr::Return(_, _) => Err("vm: `return` outside a function".to_string()),
+
+            // `Json.parse(text)` is given the TYPE it must produce as a second
+            // argument: nothing at run time can recover it, and reading `[1,2,3]` back
+            // into a `List(ItemKind)` is only possible knowing it.
+            Expr::Call { func, args, id }
+                if matches!(&**func, Expr::Qualified { module: "Json", name: "parse", .. })
+                    && self.parse_targets.contains_key(id) =>
+            {
+                let target = type_descriptor(&self.parse_targets[id]);
+                let name = self.names_run(&["Json", "parse"])?;
+                let arg_base = self.st().next_reg;
+                let (_, argc) = self.arguments(args)?;
+                self.st().next_reg = arg_base + argc as u16;
+                let slot = self.alloc()?;
+                self.constant(slot, target)?;
+                self.st().next_reg = arg_base;
+                let dst = self.alloc()?;
+                self.emit(Op::CallBuiltin { dst, name, base: arg_base, argc: argc + 1 });
+                Ok(dst)
+            }
 
             Expr::Call { func, args, .. } => {
                 if let Some((chunk, arity)) = self.direct_callee(func) {
@@ -1008,6 +1188,18 @@ impl Compiler {
                         _ => {}
                     }
                 }
+                // `U64.highest` is a value too, so it is CALLED here rather than left
+                // as a function to be called later — there is no later, a constant is
+                // used where it stands.
+                if crate::eval::is_numeric_constant(module, name) {
+                    let idx = self.names_run(&[module, name])?;
+                    let base = self.st().next_reg;
+                    self.reserve(base)?;
+                    self.st().next_reg = base;
+                    let dst = self.alloc()?;
+                    self.emit(Op::CallBuiltin { dst, name: idx, base, argc: 0 });
+                    return Ok(dst);
+                }
                 let name = self.name_idx(qualified)?;
                 let dst = self.alloc()?;
                 self.emit(Op::MakeBuiltin { dst, name });
@@ -1016,8 +1208,8 @@ impl Compiler {
 
             Expr::StrInterp(parts, _) => self.interpolation(parts),
 
-            Expr::Dispatch { receiver, method, args, .. } => {
-                self.dispatch(receiver, method, args)
+            Expr::Dispatch { receiver, method, args, id } => {
+                self.dispatch(receiver, method, args, *id)
             }
 
             // The three statement forms. Each yields `{}`, as in the tree-walker.
@@ -1333,7 +1525,17 @@ impl Compiler {
                 Ok(dst)
             }
             Some(Found::Refused(why)) => Err(why),
-            None => Err(format!("Undefined variable: {}", name)),
+            None => {
+                // The same sibling rule, for a method used as a VALUE rather than
+                // called: `map(xs, helper)` inside the block `helper` belongs to.
+                if let Some(owner) = self.enclosing_type() {
+                    let qualified = qualify(owner, name);
+                    if self.resolve(qualified).is_some() {
+                        return self.use_name(qualified);
+                    }
+                }
+                Err(format!("Undefined variable: {}", name))
+            }
         }
     }
 
@@ -1373,6 +1575,18 @@ impl Compiler {
                 if self.resolve(bare).is_some() {
                     return Ok(None);
                 }
+                // A SIBLING method, called by its bare name from inside the same
+                // method block: `from_list = |l| from_dict(…)` inside `Graph`.
+                if let Some(owner) = self.enclosing_type() {
+                    if let Some((chunk, arity)) = self.tops.func(qualify(owner, bare)) {
+                        let (arg_base, argc) = self.arguments(args)?;
+                        check_arity(bare, arity, argc)?;
+                        self.st().next_reg = arg_base;
+                        let dst = self.alloc()?;
+                        self.emit(Op::CallFn { dst, chunk, base: arg_base, argc });
+                        return Ok(Some(dst));
+                    }
+                }
                 // An effect of the default host. `!` is part of the name.
                 if crate::platform::host::lookup(bare).is_some() {
                     let name = self.name_idx(bare)?;
@@ -1380,6 +1594,20 @@ impl Compiler {
                     self.st().next_reg = arg_base;
                     let dst = self.alloc()?;
                     self.emit(Op::CallHost { dst, name, base: arg_base, argc });
+                    return Ok(Some(dst));
+                }
+                // A LOW-LEVEL op: a bare name `Builtin.roc` calls but never defines,
+                // which the real compiler injects and rocflight answers from Rust.
+                // Sent under a module of its own, because Roc has no module for these.
+                if crate::eval::low_level_arity(bare).is_some() || self.intrinsics.contains(bare) {
+                    if let Some(arity) = crate::eval::low_level_arity(bare) {
+                        check_arity(bare, arity as u16, args.len() as u16)?;
+                    }
+                    let name = self.names_run(&["LowLevel", bare])?;
+                    let (arg_base, argc) = self.arguments(args)?;
+                    self.st().next_reg = arg_base;
+                    let dst = self.alloc()?;
+                    self.emit(Op::CallBuiltin { dst, name, base: arg_base, argc });
                     return Ok(Some(dst));
                 }
                 // Bare `to_str(x)`. The tree-walker stringifies any value here, which
@@ -1399,6 +1627,21 @@ impl Compiler {
         }
     }
 
+    /// Does this operator go through a method?
+    ///
+    /// Yes when the checker named a module that defines one. Yes ALSO when it named no
+    /// module at all: roc erases nominals, so an unannotated `Money.{ cents: 5 }` is
+    /// just a record here and its `plus` has to stay reachable. No when the module is
+    /// named and has no such method — which is what keeps `1 + 2`, `"a" == "b"` and a
+    /// tuple comparison away from whatever `is_eq` happens to be in scope.
+    fn operator_dispatches(&self, node: &crate::ast::NodeId, op: crate::ast::BinOp) -> bool {
+        let Some(method) = operator_method_name(op) else { return false };
+        match self.binop_modules.get(node) {
+            Some(module) => self.tops.func(qualify(module, method)).is_some(),
+            None => true,
+        }
+    }
+
     /// `receiver.method(args)`.
     ///
     /// A nominal's own method block wins, and the compiler can resolve it: it is a
@@ -1409,18 +1652,33 @@ impl Compiler {
         receiver: &Expr,
         method: &'static str,
         args: &[Expr],
+        node: crate::ast::NodeId,
     ) -> Result<Reg, String> {
-        let candidates = self.tops.methods(method);
-        if candidates.len() > 1 {
-            // The tree-walker reports this when the call runs; the compiler knows it
-            // before the program starts.
-            let names: Vec<&str> = candidates.iter().map(|(n, ..)| *n).collect();
-            return Err(format!(
-                "`{}` is ambiguous: {} all define it. Call it explicitly.",
-                method,
-                names.join(", ")
-            ));
-        }
+        let all = self.tops.methods(method);
+
+        // What the CHECKER says the receiver is. A method name alone cannot pick a
+        // definition once more than one type defines it, and `Builtin.roc` has every
+        // type defining `map`, `len`, `is_eq` and `to_hash`. With the receiver's module
+        // in hand the choice is exact: `Type.method` if that type defines one, and
+        // otherwise the builtin for that module, whatever else is in scope.
+        let candidates: Vec<(&'static str, ChunkId, u16)> =
+            match self.dispatch_modules.get(&node) {
+                Some(module) => {
+                    let owner = qualify(module, method);
+                    all.iter().copied().filter(|(name, ..)| *name == owner).collect()
+                }
+                // No module: a bare record or tag, or a variable a `where` clause
+                // covers. Unchanged from before — the single candidate by name, or a
+                // runtime dispatch on the value.
+                None => all,
+            };
+
+        // With no module named, the choice belongs to the running value: `DispatchMethod`
+        // looks the method up by what the receiver turns out to be, and falls back to a
+        // uniquely-named one for a nominal, which is a bare record at run time. Picking
+        // the only candidate HERE is what made a loaded `Stream` answer `xs.map(f)`.
+        let candidates: Vec<(&'static str, ChunkId, u16)> =
+            if self.dispatch_modules.contains_key(&node) { candidates } else { Vec::new() };
 
         // The receiver is the first argument either way — which is why roc's builtins
         // take their subject first: `xs.map(f)` is `List.map(xs, f)`.
@@ -1606,3 +1864,45 @@ fn func_name(func: &Expr) -> &'static str {
     }
 }
 
+
+/// The method an operator is sugar for. Agrees with `eval::dispatch_operator`, which
+/// makes the same mapping when the call actually runs.
+fn operator_method_name(op: crate::ast::BinOp) -> Option<&'static str> {
+    use crate::ast::BinOp;
+    Some(match op {
+        BinOp::Add => "plus",
+        BinOp::Sub => "minus",
+        BinOp::Mul => "times",
+        BinOp::Div => "div_by",
+        BinOp::IntDiv => "div_trunc_by",
+        BinOp::Rem => "rem_by",
+        BinOp::Lt => "is_lt",
+        BinOp::Gt => "is_gt",
+        BinOp::Le => "is_lte",
+        BinOp::Ge => "is_gte",
+        BinOp::Eq | BinOp::Ne => "is_eq",
+        _ => return None,
+    })
+}
+
+/// A type as a runtime value, for the builtins that must read one.
+///
+/// Only the shape a JSON reader needs: a list of what, a nominal by name, and a
+/// stopping point for everything else — where the reader falls back to reading the
+/// document as it stands.
+fn type_descriptor(ty: &crate::types::Type) -> Value {
+    use crate::types::Type;
+    match ty {
+        Type::List(inner) => Value::tag("List", vec![type_descriptor(inner)]),
+        Type::Nominal { name, .. } => Value::tag(
+            "Nominal",
+            vec![crate::eval::str_value(name.clone())],
+        ),
+        // `Try(a, e)` is how a parse result is written, and the `a` is what to read.
+        Type::TagUnion { tags, .. } => match tags.iter().find(|(tag, _)| tag == "Ok") {
+            Some((_, payload)) if payload.len() == 1 => type_descriptor(&payload[0]),
+            _ => Value::Unit,
+        },
+        _ => Value::Unit,
+    }
+}

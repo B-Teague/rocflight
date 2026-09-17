@@ -1,5 +1,5 @@
 # The environment a closure captures. Identical work to list_ops.roc, except the
-# expect: 16004000
+# expect: 16004000.0
 # list is bound in the SAME block as the lambda, so it is part of what the closure
 # captures. Any per-call copy of the environment shows up here and nowhere else.
 app [main!] {}

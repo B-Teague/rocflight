@@ -234,9 +234,16 @@ pub enum Expr {
     /// String interpolation: "x=${expr}"
     StrInterp(Vec<StrPart>, NodeId),
     /// Integer literal: 42, -3
-    Int(i64, NodeId),
+    Int(i128, NodeId),
     /// Float literal: 3.14, -2.5
-    Float(f64, NodeId),
+    /// A fractional literal: the double it parses to, and the SAME literal scaled by
+    /// `Dec::SCALE`.
+    ///
+    /// Both, because `Dec` is not a float: `147.666666666666666666` is exact as a
+    /// fixed-point value and is not as a double, so reconstructing the one from the
+    /// other loses the digits the type exists to keep. Which is used depends on the
+    /// type the checker gives the node.
+    Float(f64, i128, NodeId),
     /// Identifier: x, main
     Ident(&'static str, NodeId),
     /// Qualified name: Module.function
@@ -501,7 +508,7 @@ pub enum Pattern {
     /// `x` — matches anything and binds it to `x`.
     Binding(&'static str),
     /// `1`, `3.5`, `"hello"` — matches an equal value.
-    Int(i64),
+    Int(i128),
     Float(f64),
     Str(&'static str),
     /// `Red`, `Foo(a, b)`, `Wrap(Inner(s))` — patterns nest to any depth.
@@ -615,7 +622,7 @@ impl fmt::Display for Expr {
                 write!(f, "\"")
             }
             Expr::Int(n, _) => write!(f, "{}", n),
-            Expr::Float(n, _) => write!(f, "{}", n),
+            Expr::Float(n, ..) => write!(f, "{}", n),
             Expr::Ident(name, _) => write!(f, "{}", name),
             Expr::Unit(_) => write!(f, "{{}}"),
             Expr::Bool(b, _) => write!(f, "Bool.{}", if *b { "True" } else { "False" }),

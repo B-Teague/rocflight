@@ -97,8 +97,8 @@ while read -r name entry mode; do
     printf '  %s %-24s missing %s\n' "$(red FAIL)" "$name" "$entry"; fail=$((fail+1)); continue
   fi
 
-  # `roc test` runs a module's `expect`s; `roc run` runs its entry point. rocflight
-  # takes the file either way — a module's expects are checked as it is walked.
+  # `roc test` runs a module's top-level `expect`s and nothing else; `roc run` runs
+  # its entry point and skips them. rocflight splits the same way, on `--test`.
   case "$mode" in
     test) roc_out=$(cd "$dir" && timeout 120 "$ROC" test "$entry" 2>&1 </dev/null) ;;
     # Bare `roc <file>`, which is what every example's README shows. It is NOT the

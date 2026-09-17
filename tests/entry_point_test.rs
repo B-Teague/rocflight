@@ -148,10 +148,15 @@ fn identifiers_now_carry_their_type() {
     let typed = |src: &str| -> String {
         let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
         let ast = Parser::new(&desugared).parse_expr().unwrap();
-        TypeChecker::new().synth(&ast).map(|t| t.to_string()).unwrap_or_default()
+        let mut checker = TypeChecker::new();
+        let ty = checker.synth(&ast);
+        // Defaulted, because an unconstrained NUMERAL has no width until something
+        // gives it one — and roc then makes it a `Dec`, printing `42.0`.
+        ty.map(|t| checker.defaulted(&t).to_string()).unwrap_or_default()
     };
 
-    assert_eq!(typed("x = 42\nx"), "I64");
+    assert_eq!(typed("x = 42\nx"), "Dec");
+    assert_eq!(typed("n : I64\nn = 42\nn"), "I64");
     assert_eq!(typed("s = \"hi\"\ns"), "Str");
     assert_eq!(typed("b = Bool.True\nb"), "Bool");
 }

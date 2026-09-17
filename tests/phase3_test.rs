@@ -93,9 +93,10 @@ mod phase3_tests {
         let ty = checker.synth(&expr).expect("Failed to infer type");
 
         // The let's type is its body's type, and the body is `x` — which the type
-        // environment now knows is an I64. This used to be an opaque `$0`, because
-        // every identifier synthesised to a fresh variable.
-        assert_eq!(ty.to_string(), "I64");
+        // environment now knows. This used to be an opaque `$0`, because every
+        // identifier synthesised to a fresh variable. It is `Dec` rather than `I64`
+        // because nothing constrains the numeral, and that is what roc defaults it to.
+        assert_eq!(checker.defaulted(&ty).to_string(), "Dec");
     }
 
     #[test]

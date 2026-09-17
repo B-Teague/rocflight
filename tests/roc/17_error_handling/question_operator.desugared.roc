@@ -11,9 +11,9 @@ parse_both = |a, b| {
         Ok(x) =>
             match I64.from_str(b) {
                 Ok(y) => Ok(x + y)
-                Err(e) => Err(e)
+                Err(e) => return Err(e)
             }
-        Err(e) => Err(e)
+        Err(e) => return Err(e)
     }
 }
 

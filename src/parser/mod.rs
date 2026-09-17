@@ -59,6 +59,36 @@ pub struct Parser {
     /// How deep `parse_expr` is nested. Only the outermost call wraps the program in
     /// its nominal method bindings.
     expr_depth: u32,
+    /// Members of a nominal's method block that carry an ANNOTATION BUT NO BODY, as
+    /// `(Type.name, its declared type)`.
+    ///
+    /// In `Builtin.roc` that is precisely the set of intrinsics: the real compiler's
+    /// `canonicalize/BuiltinLowLevel.zig` rewrites exactly these into lambdas running a
+    /// `LowLevel` op, and rocflight has to supply each one from Rust. They fall out of
+    /// the annotation bookkeeping for free — an annotation a binding claims is a
+    /// definition, and whatever is left over when the block closes is an intrinsic.
+    intrinsics: Vec<(&'static str, Type)>,
+    /// EVERY method-block annotation, `Type.method` to its declared type, whether or
+    /// not a body claimed it. This is the type table `Builtin.roc` is really for: the
+    /// signatures are already written, module-qualified and arity-correct, so the
+    /// checker has no business guessing them from a method name.
+    signatures: Vec<(&'static str, Type)>,
+    /// Record literals written as a NOMINAL construction, `Point.{ x: 3 }`, and the
+    /// nominal's type.
+    ///
+    /// The AST erases the nominal — roc does too — so by the time the checker sees the
+    /// literal it is a plain record and its fields have no declared types. That is what
+    /// left `Point := { x: I64 }` unable to tell `3` it is an integer.
+    nominal_literals: Vec<(crate::ast::NodeId, Type)>,
+    /// Nominals declared with `::`, the OPAQUE form.
+    opaque_nominals: Vec<&'static str>,
+    /// How many blocks enclose the cursor. `?` is only meaningful inside one, because
+    /// the match it expands to has to wrap the rest of the block.
+    block_depth: u32,
+    /// `expr?` sites lifted out of the statement being parsed, as
+    /// `(fresh name, the Try expression, an optional error mapper)`. Drained by
+    /// `parse_block` once the statement's value is complete.
+    pending_tries: Vec<(&'static str, Expr, Option<Expr>)>,
     /// Defaults collected while parsing the record type of the current declaration,
     /// as `(field, default expression)`. Moved into `nominal_defaults` when the
     /// declaration completes.
@@ -127,6 +157,12 @@ impl Parser {
             nominal_params: Vec::new(),
             mutable_names: Vec::new(),
             expr_depth: 0,
+            block_depth: 0,
+            intrinsics: Vec::new(),
+            signatures: Vec::new(),
+            nominal_literals: Vec::new(),
+            opaque_nominals: Vec::new(),
+            pending_tries: Vec::new(),
             methods: Vec::new(),
             entry_point: None,
             source: None,
@@ -193,6 +229,13 @@ impl Parser {
         // Only the outermost call brings nominal methods into scope; wrapping at every
         // level nested them inside the first method's own body.
         if self.expr_depth == 0 {
+            // Whatever annotation is still pending at the end of the file was never
+            // claimed by a binding, so it declares a type and no body. At the top level
+            // of `Builtin.roc` those are the low-level ops — `list_get_unsafe`,
+            // `hasher_finish`, `dict_seed` — which the real compiler injects and which
+            // Rust has to supply here. `claim_intrinsics` with an empty prefix keeps
+            // their bare names.
+            self.claim_intrinsics("", 0);
             for (name, annotation, value) in
                 std::mem::take(&mut self.methods).into_iter().rev()
             {
@@ -204,7 +247,15 @@ impl Parser {
                 };
             }
             // The tests go last, after every declaration is in scope.
-            let expects = std::mem::take(&mut self.deferred_expects);
+            //
+            // `parse_top_level` defers the ones it parses at the outermost level, but
+            // not those inside a `_ = <chain>` — the shape this parser produces for a
+            // file whose declarations are followed by expects — because it is not at
+            // that level when it meets them. `compile_unit` reorders them anyway when
+            // it flattens, so the VM was already running them last; the CHECKER walks
+            // the tree as written, and saw `graph.dfs(…)` before `graph` was bound.
+            let mut expects = std::mem::take(&mut self.deferred_expects);
+            Self::lift_expects(&mut program, &mut expects);
             if !expects.is_empty() {
                 Self::append_to_body(&mut program, expects);
             }
@@ -216,6 +267,42 @@ impl Parser {
     ///
     /// The file's value — usually `main!` — stays last, so what the program evaluates
     /// to is unchanged.
+    /// Take every `expect` statement out of the top-level spine, in order.
+    ///
+    /// The spine is the chain of `Let`s the file's declarations build, and a statement
+    /// in it is a binding to `_`. A `_` bound to another chain is the flattened group
+    /// `compile_unit` also looks through, so this descends into one.
+    fn lift_expects(program: &mut Expr, out: &mut Vec<Expr>) {
+        // Take the expects off the front of this spine, then walk what is left.
+        while matches!(program, Expr::Let { name: "_", value, .. } if matches!(**value, Expr::Expect(..)))
+        {
+            let Expr::Let { value, body, .. } =
+                std::mem::replace(program, Expr::Unit(crate::ast::fresh_node_unlocated()))
+            else {
+                unreachable!("matched a Let")
+            };
+            out.push(*value);
+            *program = *body;
+        }
+        match program {
+            // A `_` bound to another chain is the flattened group `compile_unit` also
+            // looks through.
+            Expr::Let { name: "_", value, body, .. } if matches!(**value, Expr::Let { .. }) => {
+                Self::lift_expects(value, out);
+                Self::lift_expects(body, out);
+            }
+            Expr::Let { body, .. } => Self::lift_expects(body, out),
+            // A chain can END in an expect rather than binding one to `_`, which is
+            // the shape a group of declarations followed by a test actually produces.
+            Expr::Expect(..) => {
+                let lifted =
+                    std::mem::replace(program, Expr::Unit(crate::ast::fresh_node_unlocated()));
+                out.push(lifted);
+            }
+            _ => {}
+        }
+    }
+
     fn append_to_body(program: &mut Expr, extra: Vec<Expr>) {
         let mut cursor = program;
         while let Expr::Let { body, .. } = cursor {
@@ -302,7 +389,10 @@ impl Parser {
             // enclosing list; only commit if another atom follows.
             let saved = self.pos;
             self.pos += 1;
-            self.skip_inline_whitespace();
+            // Across the newline: a parameter list may be written one per line, which
+            // is how Builtin.roc writes the big record-shaped ones. Committing is safe
+            // because a failed atom rewinds to `saved`.
+            self.skip_whitespace();
             match self.parse_type_atom() {
                 Ok(atom) => params.push(atom),
                 Err(_) => {
@@ -353,7 +443,36 @@ impl Parser {
             let result = self.parse_type_operand()?;
             return Ok(Type::Function(Box::new(atom), Box::new(result)));
         }
-        Ok(atom)
+
+        // A MULTI-parameter function still reads as one operand when an arrow follows
+        // the comma list: `{ next_payload : _state, U64, U64 -> Try(…) }` is one field
+        // whose type takes three parameters, not three fields. The commas are only
+        // parameters if an arrow turns up, so this collects them speculatively and
+        // rewinds when it does not — which is what leaves an ordinary
+        // `{ x: Bool, y: Bool }` alone.
+        let saved = self.pos;
+        let mut params = vec![atom];
+        while self.input[self.pos..].starts_with(',') {
+            self.pos += 1;
+            self.skip_whitespace();
+            match self.parse_type_atom() {
+                Ok(next) => params.push(next),
+                Err(_) => break,
+            }
+            self.skip_inline_whitespace();
+        }
+        let rest = &self.input[self.pos..];
+        if params.len() > 1 && (rest.starts_with("->") || rest.starts_with("=>")) {
+            self.pos += 2;
+            self.skip_inline_whitespace();
+            let mut result = self.parse_type_operand()?;
+            for param in params.into_iter().rev() {
+                result = Type::Function(Box::new(param), Box::new(result));
+            }
+            return Ok(result);
+        }
+        self.pos = saved;
+        Ok(params.into_iter().next().expect("the atom is always there"))
     }
 
     /// Parse one type atom. See `parse_type` for the grammar.
@@ -369,6 +488,16 @@ impl Parser {
         }
         if rest.starts_with('(') {
             self.pos += 1;
+            // `()` is Roc's EMPTY PARAMETER LIST, which is how Builtin.roc spells a
+            // function that takes nothing: `step! : () => [Done]`, `empty : () ->
+            // Dict(k, v)`. It is also the unit type, and `{}` is the same type, so
+            // both land on `Type::Unit`. Without this the tuple branch below asks for
+            // a type atom, finds `)`, and fails the whole annotation.
+            self.skip_inline_whitespace();
+            if self.input[self.pos..].starts_with(')') {
+                self.pos += 1;
+                return Ok(Type::Unit);
+            }
             let mut items = vec![self.parse_type_operand()?];
             loop {
                 self.skip_inline_whitespace();
@@ -394,18 +523,45 @@ impl Parser {
             });
         }
 
-        let (remaining, ident) = parse_identifier(rest).map_err(|_| ParseError {
-            message: "Expected a type".to_string(),
-            position: self.pos,
-        })?;
-        self.pos += rest.len() - remaining.len();
-        let name = match ident {
-            Expr::Ident(n, _) => n,
-            other => {
+        // A QUALIFIED type name — `Dict.DictBucket`, `Str.Utf8Problem` — is read here
+        // rather than through `parse_identifier`, which sees an uppercase dotted path
+        // as a nominal-qualified TAG (`Animal.Dog`) and hands back something this match
+        // then rejected, silently dropping the whole annotation.
+        //
+        // The last segment is the name: nested nominals are registered flat, so
+        // `Str :: […].{ Utf8Problem := […] }` puts `Utf8Problem` in scope, not
+        // `Str.Utf8Problem`.
+        let qualified: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+            .collect();
+        let name = if qualified.contains('.')
+            && qualified.starts_with(char::is_uppercase)
+            && !qualified.ends_with('.')
+        {
+            self.pos += qualified.len();
+            let last = qualified.rsplit('.').next().expect("split yields one part");
+            if !last.starts_with(char::is_uppercase) {
                 return Err(ParseError {
-                    message: format!("Expected a type name, got {}", other),
+                    message: format!("Expected a type name, got {}", qualified),
                     position: self.pos,
-                })
+                });
+            }
+            &*Box::leak(last.to_string().into_boxed_str())
+        } else {
+            let (remaining, ident) = parse_identifier(rest).map_err(|_| ParseError {
+                message: "Expected a type".to_string(),
+                position: self.pos,
+            })?;
+            self.pos += rest.len() - remaining.len();
+            match ident {
+                Expr::Ident(n, _) => n,
+                other => {
+                    return Err(ParseError {
+                        message: format!("Expected a type name, got {}", other),
+                        position: self.pos,
+                    })
+                }
             }
         };
 
@@ -446,6 +602,16 @@ impl Parser {
                     });
                 }
             }
+        }
+
+        // A BUILTIN name keeps its builtin meaning even where the file declares it.
+        // `Builtin.roc` writes `Str :: [ProvidedByCompiler]` and
+        // `List(_item) :: [ProvidedByCompiler]`, and reading `Str` through those makes
+        // it a nominal over an opaque tag and throws a list's element type away — so
+        // every signature the file declares would arrive less precise than the types
+        // rocflight already has.
+        if let Some(builtin) = builtin_type(name, args.clone(), || Type::TypeVar(u32::MAX)) {
+            return Ok(builtin);
         }
 
         // A declared nominal wins over the fallback: `Point` is the nominal, not an
@@ -766,6 +932,12 @@ impl Parser {
                     if rest.starts_with(',') {
                         self.pos += 1;
                         self.skip_whitespace();
+                        // A trailing comma before `)` is legal, as it is in a call.
+                        // Builtin.roc writes multi-line tag payloads that way.
+                        if self.input[self.pos..].starts_with(')') {
+                            self.pos += 1;
+                            break;
+                        }
                     } else if rest.starts_with(')') {
                         self.pos += 1;
                         break;
@@ -779,6 +951,15 @@ impl Parser {
             }
         }
         self.skip_whitespace();
+
+        // `Bool : [True, False]`, so a bare `True` IS the boolean — roc runs
+        // `x = True` then `if x { … }` quite happily, and rocflight refused it with
+        // "Cannot unify [True, ..] with Bool". The qualified `Bool.True` was already
+        // a boolean; this makes the unqualified spelling agree. `Builtin.roc` writes
+        // every `return False` that way.
+        if args.is_empty() && matches!(name, "True" | "False") {
+            return Ok(Expr::Bool(name == "True", self.node()));
+        }
         Ok(Expr::Tag { id: self.node(), name, args })
     }
 
@@ -801,6 +982,9 @@ impl Parser {
             Some(i) => i,
             None => return false,
         };
+        // `::` is the OPAQUE form. roc shows one as `<opaque>` rather than as its
+        // backing value, which is the only place the difference is observable here.
+        let opaque = line[assign..].starts_with("::");
         // `Wrapper(a) := ...` parameterises the nominal. The parameters need no
         // record of their own: the backing type's `a` becomes a fresh type variable
         // the same way a lowercase name in any annotation does.
@@ -843,6 +1027,9 @@ impl Parser {
         }
         match self.parse_type_operand() {
             Ok(backing) => {
+                if opaque {
+                    self.opaque_nominals.push(name_owned);
+                }
                 self.nominals.push((
                     name_owned,
                     Type::Nominal { name: name.clone(), backing: Box::new(backing) },
@@ -865,6 +1052,78 @@ impl Parser {
         }
     }
 
+    /// Expand `{ a: pa, b: pb, c: pc }.Combiner` into nested `Combiner.map2` calls.
+    ///
+    /// The fields are folded right, each level pairing its value with the rest:
+    ///
+    /// ```text
+    /// Combiner.map2(pa, Combiner.map2(pb, pc, |x, y| (x, y)), |x, y| { a: x, b: y.0, c: y.1 })
+    /// ```
+    ///
+    /// The inner levels build plain pairs and the outermost builds the record, reading
+    /// each field out of the nesting. roc writes the combiners as patterns —
+    /// `|month, (day, year)|` — which this cannot, because a lambda's parameters are
+    /// names here; indexing the pair is the same thing said differently.
+    fn record_builder(
+        &mut self,
+        combiner: &'static str,
+        fields: &[(&'static str, Expr)],
+    ) -> Result<Expr, ParseError> {
+        if fields.len() < 2 {
+            return Err(ParseError {
+                message: format!(
+                    "a record builder needs at least two fields to combine, got {}",
+                    fields.len()
+                ),
+                position: self.pos,
+            });
+        }
+        let (head, tail) = ("#rb_head", "#rb_rest");
+
+        // The nesting is right-associated pairs, so field `j` is reached by taking the
+        // second element `j - 1` times and then the first — except the last, which IS
+        // the second element all the way down.
+        let reach = |j: usize| {
+            let mut path = Expr::Ident(tail, self.node());
+            for _ in 0..j.saturating_sub(1) {
+                path = Expr::TupleIndex { id: self.node(), tuple: Box::new(path), index: 1 };
+            }
+            if j < fields.len() - 1 {
+                path = Expr::TupleIndex { id: self.node(), tuple: Box::new(path), index: 0 };
+            }
+            path
+        };
+
+        let mut built = fields[fields.len() - 1].1.clone();
+        for index in (0..fields.len() - 1).rev() {
+            let outermost = index == 0;
+            let body = if outermost {
+                let mut assembled = vec![(fields[0].0, Expr::Ident(head, self.node()))];
+                for (j, (name, _)) in fields.iter().enumerate().skip(1) {
+                    assembled.push((*name, reach(j)));
+                }
+                Expr::Record(assembled, self.node())
+            } else {
+                Expr::Tuple(
+                    vec![Expr::Ident(head, self.node()), Expr::Ident(tail, self.node())],
+                    self.node(),
+                )
+            };
+            built = Expr::Call { id: self.node(),
+                func: Box::new(Expr::Qualified { id: self.node(), module: combiner, name: "map2" }),
+                args: vec![
+                    fields[index].1.clone(),
+                    built,
+                    Expr::Lambda { id: self.node(),
+                        params: std::rc::Rc::new(vec![head, tail]),
+                        body: std::rc::Rc::new(body),
+                    },
+                ],
+            };
+        }
+        Ok(built)
+    }
+
     /// Parse a `.{ ... }` method block after a nominal declaration.
     ///
     /// The block holds ordinary bindings — `reveal = |s| s.key` — which become
@@ -882,14 +1141,20 @@ impl Parser {
         }
         self.pos += 2;
 
+        // Whatever annotations are pending when this block closes, and were pushed
+        // while it was open, are its members WITHOUT a body — its intrinsics.
+        let outer_annotations = self.pending_annotations.len();
+
         loop {
             self.skip_trivia();
             let rest = &self.input[self.pos..];
             if rest.is_empty() {
+                self.claim_intrinsics(type_name, outer_annotations);
                 return;
             }
             if rest.starts_with('}') {
                 self.pos += 1;
+                self.claim_intrinsics(type_name, outer_annotations);
                 return;
             }
 
@@ -918,6 +1183,11 @@ impl Parser {
             // Claimed before parsing the value: `skip_trivia` above already read the
             // annotation line into `pending_annotations`.
             let annotation = self.claim_annotation(method);
+            if let Some(ty) = &annotation {
+                let qualified: &'static str =
+                    Box::leak(format!("{}.{}", type_name, method).into_boxed_str());
+                self.signatures.push((qualified, ty.clone()));
+            }
 
             match self.parse_or_expr() {
                 Ok(value) => {
@@ -925,9 +1195,67 @@ impl Parser {
                         Box::leak(format!("{}.{}", type_name, method).into_boxed_str());
                     self.methods.push((qualified, annotation, value));
                 }
-                Err(_) => return,
+                Err(_) => {
+                    self.claim_intrinsics(type_name, outer_annotations);
+                    return;
+                }
             }
         }
+    }
+
+    /// Move the annotations a closing method block left unclaimed into `intrinsics`.
+    ///
+    /// `outer` is how many annotations were pending when the block opened; anything
+    /// past that was declared inside it. A nested block runs first and takes its own,
+    /// so each name lands under the type that declared it.
+    fn claim_intrinsics(&mut self, type_name: &str, outer: usize) {
+        let from = outer.min(self.pending_annotations.len());
+        for (name, ty) in self.pending_annotations.split_off(from) {
+            let qualified: &'static str = if type_name.is_empty() {
+                name
+            } else {
+                Box::leak(format!("{}.{}", type_name, name).into_boxed_str())
+            };
+            self.signatures.push((qualified, ty.clone()));
+            self.intrinsics.push((qualified, ty));
+        }
+    }
+
+    /// Members declared with a type but no body: what Rust has to supply.
+    pub fn intrinsics(&self) -> &[(&'static str, Type)] {
+        &self.intrinsics
+    }
+
+    /// Literal nodes with an explicit type suffix, and the type each named.
+    pub fn suffixed_literals(&self) -> Vec<(crate::ast::NodeId, Type)> {
+        SUFFIXED.with(|s| {
+            s.borrow()
+                .iter()
+                .filter_map(|(id, name)| {
+                    Some((*id, builtin_type(name, Vec::new(), || Type::TypeVar(u32::MAX))?))
+                })
+                .collect()
+        })
+    }
+
+    /// Record literals written as `Name.{ … }`, with the nominal's type.
+    pub fn nominal_literals(&self) -> &[(crate::ast::NodeId, Type)] {
+        &self.nominal_literals
+    }
+
+    /// The nominals declared with `::` — the opaque form.
+    pub fn opaque_nominals(&self) -> &[&'static str] {
+        &self.opaque_nominals
+    }
+
+    /// The nominal types the file declared, as `(name, backing)`.
+    pub fn nominals(&self) -> &[(&'static str, Type)] {
+        &self.nominals
+    }
+
+    /// Every `Type.method` annotation the file declared, with or without a body.
+    pub fn signatures(&self) -> &[(&'static str, Type)] {
+        &self.signatures
     }
 
     /// Method names any `where` clause in the file promised.
@@ -1505,6 +1833,17 @@ impl Parser {
     /// lambda body without braces goes through it too, and would swallow the rest of
     /// the file.
     fn parse_top_level(&mut self) -> Result<Expr, ParseError> {
+        // A file can be nothing but declarations. `Builtin.roc` is 23,555 lines of
+        // them, and so is any module whose types and methods are all claimed by
+        // `skip_trivia`; there is no trailing expression left to be the file's value,
+        // so its value is `{}`. Only the outermost parse may decide this — a lambda
+        // body that runs out of input is a truncated file, not an empty one.
+        if self.expr_depth == 1 {
+            self.skip_trivia();
+            if self.input[self.pos..].is_empty() {
+                return Ok(Expr::Unit(self.node()));
+            }
+        }
         let value = self.parse_let_or_expr()?;
         // A top-level test waits for the whole file, so it is set aside here and put
         // back at the end by `parse_expr`.
@@ -1871,6 +2210,51 @@ impl Parser {
             self.skip_whitespace();
             let rest = &self.input[self.pos..];
 
+            // Postfix `?`. It cannot be unwrapped where it stands — the whole rest of
+            // the block has to move into the `Ok` arm — so the Try is lifted out under
+            // a fresh name here and `parse_block` folds the match around the statement.
+            // That covers `f(g(x)?)` and `if predicate(item)? { … }` as well as
+            // `$t + double(x)?`, where the `?` binds to an operand rather than to the
+            // statement's value.
+            //
+            // The case where the `?` DOES cover the whole value is handed straight
+            // back to the statement parser, which needs no extra binding for it; see
+            // `parse_block`. `??` is the default operator and belongs to
+            // `parse_or_expr`, and `?:` is an optional record field.
+            if rest.starts_with('?')
+                && !rest.starts_with("??")
+                && self.block_depth > 0
+                && !rest[1..].starts_with(':')
+            {
+                self.pos += 1;
+                // Inline only: a mapper sits on the SAME line, and crossing the
+                // newline would swallow whatever declaration comes next.
+                self.skip_inline_whitespace();
+                // `expr ? |e| MyError(e)` replaces the error before propagating it,
+                // and `expr ? MyError` is the short spelling of the same thing — a tag
+                // name used as the constructor it is.
+                let rest = &self.input[self.pos..];
+                let mapper = if rest.starts_with('|') {
+                    Some(self.parse_lambda()?)
+                } else if rest.starts_with(char::is_uppercase) {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    self.pos += name.len();
+                    let name: &'static str = Box::leak(name.into_boxed_str());
+                    Some(Expr::Tag { id: self.node(), name, args: Vec::new() })
+                } else {
+                    None
+                };
+                let fresh: &'static str =
+                    Box::leak(format!("#try{}", self.pending_tries.len()).into_boxed_str());
+                self.pending_tries.push((fresh, expr, mapper));
+                expr = Expr::Ident(fresh, self.node());
+                self.skip_whitespace();
+                continue;
+            }
+
             // Postfix field access: `r.x`, and chains like `r.a.b`. Applies to any
             // receiver — `f(x).field` and `{ a: 1 }.a` included — which is why it
             // lives here rather than in the identifier branch of parse_primary_expr.
@@ -1890,6 +2274,28 @@ impl Parser {
                     message: "Expected a field name after `.?`".to_string(),
                     position: self.pos,
                 });
+            }
+
+            // RECORD BUILDER: `{ a: pa, b: pb }.Combiner`.
+            //
+            // roc combines the fields with the named type's `map2`, so a record of
+            // parsers becomes a parser of records. `DateParser.roc` writes the
+            // expansion out by hand in its second test, which is what this matches.
+            if rest.starts_with('.') && rest[1..].starts_with(char::is_uppercase) {
+                if let Expr::Record(fields, _) = &expr {
+                    let fields = fields.clone();
+                    self.pos += 1;
+                    let rest = &self.input[self.pos..];
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    self.pos += name.len();
+                    self.skip_whitespace();
+                    let combiner: &'static str = Box::leak(name.into_boxed_str());
+                    expr = self.record_builder(combiner, &fields)?;
+                    continue;
+                }
             }
 
             // Positional tuple access: `.0`, `.1`. Same postfix slot as `.field`,
@@ -2043,7 +2449,16 @@ impl Parser {
         self.skip_whitespace();
         if content.contains("${") {
             let parts =
-                parse_interpolation_parts(&content, &self.nominals, &self.nominal_defaults)?;
+                {
+                    let (nominals, defaults) =
+                        (self.nominals.clone(), self.nominal_defaults.clone());
+                    parse_interpolation_parts(
+                        &content,
+                        &nominals,
+                        &defaults,
+                        &mut self.nominal_literals,
+                    )?
+                };
             return Ok(Expr::StrInterp(parts, self.node()));
         }
         Ok(Expr::Str(string_pool::intern(&content), self.node()))
@@ -2113,7 +2528,7 @@ impl Parser {
         }
         self.pos += 1;
 
-        Ok(Expr::Int(ch as i64, self.node()))
+        Ok(Expr::Int(ch as i128, self.node()))
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr, ParseError> {
@@ -2271,10 +2686,19 @@ impl Parser {
         }
 
         // Try number
-        if let Ok((remaining, expr)) = parse_number_literal(rest) {
-            self.pos += rest.len() - remaining.len();
-            self.skip_whitespace();
-            return Ok(expr);
+        match parse_number_literal(rest) {
+            Ok((remaining, expr)) => {
+                self.pos += rest.len() - remaining.len();
+                self.skip_whitespace();
+                return Ok(expr);
+            }
+            // A literal that IS a number but does not fit says so. Falling through to
+            // the string branch reported `Expected '"'` three tokens later, which named
+            // neither the literal nor the reason.
+            Err(e) if e.message.starts_with("Integer literal") => {
+                return Err(ParseError { message: e.message, position: self.pos })
+            }
+            Err(_) => {}
         }
 
         // Try string
@@ -2302,9 +2726,15 @@ impl Parser {
                                 // Omitting a defaulted field substitutes its default,
                                 // so the record always has it — which is why a
                                 // defaulted field needs no unwrapping to read.
-                                return Ok(self.fill_defaults(base, built));
+                                let built = self.fill_defaults(base, built);
+                                if let Some(declared) = self.nominal(base) {
+                                    self.nominal_literals.push((built.id(), declared));
+                                }
+                                return Ok(built);
                             }
                             // `Name.(payload)` builds a nominal over a non-record
+                            // — recorded for the same reason `.{ … }` is: the nominal
+                            // is erased, so this is what keeps the payload's type.
                             // payload: `UserId.(7)` is 7, `Pair.(1, "two")` is the
                             // tuple. Like `.{ }`, the nominal name is erased — roc
                             // inspects both as the bare payload. Skipping the `.`
@@ -2312,16 +2742,27 @@ impl Parser {
                             // tuple depending on the comma.
                             if self.input[self.pos..].starts_with(".(") {
                                 self.pos += 1;
-                                return self.parse_primary_expr();
+                                let built = self.parse_primary_expr()?;
+                                if let Some(declared) = self.nominal(base) {
+                                    self.nominal_literals.push((built.id(), declared));
+                                }
+                                return Ok(built);
                             }
                             if let Some(qualified) = self.try_parse_qualified(base) {
                                 // `Animal.Dog(x)` is the tag `Dog(x)`: the
                                 // qualification says which nominal it belongs to, and
                                 // carries no runtime weight.
                                 if let Expr::Qualified { module, name, .. } = qualified {
-                                    if self.nominal(module).is_some()
-                                        && name.starts_with(|c: char| c.is_uppercase())
-                                    {
+                                    // A capitalised name after a module is a TAG,
+                                    // whether or not this file declared the nominal:
+                                    // `Try.Ok(x)` is `Ok(x)`, and `Try` is declared in
+                                    // `Builtin.roc`, not here. Requiring a local
+                                    // declaration made every qualified builtin tag an
+                                    // "Unknown function". `Bool.True` lands on the
+                                    // boolean through `finish_tag`, as the bare
+                                    // spelling does.
+                                    let _ = module;
+                                    if name.starts_with(|c: char| c.is_uppercase()) {
                                         return self.finish_tag(name);
                                     }
                                 }
@@ -2412,6 +2853,17 @@ impl Parser {
         mapper: Option<Expr>,
     ) -> Expr {
         let propagated = match mapper {
+            // `? MyError` — the mapper is the tag CONSTRUCTOR, so the error goes
+            // inside it rather than being handed to it as a function.
+            Some(Expr::Tag { name, args, .. }) if args.is_empty() => {
+                Expr::Tag { id: crate::ast::fresh_node_unlocated(),
+                    name: "Err",
+                    args: vec![Expr::Tag { id: crate::ast::fresh_node_unlocated(),
+                        name,
+                        args: vec![Expr::Ident("e", crate::ast::fresh_node_unlocated())],
+                    }],
+                }
+            }
             Some(map) => Expr::Tag { id: crate::ast::fresh_node_unlocated(),
                 name: "Err",
                 args: vec![Expr::Call { id: crate::ast::fresh_node_unlocated(),
@@ -2421,6 +2873,17 @@ impl Parser {
             },
             None => Expr::Tag { id: crate::ast::fresh_node_unlocated(), name: "Err", args: vec![Expr::Ident("e", crate::ast::fresh_node_unlocated())] },
         };
+
+        // `return`, not a bare `Err(e)`: `?` leaves the enclosing FUNCTION, and the
+        // continuation it wraps is not always the function's body. Inside a `for` or
+        // `while` the block's value is `{}`, so yielding `Err(e)` there is both a type
+        // error and the wrong control flow — the loop would carry on. Builtin.roc
+        // propagates from inside a loop (`$out = append($out, transform(item)?)`), and
+        // so does `tests/roc/17_error_handling`.
+        let propagated = Expr::Return(
+            Box::new(propagated),
+            crate::ast::fresh_node_unlocated(),
+        );
 
         Expr::Match { id: crate::ast::fresh_node_unlocated(),
             scrutinee: Box::new(value),
@@ -2558,6 +3021,20 @@ impl Parser {
             return self.parse_list_pattern();
         }
 
+        // A grapheme literal matches the NUMBER it denotes — roc has no character type,
+        // so `'"' => …` is the pattern `34`. Builtin.roc's JSON scanner matches bytes
+        // that way.
+        if rest.starts_with('\'') {
+            let literal = self.parse_grapheme_literal()?;
+            return match literal {
+                Expr::Int(n, _) => Ok(Pattern::Int(n)),
+                other => Err(ParseError {
+                    message: format!("Expected a grapheme literal pattern, got {}", other),
+                    position: self.pos,
+                }),
+            };
+        }
+
         // A bare record pattern — `|{ x, y }|`, or a `match` arm. Previously only the
         // nominal spelling `Name.{ ... }` reached the record-pattern parser, so
         // destructuring a plain record in a parameter was a parse error.
@@ -2580,7 +3057,7 @@ impl Parser {
             self.skip_whitespace();
             return match expr {
                 Expr::Int(n, _) => Ok(Pattern::Int(n)),
-                Expr::Float(n, _) => Ok(Pattern::Float(n)),
+                Expr::Float(n, ..) => Ok(Pattern::Float(n)),
                 other => Err(ParseError {
                     message: format!("Unsupported numeric pattern: {}", other),
                     position: self.pos,
@@ -2678,8 +3155,11 @@ impl Parser {
     /// `f(x)`, never by juxtaposition — so the expression parser stops on its own
     /// once the then-branch begins.
     ///
-    /// `else` is mandatory: `if` is an expression, and roc rejects a bare `if` with
-    /// "The second branch of this if does not match the previous branch".
+    /// `else` is OPTIONAL, and a missing one means `{}`. roc parses `if cond { … }`
+    /// happily and gives it the type `{}` — using the result is then a type error
+    /// ("The value's type, which does not have a method named from_numeral, is: {}"),
+    /// not a parse error. That is what makes an else-less `if` usable as a statement,
+    /// which is how `Builtin.roc` writes a guarded assignment inside a loop.
     ///
     /// `else if` is parsed by recursing, which builds an `If` whose `otherwise` is
     /// another `If` — there is no separate else-if node.
@@ -2694,10 +3174,8 @@ impl Parser {
         self.skip_whitespace();
 
         if !starts_with_keyword(&self.input[self.pos..], "else") {
-            return Err(ParseError {
-                message: "Expected 'else': every if must have an else branch".to_string(),
-                position: self.pos,
-            });
+            let otherwise = Box::new(Expr::Unit(self.node()));
+            return Ok(Expr::If { id: self.node(), condition, then_branch, otherwise });
         }
         self.pos += 4; // Skip "else"
         self.skip_whitespace();
@@ -2908,20 +3386,22 @@ impl Parser {
 
             // `..rest` binds every field the pattern does not name, which is how a
             // field gets removed: name it `_`, capture the rest.
+            //
+            // A BARE `..` says only "and whatever else is in there", which is how
+            // Builtin.roc writes most of its record patterns
+            // (`Found({ data, entry_index, .. })`). It binds the remainder to the
+            // throwaway name rather than to nothing, because `rest` is also what tells
+            // the checker the record is open — see `pattern_type`.
             if rest.starts_with("..") {
                 self.pos += 2;
                 self.skip_whitespace();
                 let rest = &self.input[self.pos..];
-                let (leftover, ident) = parse_identifier(rest)?;
-                self.pos += rest.len() - leftover.len();
-                match ident {
-                    Expr::Ident(name, _) => rest_binding = Some(name),
-                    other => {
-                        return Err(ParseError {
-                            message: format!("Expected a name after `..`, got {}", other),
-                            position: self.pos,
-                        })
+                match parse_identifier(rest) {
+                    Ok((leftover, Expr::Ident(name, _))) => {
+                        self.pos += rest.len() - leftover.len();
+                        rest_binding = Some(name);
                     }
+                    _ => rest_binding = Some("_"),
                 }
                 self.skip_whitespace();
                 if self.input[self.pos..].starts_with(',') {
@@ -3130,16 +3610,18 @@ impl Parser {
         self.pos += 3; // Skip "for"
         self.skip_whitespace();
 
-        let rest = &self.input[self.pos..];
-        let (remaining, ident) = parse_identifier(rest)?;
-        self.pos += rest.len() - remaining.len();
-        let name = match ident {
-            Expr::Ident(n, _) => n,
+        // The loop variable is a PATTERN, not just a name: `for (key, value) in dict`
+        // is how Builtin.roc walks a Dict's entries. Only a plain binding can be the
+        // loop variable itself, so anything else iterates over a fresh name and
+        // destructures it in the body — the same shape the desugarer already gives
+        // `(a, b) = pair`.
+        let pattern = self.parse_pattern()?;
+        let (name, destructure) = match pattern {
+            Pattern::Binding(n) => (n, None),
             other => {
-                return Err(ParseError {
-                    message: format!("Expected a loop variable after `for`, got {}", other),
-                    position: self.pos,
-                })
+                let fresh: &'static str =
+                    Box::leak(format!("#for{}", self.pos).into_boxed_str());
+                (fresh, Some(other))
             }
         };
 
@@ -3157,13 +3639,43 @@ impl Parser {
         // into a brace.
         let iterable = Box::new(self.parse_or_expr()?);
         self.skip_whitespace();
+
+        // `for x in xs if cond { … }` — a filtered loop. The body runs only for the
+        // items that satisfy the guard, so it is exactly the body wrapped in an
+        // else-less `if`. Verified against the real compiler: `for x in [1,2,3] if
+        // x > 1 { $t = $t + x }` leaves `$t` at 5.
+        let mut guard = None;
+        if starts_with_keyword(&self.input[self.pos..], "if") {
+            self.pos += 2;
+            self.skip_whitespace();
+            guard = Some(self.parse_or_expr()?);
+            self.skip_whitespace();
+        }
+
         if !self.input[self.pos..].starts_with('{') {
             return Err(ParseError {
                 message: "Expected '{' to open the `for` loop body".to_string(),
                 position: self.pos,
             });
         }
-        let body = Box::new(self.parse_block()?);
+        let mut body = Box::new(self.parse_block()?);
+        if let Some(condition) = guard {
+            body = Box::new(Expr::If { id: self.node(),
+                condition: Box::new(condition),
+                then_branch: body,
+                otherwise: Box::new(Expr::Unit(self.node())),
+            });
+        }
+        if let Some(pattern) = destructure {
+            body = Box::new(Expr::Match { id: self.node(),
+                scrutinee: Box::new(Expr::Ident(name, self.node())),
+                arms: vec![crate::ast::MatchArm {
+                    patterns: vec![pattern],
+                    guard: None,
+                    body: *body,
+                }],
+            });
+        }
 
         Ok(Expr::For { id: self.node(), name, iterable, body })
     }
@@ -3345,16 +3857,29 @@ impl Parser {
         self.pos += 1; // Skip '{'
         self.skip_whitespace();
 
+        // A block starts a fresh statement context: this one may be nested inside a
+        // statement of an enclosing block — a lambda body in a call argument — and a
+        // `?` in ITS first statement must be lifted to ITS statement, not the caller's.
+        let enclosing_tries = std::mem::take(&mut self.pending_tries);
+        self.block_depth += 1;
+        let parsed = self.parse_block_inner();
+        self.block_depth -= 1;
+        self.pending_tries = enclosing_tries;
+        parsed
+    }
+
+    fn parse_block_inner(&mut self) -> Result<Expr, ParseError> {
+
         if self.input[self.pos..].starts_with('}') {
             self.pos += 1;
             self.skip_whitespace();
             return Ok(Expr::Unit(self.node()));
         }
 
-        // (binding target, annotation, value, uses `?`) per statement; the last is
-        // the block's result.
-        // `(target, annotation, value, propagates, error mapper)`.
-        type Stmt = (BindTarget, Option<Type>, Expr, bool, Option<Expr>);
+        // One per statement; the last is the block's result.
+        // `(target, annotation, value, propagates, error mapper, lifted `?` sites)`.
+        type Stmt =
+            (BindTarget, Option<Type>, Expr, bool, Option<Expr>, Vec<(&'static str, Expr, Option<Expr>)>);
         let mut stmts: Vec<Stmt> = Vec::new();
 
         loop {
@@ -3407,7 +3932,14 @@ impl Parser {
                 self.pos += 1;
                 self.skip_whitespace();
                 let value = self.parse_or_expr()?;
-                stmts.push((BindTarget::Var(name), None, value, false, None));
+                stmts.push((
+                    BindTarget::Var(name),
+                    None,
+                    value,
+                    false,
+                    None,
+                    std::mem::take(&mut self.pending_tries),
+                ));
                 continue;
             }
 
@@ -3422,12 +3954,19 @@ impl Parser {
             // A record destructuring `{ x, y } = r` is the same shape as a tuple one.
             let opens_paren = rest.starts_with('(');
             let opens_brace = rest.starts_with('{');
-            if opens_paren || opens_brace {
+            // `Ok(encoded) = expr` destructures a TAG, which is how Builtin.roc unwraps
+            // a Try it has already proved cannot fail. It starts with a capital, and so
+            // does an ordinary statement like `Str.inspect(x)` — the backtracking below
+            // is what tells them apart, on whether an `=` follows.
+            let opens_tag = rest.starts_with(char::is_uppercase);
+            if opens_paren || opens_brace || opens_tag {
                 let saved = self.pos;
                 let parsed = if opens_paren {
                     self.parse_tuple_pattern()
-                } else {
+                } else if opens_brace {
                     self.parse_record_pattern()
+                } else {
+                    self.parse_pattern()
                 };
                 if let Ok(pattern) = parsed {
                     self.skip_whitespace();
@@ -3475,21 +4014,25 @@ impl Parser {
                 }
             }
 
-            let value = self.parse_or_expr()?;
+            let mut value = self.parse_or_expr()?;
 
-            // Postfix `?` on a statement's value. Not `??`, which the expression
-            // parser has already consumed by this point.
-            let propagates = self.input[self.pos..].starts_with('?');
+            // `parse_call_expr` lifts every `?` it sees, including one that covers the
+            // statement's whole value — which shows up here as the value being nothing
+            // but the fresh name of the try just pushed. Take that one back: the
+            // statement form binds the unwrapped value directly, with no extra `let`,
+            // and it is the form that must still reject `?` on a block's final
+            // expression. Any remaining tries were nested inside the value and stay
+            // lifted.
+            let mut propagates = false;
             let mut mapper = None;
-            if propagates {
-                self.pos += 1;
-                self.skip_whitespace();
-                // `expr ? |e| MyError(e)` REPLACES the error before propagating it.
-                // Without the mapper the original error travels unchanged.
-                if self.input[self.pos..].starts_with('|') {
-                    mapper = Some(self.parse_lambda()?);
+            if let Expr::Ident(name, _) = &value {
+                if self.pending_tries.last().is_some_and(|(fresh, ..)| fresh == name) {
+                    let (_, scrutinee, lifted) =
+                        self.pending_tries.pop().expect("checked above");
+                    value = scrutinee;
+                    mapper = lifted;
+                    propagates = true;
                 }
-                self.skip_whitespace();
             }
 
             stmts.push((
@@ -3498,17 +4041,28 @@ impl Parser {
                 value,
                 propagates,
                 mapper,
+                std::mem::take(&mut self.pending_tries),
             ));
         }
 
         // Fold from the end: every statement wraps the one after it, so the
         // "rest of the block" is whatever has been folded so far.
-        let (result_target, _result_annotation, result, result_propagates, _result_mapper) =
-            stmts.pop().ok_or_else(|| ParseError {
+        let (
+            result_target,
+            _result_annotation,
+            result,
+            result_propagates,
+            result_mapper,
+            result_tries,
+        ) = stmts.pop().ok_or_else(|| ParseError {
             message: "Empty block body".to_string(),
             position: self.pos,
         })?;
-        if result_propagates {
+        // Only when the last statement IS the block's value. An assignment or a `var`
+        // still evaluates to `{}` whatever its right-hand side does, so
+        // `for x in xs { $s = step($s, x)? }` has a perfectly good continuation — the
+        // implicit `{}` — and roc accepts it. Builtin.roc's `fold_try` is exactly that.
+        if result_propagates && matches!(result_target, BindTarget::Name(_)) {
             // `?` unwraps, so a block ending in `expr?` evaluates to the unwrapped
             // value rather than a Try. roc rejects that against a Try return type,
             // and there is no continuation to put in the Ok arm.
@@ -3518,6 +4072,19 @@ impl Parser {
                 position: self.pos,
             });
         }
+        // A propagating assignment assigns the UNWRAPPED value, so it is lifted like
+        // any nested `?`: bind the `Ok` to a fresh name and assign that. Appending it
+        // last puts it innermost, inside any `?` that its own right-hand side used.
+        let (result, result_tries) = if result_propagates {
+            let mut tries = result_tries;
+            let fresh: &'static str =
+                Box::leak(format!("#try{}", tries.len()).into_boxed_str());
+            tries.push((fresh, result, result_mapper));
+            (Expr::Ident(fresh, self.node()), tries)
+        } else {
+            (result, result_tries)
+        };
+
         // A block's value is its LAST expression — but if that last statement is an
         // assignment or a `var`, it still has to run, and the block's value is unit.
         // Dropping the target here silently discarded the mutation, so
@@ -3544,7 +4111,8 @@ impl Parser {
             },
             BindTarget::Name(_) => result,
         };
-        while let Some((target, annotation, value, propagates, mapper)) = stmts.pop() {
+        body = Self::lift_tries(result_tries, body);
+        while let Some((target, annotation, value, propagates, mapper, tries)) = stmts.pop() {
             // A destructuring binding is a one-arm match: `(a, b) = v` then the rest
             // is exactly `match v { (a, b) => rest }`. No new AST node needed.
             if let BindTarget::Destructure(pattern) = target {
@@ -3557,12 +4125,14 @@ impl Parser {
                         body,
                         mapper,
                     );
+                    body = Self::lift_tries(tries, body);
                     continue;
                 }
                 body = Expr::Match { id: self.node(),
                     scrutinee: Box::new(value),
                     arms: vec![MatchArm { patterns: vec![pattern], guard: None, body }],
                 };
+                body = Self::lift_tries(tries, body);
                 continue;
             }
             let name = match target {
@@ -3573,6 +4143,7 @@ impl Parser {
                         value: Box::new(value),
                         body: Box::new(body),
                     };
+                    body = Self::lift_tries(tries, body);
                     continue;
                 }
                 BindTarget::Assign(name) => {
@@ -3581,6 +4152,7 @@ impl Parser {
                         value: Box::new(value),
                         body: Box::new(body),
                     };
+                    body = Self::lift_tries(tries, body);
                     continue;
                 }
                 BindTarget::Destructure(_) => unreachable!("handled above"),
@@ -3614,8 +4186,25 @@ impl Parser {
                     body: Box::new(body),
                 }
             };
+            body = Self::lift_tries(tries, body);
         }
         Ok(body)
+    }
+
+    /// Wrap `body` in the `match` each lifted `?` needs.
+    ///
+    /// The tries were collected left to right, so they are applied in reverse: the
+    /// last one lands innermost, and `f(g(x)?, h(y)?)` unwraps `g(x)` before `h(y)`,
+    /// which is the order the arguments are evaluated in.
+    fn lift_tries(tries: Vec<(&'static str, Expr, Option<Expr>)>, body: Expr) -> Expr {
+        tries.into_iter().rev().fold(body, |body, (name, value, mapper)| {
+            Self::propagate_error_pattern(
+                Pattern::Tag { name: "Ok", args: vec![Pattern::Binding(name)] },
+                value,
+                body,
+                mapper,
+            )
+        })
     }
 
     /// Parse lambda expression: |params| body
@@ -3725,7 +4314,8 @@ impl Parser {
         // The sub-parser for each `${...}` needs the nominal declarations too, or
         // `Animal.Dog(x)` inside an interpolation parses as a qualified CALL instead of
         // a tag. Any parser state a nested expression depends on has to be passed down.
-        match parse_string_literal(rest, &self.nominals, &self.nominal_defaults) {
+        let (nominals, defaults) = (self.nominals.clone(), self.nominal_defaults.clone());
+        match parse_string_literal(rest, &nominals, &defaults, &mut self.nominal_literals) {
             Ok((remaining, expr)) => {
                 self.pos += rest.len() - remaining.len();
                 Ok(expr)
@@ -3743,6 +4333,7 @@ fn parse_string_literal<'input>(
     input: &'input str,
     nominals: &[(&'static str, Type)],
     nominal_defaults: &[(String, Vec<(String, Expr)>)],
+    nominal_literals: &mut Vec<(crate::ast::NodeId, Type)>,
 ) -> Result<(&'input str, Expr), ParseError> {
     // Check for opening quote
     if !input.starts_with('"') {
@@ -3768,7 +4359,12 @@ fn parse_string_literal<'input>(
         Ok((remaining, Expr::Str(string_pool::intern(""), crate::ast::fresh_node_unlocated())))
     } else if content.contains("${") {
         // Parse interpolation expressions
-        let parts = parse_interpolation_parts(&content, nominals, nominal_defaults)?;
+        let parts = parse_interpolation_parts(
+            &content,
+            nominals,
+            nominal_defaults,
+            nominal_literals,
+        )?;
         Ok((remaining, Expr::StrInterp(parts, crate::ast::fresh_node_unlocated())))
     } else {
         // Plain string
@@ -3955,6 +4551,41 @@ fn scan_digits(bytes: &[u8], mut pos: usize, accept: impl Fn(u8) -> bool) -> (us
 ///
 /// Digit separators are allowed throughout. Verified against roc: `1_000_000` is
 /// 1000000, `1e3` is 1000, `1.5e-3` is 0.0015, `0xFF_FF` is 65535.
+/// A decimal literal's digits as a `Dec`: the value times 10^18.
+///
+/// Read from the TEXT, because the double it also parses to has already lost the last
+/// places — which is the whole reason `Dec` exists. An exponent falls back to the
+/// double, since `1e30` has no exact fixed-point form anyway.
+fn scale_decimal(number: &str, is_negative: bool) -> i128 {
+    let scale = crate::eval::DEC_SCALE;
+    if number.contains(['e', 'E']) {
+        return crate::eval::dec_from_f64(
+            number.parse::<f64>().unwrap_or(0.0) * if is_negative { -1.0 } else { 1.0 },
+        );
+    }
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    // Eighteen places is where a `Dec` stops; anything past them is dropped, as it is
+    // by every other operation on one.
+    let mut digits: String = fraction.chars().take(18).collect();
+    while digits.len() < 18 {
+        digits.push('0');
+    }
+    let whole: i128 = whole.parse().unwrap_or(0);
+    let fraction: i128 = digits.parse().unwrap_or(0);
+    let magnitude = whole.saturating_mul(scale).saturating_add(fraction);
+    if is_negative { -magnitude } else { magnitude }
+}
+
+thread_local! {
+    /// Literal nodes that carried an explicit type SUFFIX — `255.U8` — and which type.
+    ///
+    /// A thread-local because the number literal is read by a free function with no
+    /// parser to hand, and the alternative is threading an out-parameter through every
+    /// call site of it. `Parser::take_suffixed` drains it.
+    static SUFFIXED: std::cell::RefCell<Vec<(crate::ast::NodeId, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
     let bytes = input.as_bytes();
     let mut pos = 0;
@@ -3991,7 +4622,7 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
                     position: next,
                 });
             }
-            let value = i64::from_str_radix(&digits, radix).map_err(|_| ParseError {
+            let value = i128::from_str_radix(&digits, radix).map_err(|_| ParseError {
                 message: format!("Invalid {} number: {}", label, digits),
                 position: 0,
             })?;
@@ -4045,25 +4676,60 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
             position: 0,
         })?;
         let value = if is_negative { -value } else { value };
+        // The SAME literal as a fixed-point value, read off the digits rather than off
+        // the double, so `147.666666666666666666` keeps all eighteen places.
+        let scaled = scale_decimal(&number, is_negative);
 
         // A fractional type suffix, e.g. `3.14.F64`.
         let remaining = &input[pos..];
         for suffix in [".F32", ".F64", ".Dec"] {
             if let Some(rest) = remaining.strip_prefix(suffix) {
-                return Ok((rest, Expr::Float(value, crate::ast::fresh_node_unlocated())));
+                return Ok((
+                    rest,
+                    Expr::Float(value, scaled, crate::ast::fresh_node_unlocated()),
+                ));
             }
         }
-        return Ok((remaining, Expr::Float(value, crate::ast::fresh_node_unlocated())));
+        return Ok((
+            remaining,
+            Expr::Float(value, scaled, crate::ast::fresh_node_unlocated()),
+        ));
     }
 
-    let value = number.parse::<i64>().map_err(|_| ParseError {
-        message: format!("Invalid number: {}", number),
+    // Parsed WIDE, then narrowed. `-9223372036854775808` is `i64::MIN`, and its
+    // magnitude is one past `i64::MAX` — reading the digits as an `i64` before applying
+    // the sign rejects the one literal that names the smallest integer there is.
+    // `Builtin.roc` writes it out for `I64.lowest`.
+    // Read UNSIGNED, then apply the sign. `I128.lowest` is
+    // -170141183460469231731687303715884105728, and its magnitude is one past
+    // `i128::MAX` — the same trap `I64.lowest` sprang, one width up.
+    let magnitude = number.parse::<u128>().map_err(|_| ParseError {
+        message: format!("Integer literal {} does not fit in I128", number),
         position: 0,
     })?;
-    let value = if is_negative { -value } else { value };
+    // KEPT WIDE. `U64.highest` is 18446744073709551615 and `U128.highest` is
+    // 340282366920938463463374607431768211455 — both are written out in `Builtin.roc`,
+    // and narrowing the literal to an i64 is what stopped `Iter` and `Num` parsing.
+    const I128_MIN_MAGNITUDE: u128 = 1u128 << 127;
+    let value = if is_negative {
+        if magnitude == I128_MIN_MAGNITUDE {
+            i128::MIN
+        } else {
+            -i128::try_from(magnitude).map_err(|_| ParseError {
+                message: format!("Integer literal -{} does not fit in I128", number),
+                position: 0,
+            })?
+        }
+    } else {
+        // `U128.highest` is past `i128::MAX`, so it is held as the same BIT PATTERN.
+        // Every width operation reads it back correctly; only a comparison or a
+        // `to_str` on one that large sees it as negative.
+        magnitude as i128
+    };
 
-    // An integer type suffix, e.g. `255.U8`. The value is unchanged: the interpreter
-    // keeps one integer representation, and the suffix is the annotation.
+    // An integer type suffix, e.g. `255.U8`. The VALUE is unchanged — one integer
+    // representation — but the TYPE is not: a suffixed literal is not a numeral waiting
+    // to be defaulted, it has already been told what it is.
     let remaining = &input[pos..];
     if remaining.starts_with('.') {
         let after = &remaining[1..];
@@ -4074,10 +4740,19 @@ fn parse_number_literal(input: &str) -> Result<(&str, Expr), ParseError> {
             if let Some(rest) = after.strip_prefix(suffix) {
                 // Only if the suffix ends there — `255.U8x` is not a suffix.
                 if !rest.starts_with(is_ident_char) {
+                    let node = crate::ast::fresh_node_unlocated();
+                    SUFFIXED.with(|s| s.borrow_mut().push((node, suffix)));
                     return if suffix.starts_with('F') || suffix == "Dec" {
-                        Ok((rest, Expr::Float(value as f64, crate::ast::fresh_node_unlocated())))
+                        Ok((
+                            rest,
+                            Expr::Float(
+                                value as f64,
+                                value.saturating_mul(crate::eval::DEC_SCALE),
+                                node,
+                            ),
+                        ))
                     } else {
-                        Ok((rest, Expr::Int(value, crate::ast::fresh_node_unlocated())))
+                        Ok((rest, Expr::Int(value, node)))
                     };
                 }
             }
@@ -4132,6 +4807,7 @@ fn parse_interpolation_parts(
     content: &str,
     nominals: &[(&'static str, Type)],
     nominal_defaults: &[(String, Vec<(String, Expr)>)],
+    nominal_literals: &mut Vec<(crate::ast::NodeId, Type)>,
 ) -> Result<Vec<StrPart>, ParseError> {
     let mut parts = Vec::new();
     let mut current_literal = String::new();
@@ -4188,6 +4864,10 @@ fn parse_interpolation_parts(
             expr_parser.nominals = nominals.to_vec();
             expr_parser.nominal_defaults = nominal_defaults.to_vec();
             let expr = expr_parser.parse_expr()?;
+            // And every piece it LEARNS has to be passed back up: a `Point.{ … }`
+            // inside an interpolation is a nominal construction like any other, and
+            // the checker only knows that from this record.
+            nominal_literals.extend(expr_parser.nominal_literals);
             parts.push(StrPart::Expr(Box::leak(Box::new(expr))));
         } else {
             // Push the whole character, not one byte of it: `as char` on a byte
@@ -4286,8 +4966,25 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
     }
 }
 
-fn named_type(name: &str, args: Vec<Type>, mut fresh: impl FnMut() -> Type) -> Type {
-    match (name, args.len()) {
+fn named_type(name: &str, args: Vec<Type>, fresh: impl FnMut() -> Type) -> Type {
+    let name_owned = name.to_string();
+    builtin_type(name, args, fresh).unwrap_or(
+        // Every other name is a TYPE, not an unknown: a user's own nominal has already
+        // been resolved by its declaration before this is reached. Answering a fresh
+        // variable threw the name away, which is what left `fruit_dict : Dict(Str, U64)`
+        // with no type at all and `fruit_dict.get(k)` with nothing to dispatch on.
+        //
+        // ponytail: the arguments are dropped — `Dict(Str, U64)` and `Dict(I64, Bool)`
+        // are the same type here. The NAME is what dispatch needs; carrying the
+        // arguments needs a parameterised type, and nothing yet asks for one.
+        Type::Nominal { name: name_owned, backing: Box::new(Type::TypeVar(u32::MAX)) },
+    )
+}
+
+/// The types Roc names and rocflight models directly. `None` for anything else.
+fn builtin_type(name: &str, args: Vec<Type>, mut fresh: impl FnMut() -> Type) -> Option<Type> {
+    let _ = &mut fresh;
+    Some(match (name, args.len()) {
         ("Str", 0) => Type::Str,
         ("Bool", 0) => Type::Bool,
         ("U8", 0) => Type::U8,
@@ -4314,8 +5011,8 @@ fn named_type(name: &str, args: Vec<Type>, mut fresh: impl FnMut() -> Type) -> T
                 open: false,
             }
         }
-        _ => fresh(),
-    }
+        _ => return None,
+    })
 }
 
 /// How a top-level destructuring reaches one element of its temporary.

@@ -9,7 +9,7 @@ add_one : Str => Try(I64, [BadNumStr])
 add_one = |s| {
     match I64.from_str(s) {
         Ok(n) => Ok(n + 1)
-        Err(e) => Err(e)
+        Err(e) => return Err(e)
     }
 }
 

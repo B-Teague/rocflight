@@ -170,6 +170,29 @@ pub struct Substitution {
 }
 
 impl Substitution {
+    /// Point every variable currently bound to `old` at `new` instead.
+    ///
+    /// An OPEN record grows as more of its fields are read, and by then the variable it
+    /// stands for has already been resolved away — `synth` applies the substitution
+    /// before returning a name's type. This is how the growth gets back to the
+    /// variable: nothing else is bound to that exact record, because the field types
+    /// inside it are freshly made.
+    pub fn rebind(&mut self, old: &Type, new: Type) {
+        for bound in self.bindings.values_mut() {
+            if bound == old {
+                *bound = new.clone();
+            }
+        }
+    }
+
+    /// Every variable this substitution binds.
+    ///
+    /// Used to follow unification in the other direction: a variable bound TO a
+    /// numeral's is as much a numeral as the original.
+    pub fn bound_vars(&self) -> Vec<u32> {
+        self.bindings.keys().copied().collect()
+    }
+
     /// Create empty substitution
     pub fn new() -> Self {
         Substitution {
@@ -201,6 +224,28 @@ impl Substitution {
             Type::Function(a, b) => {
                 Type::Function(Box::new(self.apply(a)), Box::new(self.apply(b)))
             }
+            // Every compound type, not just these two. A variable inside a tag's
+            // payload, a record's field or a tuple's slot was never substituted, so
+            // anything learned about it was learned and then thrown away — which is
+            // what kept `render(Foo(42, "answer"))` from telling `42` that
+            // `I64.to_str(n)` had already made it an I64.
+            Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.apply(t)).collect()),
+            Type::Optional(inner) => Type::Optional(Box::new(self.apply(inner))),
+            Type::Nominal { name, backing } => Type::Nominal {
+                name: name.clone(),
+                backing: Box::new(self.apply(backing)),
+            },
+            Type::Record { fields, open } => Type::Record {
+                fields: fields.iter().map(|(n, t)| (n.clone(), self.apply(t))).collect(),
+                open: *open,
+            },
+            Type::TagUnion { tags, open } => Type::TagUnion {
+                tags: tags
+                    .iter()
+                    .map(|(n, args)| (n.clone(), args.iter().map(|t| self.apply(t)).collect()))
+                    .collect(),
+                open: *open,
+            },
             other => other.clone(),
         }
     }

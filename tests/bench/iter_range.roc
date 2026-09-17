@@ -1,5 +1,5 @@
 # `.iter()` over a large range, folded. Building the range as a list cost 190 MB and
-# expect: 2000001000000
+# expect: 2000001000000.0
 # 208ms for two million elements; a range that stays a range costs neither.
 run = || {
 	xs = (1..=2000000).iter()

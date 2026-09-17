@@ -1,8 +1,10 @@
 //! `if` / `else` — phase 6.
 //!
 //! Verified against `roc` nightly-2026-09-03 before implementing:
-//!   * `if` is an EXPRESSION; `else` is mandatory. A bare `if` is rejected with
-//!     "The second branch of this if does not match the previous branch".
+//!   * `if` is an EXPRESSION, and `else` is OPTIONAL: `if cond { … }` parses and has
+//!     the type `{}`. Re-checked against nightly-2026-09-03 on 2026-09-16 — using the
+//!     result is a type error against `{}`, never a parse error, which is what lets a
+//!     bare `if` stand as a statement.
 //!   * the condition must be a Bool: "This if condition must evaluate to a Bool".
 //!   * `else if` is not a separate form — it nests.
 //!   * braced branches are real blocks, so they may bind names.
@@ -85,14 +87,24 @@ fn only_the_taken_branch_is_evaluated() {
 }
 
 #[test]
-fn missing_else_is_a_parse_error() {
-    // roc requires an else branch; so do we, and at parse time.
-    let err = parse(r#"if 1 == 1 "yes""#).expect_err("bare if should not parse");
-    assert!(
-        err.message.contains("else"),
-        "error should mention else, got {:?}",
-        err
-    );
+fn a_missing_else_branch_is_unit() {
+    // Not a parse error: roc accepts `if cond { … }` and gives the absent branch the
+    // type `{}`.
+    let ast = parse(r#"if 1 == 1 { 2 } "#).expect("a bare if parses");
+    assert_eq!(ast.to_string(), "if (1 == 1) 2 else {}");
+
+    // Using its value is still rejected, because `{}` does not unify with the taken
+    // branch — a TYPE error, which is exactly where roc reports it too ("The value's
+    // type, which does not have a method named from_numeral, is: {}").
+    let err = TypeChecker::new()
+        .synth(&parse(r#"if 1 == 1 { 2 } "#).unwrap())
+        .expect_err("a bare if with a value does not check");
+    assert!(err.message.contains("{}"), "got {:?}", err);
+
+    // It earns its keep as a STATEMENT, where both branches are `{}`. This is the
+    // shape `Builtin.roc` uses for a guarded assignment inside a loop.
+    let src = "f = |n| {\n\tvar $t = 0\n\tif n > 0 {\n\t\t$t = 1\n\t}\n\t$t\n}\n\nf(5)";
+    assert_eq!(eval(src).to_string(), "1");
 }
 
 #[test]

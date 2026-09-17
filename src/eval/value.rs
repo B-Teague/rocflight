@@ -13,10 +13,18 @@ pub enum Value {
     /// Building a 40,000-character string that way leaked 710 MB and never gave any of
     /// it back. Cloning stays cheap — a refcount bump instead of a pointer copy.
     Str(std::rc::Rc<str>),
-    /// Integer value (64-bit signed)
-    Int(i64),
+    /// An integer. `i128`, because Roc has `U64`, `I128` and a `Dec` that is a
+    /// 128-bit fixed-point value — an i64 cannot hold `U64.highest`, which
+    /// `Builtin.roc` writes out in full.
+    Int(i128),
     /// Float value (64-bit)
     Float(f64),
+    /// A fixed-point decimal: the value times `Dec::SCALE`, exactly as roc stores it
+    /// (`roc-compiler/src/builtins/dec.zig`, `decimal_places: u5 = 18`).
+    ///
+    /// NOT a float. `147.666666666666666666` is representable here and is not in an
+    /// f64, which is the whole reason the type exists.
+    Dec(i128),
     /// Builtin function marker: name + arity
     /// One of the interpreter's own functions, passed as a value — `xs.map(Str.inspect)`.
     ///
@@ -45,7 +53,7 @@ pub enum Value {
     /// Deliberately NOT a list: roc keeps ranges opaque, so building one as a list
     /// would show `[0, 1, 2]` where roc shows `<opaque>` and would wrongly satisfy a
     /// `List` parameter.
-    Range { start: i64, end: i64, inclusive: bool },
+    Range { start: i128, end: i128, inclusive: bool },
     /// A tag value: `Ok(x)`, `Err(e)`, `Red`.
     ///
     /// The payload is behind an `Rc` for the same reason `Lambda` is: with a `Vec`
@@ -71,6 +79,7 @@ impl fmt::Debug for Value {
             Value::Str(s) => write!(f, "Str({})", s),
             Value::Int(n) => write!(f, "Int({})", n),
             Value::Float(n) => write!(f, "Float({})", n),
+            Value::Dec(n) => write!(f, "Dec({})", crate::eval::dec_to_string(*n)),
             Value::Builtin(name, arity) => write!(f, "Builtin({}, {})", name, arity),
             Value::Closure(c) => write!(f, "Closure(|{}| ...)", c.params.join(", ")),
             Value::Unit => write!(f, "Unit"),
@@ -121,6 +130,7 @@ impl fmt::Display for Value {
                 // integer. That is the documented numeric-default divergence, not this.)
                 write!(f, "{}", n)
             }
+            Value::Dec(n) => write!(f, "{}", crate::eval::dec_to_string(*n)),
             Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
             Value::Closure(c) => write!(f, "<lambda |{}|>", c.params.join(", ")),
             Value::Unit => write!(f, "{{}}"),
@@ -163,11 +173,17 @@ mod tests {
     /// width is a tax on the whole interpreter — and a register VM's main job is moving
     /// them. It was 64 bytes until `Lambda` and `Tag` were boxed. This is the guard
     /// against a new inline field quietly putting it back.
+    ///
+    /// 48 rather than 32 since `Int` became an `i128`: Roc has `U64`, `I128` and a
+    /// fixed-point `Dec`, and `Builtin.roc` writes `U128.highest` out in full, so an
+    /// i64 could not hold the language's own numbers. `i128` aligns to 16, which is
+    /// what takes the enum from 32 to 48. Measured across the whole benchmark suite
+    /// before it was accepted: nothing moved, and `records` got faster.
     #[test]
     fn value_stays_narrow() {
         assert_eq!(
             std::mem::size_of::<Value>(),
-            32,
+            48,
             "Value grew — box the new variant's payload instead"
         );
     }

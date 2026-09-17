@@ -52,7 +52,7 @@ thread_local! {
 ///
 /// Used by the two builtins that dispatch on a user's own method: `Str.inspect` looking
 /// for a `to_inspect`, and operator dispatch looking for `plus`/`is_eq`/…
-pub fn methods_named(method: &str) -> Vec<(&'static str, Value)> {
+pub fn methods_named(method: &str, receiver: &Value) -> Vec<(&'static str, Value)> {
     let suffix = format!(".{}", method);
     let Some((program, _)) = RUNNING.with(|r| r.borrow().last().cloned()) else {
         return Vec::new();
@@ -61,6 +61,16 @@ pub fn methods_named(method: &str) -> Vec<(&'static str, Value)> {
         .chunks
         .iter()
         .filter(|chunk| chunk.name.ends_with(&suffix))
+        // Only the nominals whose shape does not RULE the receiver out. Without this a
+        // lone `Try.is_eq` in scope answered every `==`, tuples and unrelated tags
+        // included, and `(1, "x") == (1, "x")` failed with "No match arm matched".
+        .filter(|chunk| match chunk.name.rsplit_once('.') {
+            Some((owner, _)) => program
+                .nominal_shapes
+                .get(owner)
+                .is_none_or(|shape| shape.admits(receiver)),
+            None => true,
+        })
         .map(|chunk| (chunk.name, Value::Closure(Rc::clone(&chunk.bare))))
         .collect()
 }
@@ -227,9 +237,13 @@ pub enum Op {
     BinDispatch { dst: Reg, a: Reg, b: Reg, op: BinOp },
 
     // ---- statements ----
-    /// `expect cond`. Tallies, reports a failure to stderr, and carries on — roc does
-    /// not abort on a failed expectation, and `roc test` reports the totals.
+    /// `expect cond` inside a function body: a runtime assertion. Reports a failure to
+    /// stderr and carries on — roc does not abort on a failed expectation — and makes
+    /// the run exit non-zero. It is not a test, so it is never tallied.
     Expect { cond: Reg },
+    /// A TOP-LEVEL `expect`, which is a test. Only emitted under `--test`, and tallied
+    /// there; a normal run does not compile it at all.
+    TestExpect { cond: Reg },
     /// `dbg value`, to stderr.
     Dbg { src: Reg },
     /// `crash message`. Always an error.
@@ -323,6 +337,113 @@ pub struct Program {
     pub top: ChunkId,
     /// The app's entry point, if it declared one, and its arity.
     pub entry: Option<(ChunkId, u16)>,
+    /// Top-level methods by `(module, method)` — `("Dict", "insert")`.
+    ///
+    /// The compiler resolves a dispatch itself when the checker names the receiver's
+    /// module. When it cannot, only the running value knows, and this is what it looks
+    /// the method up in.
+    pub methods: std::collections::HashMap<(&'static str, &'static str), ChunkId>,
+    /// The same methods by bare name. A user nominal is a plain record at run time —
+    /// roc erases nominals — so a receiver whose module cannot be named falls back to
+    /// a method of that name, provided only one type defines it.
+    pub methods_by_name: std::collections::HashMap<&'static str, Vec<(&'static str, ChunkId)>>,
+    /// What each nominal's backing type LOOKS like, by name.
+    ///
+    /// roc erases nominals, so a value cannot say which one it is. Its shape can rule
+    /// one out, though, and that is enough: a tuple is not a `Try`, so `Try.is_eq` must
+    /// not answer `(1, "x") == (1, "x")`. This is the runtime half of nominal identity
+    /// — the compiler resolves it from the type wherever the checker knows one.
+    pub nominal_shapes: std::collections::HashMap<&'static str, NominalShape>,
+    /// The shapes of the nominals declared with `::`, the OPAQUE form.
+    ///
+    /// roc shows one as `<opaque>` instead of its backing value, and that is the only
+    /// place opacity is observable inside a single file.
+    pub opaque_shapes: Vec<NominalShape>,
+}
+
+/// The shape of a nominal's backing type, as far as a runtime value can be compared.
+#[derive(Debug, Clone)]
+pub enum NominalShape {
+    Tags(Vec<String>),
+    Fields(Vec<String>),
+    Tuple(usize),
+    /// A backing this cannot rule anything out from — a type variable, or another
+    /// nominal whose own shape is unknown. Never filters.
+    Unknown,
+}
+
+/// A top-level method by its qualified name, as a callable value.
+///
+/// Unlike `methods_named` this needs no receiver: `Json.parse` looks up a nominal's
+/// `parser_for` knowing only the type it must produce.
+pub fn method_by_name(module: &str, method: &str) -> Option<Value> {
+    let (program, _) = RUNNING.with(|r| r.borrow().last().cloned())?;
+    let qualified = format!("{}.{}", module, method);
+    program
+        .chunks
+        .iter()
+        .find(|chunk| chunk.name == qualified)
+        .map(|chunk| Value::Closure(Rc::clone(&chunk.bare)))
+}
+
+/// The shapes declared opaque in the running program.
+pub fn opaque_shapes() -> Vec<NominalShape> {
+    RUNNING
+        .with(|r| r.borrow().last().cloned())
+        .map(|(program, _)| program.opaque_shapes.clone())
+        .unwrap_or_default()
+}
+
+impl NominalShape {
+    /// Is `value` EXACTLY this shape — the same fields, no more?
+    ///
+    /// Stricter than `admits`, which only rules a value out. Opacity is decided from
+    /// the shape because roc erases nominals and the value cannot say which one it is,
+    /// so a record that happens to have the same fields as an opaque nominal reads as
+    /// opaque too. `ponytail: the alternative is a `Value` that carries its nominal,
+    /// which every other operation would then have to see through.`
+    pub fn is_exactly(&self, value: &Value) -> bool {
+        match (self, value) {
+            (NominalShape::Fields(declared), Value::Record(fields)) => {
+                declared.len() == fields.len()
+                    && declared.iter().all(|want| fields.iter().any(|(have, _)| have == want))
+            }
+            (NominalShape::Tags(names), Value::Tag(tag, _)) => names.iter().any(|n| n == tag),
+            (NominalShape::Tuple(n), Value::Tuple(items)) => items.len() == *n,
+            _ => false,
+        }
+    }
+
+    /// Could `value` be of this nominal? `false` only when the shape RULES IT OUT.
+    pub fn admits(&self, value: &Value) -> bool {
+        match (self, value) {
+            (NominalShape::Tags(names), Value::Tag(tag, _)) => names.iter().any(|n| n == tag),
+            (NominalShape::Tags(_), _) => false,
+            (NominalShape::Fields(declared), Value::Record(fields)) => {
+                declared.iter().all(|want| fields.iter().any(|(have, _)| have == want))
+            }
+            (NominalShape::Fields(_), _) => false,
+            (NominalShape::Tuple(n), Value::Tuple(items)) => items.len() == *n,
+            (NominalShape::Tuple(_), _) => false,
+            (NominalShape::Unknown, _) => true,
+        }
+    }
+}
+
+/// The shape of a type, for `NominalShape`.
+pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
+    use crate::types::Type;
+    match ty {
+        Type::TagUnion { tags, .. } => {
+            NominalShape::Tags(tags.iter().map(|(name, _)| name.clone()).collect())
+        }
+        Type::Record { fields, .. } => {
+            NominalShape::Fields(fields.iter().map(|(name, _)| name.clone()).collect())
+        }
+        Type::Tuple(items) => NominalShape::Tuple(items.len()),
+        Type::Nominal { backing, .. } => shape_of(backing),
+        _ => NominalShape::Unknown,
+    }
 }
 
 /// A suspended caller: where to resume, and where to put the result.
@@ -576,6 +697,20 @@ impl Vm {
                     ip = 0;
                 }
                 Op::Call { dst, func, base: arg_base, argc } => {
+                    // A BUILTIN held as a value and then called: `parse_with(U64.from_str)`
+                    // stores it, and the parser it returns calls it. `eval::call_function`
+                    // already knew how; the opcode insisted on a closure.
+                    if let Value::Builtin(qualified, _) = &regs[base + func as usize] {
+                        let qualified = *qualified;
+                        let args = collect(regs, base + arg_base as usize, argc);
+                        let value = crate::eval::call_function(
+                            Value::Builtin(qualified, args.len()),
+                            args,
+                        )
+                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                        regs[base + dst as usize] = value;
+                        continue;
+                    }
                     let callee = as_closure(&regs[base + func as usize])
                             .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     let target = &program.chunks[callee.chunk as usize];
@@ -892,11 +1027,67 @@ impl Vm {
                 }
                 Op::DispatchMethod { dst, name, base: b, argc } => {
                     let method = program.chunks[chunk_id as usize].names[name as usize];
-                    let mut args = collect(regs, base + b as usize, argc);
-                    let receiver = args.remove(0);
-                    let value = crate::eval::dispatch_builtin(receiver, method, args)
-                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
-                    regs[base + dst as usize] = value;
+                    // A method the PROGRAM defines for this value's own module wins over
+                    // the interpreter's own: once `Builtin.roc` is loaded, `List.map` is
+                    // Roc, and the Rust one is only there for what Roc has not defined.
+                    let target = match crate::eval::module_for(&regs[base + b as usize]) {
+                        // The value names its module, so the answer is that module's
+                        // method or nothing. Falling through to another type's method of
+                        // the same name is what made a loaded `Stream` answer a List.
+                        Some(module) => program.methods.get(&(module, method)).copied(),
+                        // No module: a record or a tag, which is all a nominal is at run
+                        // time. If exactly one type defines the method, that is the one
+                        // meant; if several do, only the checker could have known.
+                        None => match program.methods_by_name.get(method) {
+                            Some(defined) if defined.len() == 1 => Some(defined[0].1),
+                            // Several types define it and the value cannot say which it
+                            // is. Guessing would silently run the wrong one, so name
+                            // them and let the caller be explicit.
+                            Some(defined) => {
+                                let names: Vec<&str> =
+                                    defined.iter().map(|(name, _)| *name).collect();
+                                return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                    message: format!(
+                                        "`{}` is ambiguous: {} all define it. Call it explicitly.",
+                                        method,
+                                        names.join(", ")
+                                    ),
+                                }));
+                            }
+                            None => None,
+                        },
+                    };
+                    match target {
+                        Some(chunk) => {
+                            let callee = &program.chunks[chunk as usize];
+                            check_arity(callee.arity, argc)
+                                .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                            if frames.len() >= MAX_FRAMES {
+                                return Err(locate_error(&program, chunk_id, ip, too_deep(callee.name)));
+                            }
+                            let new_base = base + b as usize;
+                            grow(regs, new_base + callee.n_regs as usize);
+                            frames.push(Frame {
+                                chunk: chunk_id,
+                                ip: ip as u32,
+                                base: base as u32,
+                                dst,
+                                closure: cur,
+                            });
+                            cur = callee.bare.clone();
+                            chunk_id = chunk;
+                            code = &callee.code;
+                            base = new_base;
+                            ip = 0;
+                        }
+                        None => {
+                            let mut args = collect(regs, base + b as usize, argc);
+                            let receiver = args.remove(0);
+                            let value = crate::eval::dispatch_builtin(receiver, method, args)
+                                .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                            regs[base + dst as usize] = value;
+                        }
+                    }
                 }
                 Op::Interp { dst, name, base: b, n } => {
                     let names = &program.chunks[chunk_id as usize].names;
@@ -924,6 +1115,9 @@ impl Vm {
                 // ---- statements ----
                 Op::Expect { cond } => {
                     crate::eval::run_expect(&regs[base + cond as usize]).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                }
+                Op::TestExpect { cond } => {
+                    crate::eval::run_test_expect(&regs[base + cond as usize]).map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                 }
                 Op::Dbg { src } => crate::eval::run_dbg(&regs[base + src as usize]),
                 Op::Crash { src } => {

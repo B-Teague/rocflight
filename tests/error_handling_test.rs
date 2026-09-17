@@ -121,9 +121,12 @@ f"#).unwrap();
         "the continuation should sit inside the Ok arm, got {}",
         rendered
     );
+    // `return`, not a bare `Err(e)`: `?` leaves the enclosing FUNCTION. Where the
+    // match is the function's own body the two are the same, but inside a `for` or
+    // `while` only the `return` propagates — the block's value there is `{}`.
     assert!(
-        rendered.contains("Err(e) => Err(e)"),
-        "the Err arm should re-wrap the error, got {}",
+        rendered.contains("Err(e) => return Err(e)"),
+        "the Err arm should return the error, got {}",
         rendered
     );
 }

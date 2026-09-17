@@ -26,6 +26,7 @@ pub mod memory;
 pub mod error;
 pub mod desugaring;
 pub mod platform;
+pub mod builtin;
 
 pub use ast::{Expr, Pattern};
 pub use types::Type;

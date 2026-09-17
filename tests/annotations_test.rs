@@ -20,6 +20,13 @@ fn build(src: &str) -> rocflight::ast::Expr {
     Parser::new(&desugared).parse_expr().expect("parse failed")
 }
 
+/// The type as the program will see it, with an unpinned numeral defaulted.
+fn defaulted_type_of(src: &str) -> String {
+    let mut checker = TypeChecker::new();
+    let ty = checker.synth(&build(src)).expect("type check failed");
+    checker.defaulted(&ty).to_string()
+}
+
 fn type_of(src: &str) -> String {
     TypeChecker::new().synth(&build(src)).expect("type check failed").to_string()
 }
@@ -92,7 +99,11 @@ fn a_named_non_function_cannot_be_called() {
 
 #[test]
 fn inference_flows_through_names_without_annotations() {
-    assert_eq!(type_of("x = 42\nx"), "I64");
+    // An unconstrained numeral has no width until something gives it one, and roc
+    // then DEFAULTS it — `x = 42` prints `42.0`, a `Dec`. Nothing here constrains it,
+    // so what comes back is the default rather than the old unconditional I64.
+    assert_eq!(defaulted_type_of("x = 42\nx"), "Dec");
+    assert_eq!(type_of("n : I64\nn = 42\nn"), "I64");
     assert_eq!(type_of("r = { a: Bool.True }\nr.a"), "Bool");
 }
 

@@ -17,8 +17,12 @@ fn build(src: &str) -> rocflight::ast::Expr {
     Parser::new(&desugared).parse_expr().expect("parse failed")
 }
 
+/// The type as the program will see it, with an unconstrained numeral defaulted — roc
+/// makes one a `Dec`, which is why `Foo(1, "a")` carries a Dec rather than an I64.
 fn ty(src: &str) -> String {
-    TypeChecker::new().synth(&build(src)).expect("type check failed").to_string()
+    let mut checker = TypeChecker::new();
+    let t = checker.synth(&build(src)).expect("type check failed");
+    checker.defaulted(&t).to_string()
 }
 
 fn eval(src: &str) -> Value {
@@ -65,7 +69,7 @@ fn a_tag_literal_is_an_open_one_tag_union() {
     // Open — rendered with a trailing `..`. A tag expression says "at least Red", so
     // unification may add more tags. Only an annotation produces a CLOSED union.
     assert_eq!(ty("Red"), "[Red, ..]");
-    assert_eq!(ty(r#"Foo(1, "a")"#), "[Foo(I64, Str), ..]");
+    assert_eq!(ty(r#"Foo(1, "a")"#), "[Foo(Dec, Str), ..]");
 }
 
 #[test]
@@ -89,7 +93,7 @@ fn union_members_are_sorted_so_order_does_not_matter() {
 
 #[test]
 fn the_same_tag_in_both_branches_does_not_duplicate() {
-    assert_eq!(ty("if 1 == 1 Foo(1) else Foo(2)"), "[Foo(I64), ..]");
+    assert_eq!(ty("if 1 == 1 Foo(1) else Foo(2)"), "[Foo(Dec), ..]");
 }
 
 #[test]

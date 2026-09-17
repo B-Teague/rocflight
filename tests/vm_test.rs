@@ -716,6 +716,38 @@ fn expect_passes_and_carries_on() {
 }
 
 #[test]
+fn a_top_level_expect_only_runs_under_test_mode() {
+    // `roc run` treats a top-level `expect` as a test it is not running: the condition
+    // is never evaluated, so `expect 1` — which is not even a Bool — is not an error.
+    // `roc test` runs it, and that is where the same program fails.
+    let ast = parse("expect 1\n\n42");
+    let unit = |test_mode| vm::compile::Unit {
+        modules: Vec::new(),
+        app: &ast,
+        entry: None,
+        ingested: Vec::new(),
+        integer_binops: Default::default(),
+        test_mode,
+        intrinsics: Default::default(),
+        dispatch_modules: Default::default(),
+        binop_modules: Default::default(),
+        nominals: Vec::new(),
+        opaque_nominals: Vec::new(),
+        dec_literals: Default::default(),
+        fractional_literals: Default::default(),
+        parse_targets: Default::default(),
+    };
+    let skipped = std::rc::Rc::new(vm::compile_unit(&unit(false)).expect("compile failed"));
+    assert_eq!(vm::run(&skipped).expect("vm failed").to_string(), "42");
+
+    let run_as_test = std::rc::Rc::new(vm::compile_unit(&unit(true)).expect("compile failed"));
+    assert_eq!(
+        vm::run(&run_as_test).expect_err("expected an error").message,
+        "`expect` needs a Bool, got 1"
+    );
+}
+
+#[test]
 fn expect_needs_a_bool() {
     assert_eq!(run_err("expect 1\n\n1"), "Runtime error: `expect` needs a Bool, got 1");
 }
@@ -752,6 +784,15 @@ fn a_module_is_compiled_into_the_same_program() {
         entry: None,
         ingested: Vec::new(),
         integer_binops: Default::default(),
+        test_mode: true,
+        intrinsics: Default::default(),
+        dispatch_modules: Default::default(),
+        binop_modules: Default::default(),
+        nominals: Vec::new(),
+        opaque_nominals: Vec::new(),
+        dec_literals: Default::default(),
+        fractional_literals: Default::default(),
+        parse_targets: Default::default(),
     };
     let program = std::rc::Rc::new(vm::compile_unit(&unit).expect("compile failed"));
     assert_eq!(vm::run(&program).expect("vm failed").to_string(), "\"Hello World\"");
@@ -767,6 +808,15 @@ fn a_module_is_compiled_into_the_same_program() {
         entry: None,
         ingested: Vec::new(),
         integer_binops: Default::default(),
+        test_mode: true,
+        intrinsics: Default::default(),
+        dispatch_modules: Default::default(),
+        binop_modules: Default::default(),
+        nominals: Vec::new(),
+        opaque_nominals: Vec::new(),
+        dec_literals: Default::default(),
+        fractional_literals: Default::default(),
+        parse_targets: Default::default(),
     };
     assert!(vm::compile_unit(&unit).is_err(), "an unexposed name was in scope");
 }
@@ -780,6 +830,15 @@ fn an_ingested_file_is_a_top_level_string() {
         entry: None,
         ingested: vec![("text", "  hello  ".to_string())],
         integer_binops: Default::default(),
+        test_mode: true,
+        intrinsics: Default::default(),
+        dispatch_modules: Default::default(),
+        binop_modules: Default::default(),
+        nominals: Vec::new(),
+        opaque_nominals: Vec::new(),
+        dec_literals: Default::default(),
+        fractional_literals: Default::default(),
+        parse_targets: Default::default(),
     };
     let program = std::rc::Rc::new(vm::compile_unit(&unit).expect("compile failed"));
     assert_eq!(vm::run(&program).expect("vm failed").to_string(), "\"hello\"");

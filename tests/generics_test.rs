@@ -16,8 +16,13 @@ fn build(src: &str) -> rocflight::ast::Expr {
     Parser::new(&desugared).parse_expr().expect("parse failed")
 }
 
+/// The type as the program will see it. An unconstrained NUMERAL has no width until
+/// something gives it one, and roc then defaults it to `Dec` — `identity(5)` is a Dec
+/// for the same reason `x = 5` prints `5.0`.
 fn type_of(src: &str) -> String {
-    TypeChecker::new().synth(&build(src)).expect("type check failed").to_string()
+    let mut checker = TypeChecker::new();
+    let ty = checker.synth(&build(src)).expect("type check failed");
+    checker.defaulted(&ty).to_string()
 }
 
 fn accepts(src: &str) -> bool {
@@ -33,7 +38,7 @@ const FIRST: &str = "first : a, b -> a\nfirst = |x, _y| x\n";
 #[test]
 fn a_generic_function_works_at_one_type() {
     assert_eq!(type_of(&format!("{}identity(\"hi\")", ID)), "Str");
-    assert_eq!(type_of(&format!("{}identity(5)", ID)), "I64");
+    assert_eq!(type_of(&format!("{}identity(5)", ID)), "Dec");
 }
 
 #[test]
@@ -47,7 +52,7 @@ fn a_generic_function_works_at_two_types_in_one_program() {
 fn each_use_gets_its_own_instance() {
     assert_eq!(
         type_of(&format!("{}s = identity(\"hi\")\nn = identity(5)\nn", ID)),
-        "I64"
+        "Dec"
     );
 }
 
@@ -79,7 +84,7 @@ fn a_repeated_variable_rejects_mismatched_types() {
 #[test]
 fn distinct_variables_may_differ() {
     assert!(accepts(&format!("{}first(1, \"s\")", FIRST)));
-    assert_eq!(type_of(&format!("{}first(1, \"s\")", FIRST)), "I64");
+    assert_eq!(type_of(&format!("{}first(1, \"s\")", FIRST)), "Dec");
 }
 
 #[test]
@@ -93,7 +98,7 @@ fn variables_are_scoped_to_their_own_signature() {
 #[test]
 fn a_variable_inside_a_container_is_still_generic() {
     let src = "echo_list : List(a) -> List(a)\necho_list = |xs| xs\n";
-    assert_eq!(type_of(&format!("{}echo_list([1])", src)), "List(I64)");
+    assert_eq!(type_of(&format!("{}echo_list([1])", src)), "List(Dec)");
     assert!(accepts(&format!("{}n = echo_list([1])\ns = echo_list([\"a\"])\ns", src)));
 }
 
@@ -122,7 +127,7 @@ fn annotation_variables_do_not_collide_with_inferred_ones() {
     // This showed up as `List(a) -> List(a)` failing with "Cannot unify List(I64)
     // with I64" — two unrelated types meeting through a shared id.
     let src = "echo_list : List(a) -> List(a)\necho_list = |xs| xs\n";
-    assert_eq!(type_of(&format!("{}echo_list([1])", src)), "List(I64)");
+    assert_eq!(type_of(&format!("{}echo_list([1])", src)), "List(Dec)");
 }
 
 #[test]
