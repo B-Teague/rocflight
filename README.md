@@ -115,6 +115,7 @@ tests/check_builtin.sh --strict # the vendored Builtin.roc still parses
 tests/check_host.sh             # linked into basic-cli's real host, calling its effects
 cargo test --quiet              # the Rust side
 tests/bench.sh                  # performance, against a saved baseline
+tests/bench_compare.sh          # the same programs under roc's own interpreter and dev backend
 ```
 
 Eight of the 28 examples are apps on basic-cli's compiled host. rocflight does not
@@ -239,6 +240,30 @@ index, a top-level name a slot, a top-level function a chunk id. Nothing compare
 string at run time. `Value` is **48 bytes** (it was 80), with a guard test to keep it
 there, and the crate is `#![forbid(unsafe_code)]` — it contained exactly one `unsafe`, a
 lifetime transmute around the AST, and removing the lifetime removed the need for it.
+
+Against roc's own interpreter (`roc --opt=interpreter`, the LIR interpreter in
+`roc-compiler/src/eval`) and its dev backend, on the same programs, measured by
+`tests/bench_compare.sh` (medians of 5, nightly-2026-09-03, wall time including each
+engine's parse and compile; roc's build cache is warm):
+
+```
+benchmark        rocflight   roc-interp   roc-dev   interp/rocflight
+calls                  7ms         14ms      29ms          2.0x
+closure_in_loop       10ms        748ms      69ms         74.8x
+iter_range            86ms      35661ms     479ms        414.7x
+list_ops               4ms        148ms      72ms         37.0x
+loop                  12ms       3185ms      88ms        265.4x
+matching              24ms       1252ms      68ms         52.2x
+records               10ms        787ms      67ms         78.7x
+strings                7ms        192ms     127ms         27.4x
+```
+
+`calls` is the honest number: pure call-and-arithmetic, where both engines are close to
+their per-instruction floor. The rest is roc's interpreter walking LIR with refcounted
+values on every step, against a register VM. The four missing rows are programs roc
+cannot run: the two `_tail` files are script-style, `list_pass` hits a roc runtime error,
+and `closure_capture` is a rocflight bug — it prints `16004000.0` where roc prints
+`16004000`, an `I64.to_str` on a numeral the checker defaulted to `Dec`.
 
 `OPTIMIZATION_PLAN.md` has the full method: every phase with its measurements, the
 targets that were missed and by how much, three optimizations that were measured and
