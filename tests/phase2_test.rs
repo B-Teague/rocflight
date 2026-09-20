@@ -95,7 +95,8 @@ mod phase2_tests {
         let mut checker = TypeChecker::new();
         let ty = checker.synth(&expr).expect("Failed to infer type");
 
-        assert_eq!(ty.to_string(), "F64");
+        // A fractional literal is a numeral, and an unpinned numeral is a `Dec`.
+        assert_eq!(checker.defaulted(&ty).to_string(), "Dec");
     }
 
     #[test]

@@ -103,12 +103,14 @@ or WebAssembly.
 
 | | |
 |---|---|
+| roc's eval tests | **1,936 / 1,953** pass with rocflight as a fifth backend of roc's own eval harness, and 65 of its 72 problem tests are refused. Full parity is the goal; `EVAL_PARITY_PLAN.md` is the plan: phases 0 to 9, 14 (crypto), 15 (SIMD), 18 (nominal identity), 19 (parameterized nominals), 21 (capturing and cross-module methods), 22 (`Iter` for `Set`) and 23 (JSON codecs) done, 12, 20 and 24 (checker refusals) mostly; 10, 11, 13, 16 and 17 partly |
 | Golden pairs | **99 / 99** across 20 phases |
 | Rust tests | **535** |
 | Language examples | **20** match `roc` byte for byte — Snake among them, on basic-cli's real host, including a whole game played key by key; 7 platform apps pending on language gaps (`PLATFORM_HOST_PLAN.md`) |
 | `Builtin.roc` | **12 of 12** members parse; 1,443 definitions in Roc, 1,109 intrinsics in Rust |
 
 ```bash
+tests/check_eval.sh             # roc's ~2,300 eval tests, rocflight alongside roc's backends
 tests/check_roc.sh --strict     # the 98 pairs — the definition of done
 tests/check_examples.sh         # roc-lang.org's own examples
 tests/check_builtin.sh --strict # the vendored Builtin.roc still parses
@@ -248,22 +250,26 @@ engine's parse and compile; roc's build cache is warm):
 
 ```
 benchmark        rocflight   roc-interp   roc-dev   interp/rocflight
-calls                  7ms         14ms      29ms          2.0x
-closure_in_loop       10ms        748ms      69ms         74.8x
-iter_range            86ms      35661ms     479ms        414.7x
-list_ops               4ms        148ms      72ms         37.0x
-loop                  12ms       3185ms      88ms        265.4x
-matching              24ms       1252ms      68ms         52.2x
-records               10ms        787ms      67ms         78.7x
-strings                7ms        192ms     127ms         27.4x
+calls                  7ms         70ms      28ms         10.0x
+closure_capture        3ms        151ms      73ms         50.3x
+closure_in_loop       10ms        752ms      69ms         75.2x
+iter_range            89ms      35464ms     479ms        398.5x
+list_ops               4ms        149ms      73ms         37.2x
+list_pass              4ms         37ms      32ms          9.2x
+loop                  12ms       3182ms      88ms        265.2x
+matching              23ms       1255ms      68ms         54.6x
+matching_tail         26ms        306ms      31ms         11.8x
+records               10ms        786ms      67ms         78.6x
+records_tail          12ms         79ms      29ms          6.6x
+strings                7ms        192ms     126ms         27.4x
 ```
 
-`calls` is the honest number: pure call-and-arithmetic, where both engines are close to
-their per-instruction floor. The rest is roc's interpreter walking LIR with refcounted
-values on every step, against a register VM. The four missing rows are programs roc
-cannot run: the two `_tail` files are script-style, `list_pass` hits a roc runtime error,
-and `closure_capture` is a rocflight bug — it prints `16004000.0` where roc prints
-`16004000`, an `I64.to_str` on a numeral the checker defaulted to `Dec`.
+Every benchmark's output is checked against roc's on every run. Two things had to
+change to get there. Each program's work now depends on `args.len()`, because roc
+evaluates a pure call with literal arguments at compile time — `go(0, 0)` and
+`fib(22)` ran in the dev backend before the interpreter ever started, and showed up
+as a 14ms floor. And the programs use roc's own names: `Try.ok_or`, not the invented
+`with_default`, and `List.from_iter` rather than treating an iterator as a list.
 
 `OPTIMIZATION_PLAN.md` has the full method: every phase with its measurements, the
 targets that were missed and by how much, three optimizations that were measured and
@@ -288,7 +294,8 @@ tests/bench/     benchmark programs and the saved baseline
 | `IMPLEMENTATION_PHASES.md` | all 22 phases, what each exposed, and the known ceilings |
 | `PHASE_IMPLEMENTATION_GUIDE.md` | the golden-pair rule and how to add a feature |
 | `OPTIMIZATION_PLAN.md` | performance method, results, and the register-VM plan |
-| `TESTING_STRATEGY.md` | how the gates fit together |
+| `TESTING_STRATEGY.md` | how the gates fit together, the eval harness first |
+| `EVAL_PARITY_PLAN.md` | the phased plan to all of roc's eval tests: phases 0 to 9, 14, 15, 18, 19, 21, 22 and 23 done, 12, 20 and 24 mostly, 10/11/13/16/17 partial (957 → 1,936); phase 25 holds the remaining 17 backend tests (libm bit-exactness and the one-offs) |
 | `BUILTIN_PLAN.md` | how the vendored `Builtin.roc` is read, loaded and bounded |
 
 ---

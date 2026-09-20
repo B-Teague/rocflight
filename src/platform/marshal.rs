@@ -175,7 +175,9 @@ fn write_scalar(value: &Value, scalar: Scalar, out: &mut [u8]) -> Result<(), Str
     match (scalar, value) {
         (Scalar::Bool, Value::Bool(b)) => out[0] = *b as u8,
         (Scalar::F32, Value::Float(f)) => out.copy_from_slice(&(*f as f32).to_le_bytes()),
+        (Scalar::F32, Value::F32(f)) => out.copy_from_slice(&f.to_le_bytes()),
         (Scalar::F64, Value::Float(f)) => out.copy_from_slice(&f.to_le_bytes()),
+        (Scalar::F64, Value::F32(f)) => out.copy_from_slice(&f64::from(*f).to_le_bytes()),
         (Scalar::Dec, Value::Dec(d)) => out.copy_from_slice(&d.to_le_bytes()),
         // Every integer width is an i128 here; the layout says how many bytes matter,
         // and two's complement makes truncation right for both signs.
@@ -300,7 +302,7 @@ fn read_scalar(bytes: &[u8], scalar: Scalar) -> Value {
     };
     match scalar {
         Scalar::Bool => Value::Bool(bytes[0] != 0),
-        Scalar::F32 => Value::Float(f32::from_le_bytes(bytes.try_into().expect("4 bytes")) as f64),
+        Scalar::F32 => Value::F32(f32::from_le_bytes(bytes.try_into().expect("4 bytes"))),
         Scalar::F64 => Value::Float(f64::from_le_bytes(bytes.try_into().expect("8 bytes"))),
         Scalar::Dec => Value::Dec(signed(128)),
         Scalar::U8 | Scalar::U16 | Scalar::U32 | Scalar::U64 | Scalar::U128 => Value::Int(unsigned as i128),

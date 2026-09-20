@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 once_cell = "1.19"
 thiserror = "1.0"
+# roc's F64 transcendentals are musl's (via zig), which is what this crate ports.
+libm = "0.2"
 
 # `host/` is the platform-side half: the same interpreter built as a static library
 # that a platform's compiled host links against and calls `roc_main` on. It is not

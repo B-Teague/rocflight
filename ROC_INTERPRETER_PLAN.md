@@ -479,7 +479,14 @@ impl Display for TypeError {
 
 ## Testing strategy
 
-**One golden pair of `.roc` files per syntax feature**, and **all four outputs must
+**First, roc's own eval tests.** rocflight is a backend of roc's eval test runner
+(`roc-compiler/src/eval/test/parallel_runner.zig`, `--rocflight <binary>`), which runs
+each of the ~2,300 tests through roc's interpreter, dev backend, wasm and rocflight and
+requires every `Str.inspect` string to agree. `tests/check_eval.sh` drives it;
+`--strict` is full parity and the definition of done for the project as a whole.
+Where it stands and what is missing is Phase 23 of IMPLEMENTATION_PHASES.md.
+
+**Then, per feature: one golden pair of `.roc` files**, and **all four outputs must
 be byte-identical**:
 
 ```

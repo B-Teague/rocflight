@@ -242,7 +242,7 @@ fn layout_at(ty: &Type, decls: &Declarations, depth: u32) -> Result<Layout, Stri
         Type::TypeVar(_) => return Err("an unresolved type variable has no layout".into()),
         Type::Function(..) => return Err("a function has no host layout".into()),
         Type::Optional(_) => return Err("an optional field has no host layout".into()),
-        Type::Range => return Err("a range has no host layout".into()),
+        Type::Range(_) => return Err("a range has no host layout".into()),
     })
 }
 

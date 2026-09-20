@@ -17,8 +17,20 @@ pub enum Value {
     /// 128-bit fixed-point value — an i64 cannot hold `U64.highest`, which
     /// `Builtin.roc` writes out in full.
     Int(i128),
-    /// Float value (64-bit)
+    /// A 128-bit SIMD vector. `kind` is the element width in bits (8/16/32/64) with
+    /// `0x80` set for signed lanes; `bits` holds the lanes packed little-endian, so
+    /// lane `i` of an 8-wide vector is byte `i`. One `u128` plus a byte, so `Value`
+    /// stays small.
+    Simd { kind: u8, bits: u128 },
+    /// An unsigned 128-bit integer. `U128` values above `i128::MAX` cannot be held as
+    /// an `i128` without reading back negative, so they get their own variant; smaller
+    /// `U128`s may still arrive as `Int` and both compare and print the same.
+    U128(u128),
+    /// An `F64`.
     Float(f64),
+    /// An `F32`, kept as one so that `0.1.F32 + 0.2.F32` rounds where roc rounds and
+    /// prints `0.3`, and `to_bits` has thirty-two of them to give back.
+    F32(f32),
     /// A fixed-point decimal: the value times `Dec::SCALE`, exactly as roc stores it
     /// (`roc-compiler/src/builtins/dec.zig`, `decimal_places: u5 = 18`).
     ///
@@ -32,6 +44,10 @@ pub enum Value {
     /// tables, so it already lives as long as the program, and an owned `String` here
     /// made this the widest arm of the enum — which every other `Value` paid for.
     Builtin(&'static str, usize),
+    /// A `var` some closure captures: one cell shared by the scope that declared it
+    /// and every closure over it, so an assignment is seen by all of them, as roc
+    /// does it. Never a first-class value — the compiler reads and writes through it.
+    Cell(std::rc::Rc<std::cell::RefCell<Value>>),
     /// A function value: a chunk to run, and the values it captured.
     ///
     /// Boxed, because this is otherwise the variant that would decide
@@ -40,6 +56,9 @@ pub enum Value {
     Closure(std::rc::Rc<crate::vm::Closure>),
     /// Empty record `{}` — Roc's unit value.
     Unit,
+    /// An optional record field that was not written: `{ b: 2 }` as `{ a ?: U8, b : U8 }`
+    /// holds one of these at `a`. Reads as `Err(MissingField)`, inspects as `<missing>`.
+    Missing,
     /// Record value. Fields keep insertion order; `Str.inspect` sorts a copy.
     Record(Vec<(&'static str, Value)>),
     /// Boolean.
@@ -62,7 +81,14 @@ pub enum Value {
     /// Deliberately NOT a list: roc keeps ranges opaque, so building one as a list
     /// would show `[0, 1, 2]` where roc shows `<opaque>` and would wrongly satisfy a
     /// `List` parameter.
-    Range { start: i128, end: i128, inclusive: bool },
+    /// `start..<end` or `start..=end`, walked `step` at a time: `step_by` on a range
+    /// sets the step outright, as roc's does, rather than compounding.
+    /// The step is an `i64` so the variant stays within the 48 bytes `Value` has.
+    Range { start: i128, end: i128, inclusive: bool, step: i64 },
+    /// A lazy iterator: `Iter.custom`, a non-integer range, or a filtered/mapped
+    /// source. One pointer, so `Value` stays 48 bytes. The eager `List` and integer
+    /// `Range` paths are untouched — this is only what must observe laziness.
+    Iter(std::rc::Rc<crate::eval::lazy::Lazy>),
     /// A tag value: `Ok(x)`, `Err(e)`, `Red`.
     ///
     /// The payload is behind an `Rc` for the same reason `Lambda` is: with a `Vec`
@@ -105,9 +131,14 @@ pub fn into_items(items: std::rc::Rc<Vec<Value>>) -> Vec<Value> {
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Cell(c) => write!(f, "Cell({:?})", c.borrow()),
             Value::Str(s) => write!(f, "Str({})", s),
             Value::Int(n) => write!(f, "Int({})", n),
+            Value::Simd { kind, bits } => write!(f, "Simd({}, {})", kind, bits),
+            Value::U128(n) => write!(f, "U128({})", n),
             Value::Float(n) => write!(f, "Float({})", n),
+            Value::F32(n) => write!(f, "F32({})", n),
+            Value::Missing => write!(f, "Missing"),
             Value::Dec(n) => write!(f, "Dec({})", crate::eval::dec_to_string(*n)),
             Value::Builtin(name, arity) => write!(f, "Builtin({}, {})", name, arity),
             Value::Closure(c) => write!(f, "Closure(|{}| ...)", c.params.join(", ")),
@@ -115,9 +146,10 @@ impl fmt::Debug for Value {
             Value::Bool(b) => write!(f, "Bool({})", b),
             Value::List(items) => write!(f, "List({:?})", items),
             Value::Tuple(items) => write!(f, "Tuple({:?})", items),
-            Value::Range { start, end, inclusive } => {
+            Value::Range { start, end, inclusive, .. } => {
                 write!(f, "Range({}..{}{})", start, if *inclusive { "=" } else { "<" }, end)
             }
+            Value::Iter(_) => write!(f, "Iter(<opaque>)"),
             Value::Record(fields) => write!(f, "Record({:?})", fields),
             Value::Tag(name, args) => write!(f, "Tag({}, {:?})", name, args),
         }
@@ -148,8 +180,11 @@ pub fn quoted(s: &str) -> String {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Cell(c) => write!(f, "{}", c.borrow()),
             Value::Str(s) => write!(f, "{}", quoted(s)),
             Value::Int(n) => write!(f, "{}", n),
+            Value::U128(n) => write!(f, "{}", n),
+            Value::Simd { kind, bits } => write!(f, "{}", crate::eval::simd_inspect(*kind, *bits)),
             Value::Float(n) => {
                 // roc prints a whole float WITHOUT a trailing `.0` — `1500.0` shows as
                 // `1500` and `0.0` as `0`. Rust's own `{}` already does that.
@@ -157,12 +192,17 @@ impl fmt::Display for Value {
                 // (An unconstrained integer literal still differs: roc defaults it to a
                 // fractional type and shows `42.0`, while this interpreter keeps it an
                 // integer. That is the documented numeric-default divergence, not this.)
-                write!(f, "{}", n)
+                // roc spells it `nan`; Rust would say `NaN`.
+                if n.is_nan() { write!(f, "nan") } else { write!(f, "{}", n) }
             }
+            // The shortest digits that read back as the same f32, which is what roc
+            // prints for an `F32`: `0.1.F32` is `0.1`, not its f64 expansion.
+            Value::F32(n) => if n.is_nan() { write!(f, "nan") } else { write!(f, "{}", n) },
             Value::Dec(n) => write!(f, "{}", crate::eval::dec_to_string(*n)),
             Value::Builtin(name, arity) => write!(f, "<builtin {}/{}>", name, arity),
             Value::Closure(c) => write!(f, "<lambda |{}|>", c.params.join(", ")),
             Value::Unit => write!(f, "{{}}"),
+            Value::Missing => write!(f, "<missing>"),
             Value::Bool(b) => write!(f, "{}", if *b { "True" } else { "False" }),
             Value::List(items) => {
                 let rendered: Vec<String> = items.iter().map(|i| i.to_string()).collect();
@@ -172,8 +212,8 @@ impl fmt::Display for Value {
                 let rendered: Vec<String> = items.iter().map(|i| i.to_string()).collect();
                 write!(f, "({})", rendered.join(", "))
             }
-            // roc renders a range as `<opaque>`.
-            Value::Range { .. } => write!(f, "<opaque>"),
+            // roc renders a range and an iterator as `<opaque>`.
+            Value::Range { .. } | Value::Iter(_) => write!(f, "<opaque>"),
             Value::Record(fields) => {
                 if fields.is_empty() {
                     return write!(f, "{{}}");

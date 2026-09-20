@@ -572,8 +572,22 @@ pub enum Pattern {
     Binding(&'static str),
     /// `1`, `3.5`, `"hello"` — matches an equal value.
     Int(i128),
-    Float(f64),
+    /// The float value and the exact scaled `Dec` (value * 10^18) it was written as,
+    /// so a long-form `Dec` pattern like `1.000000000000000001` matches exactly.
+    Float(f64, i128),
     Str(&'static str),
+    /// `"foo${name}bar"` — matches a string that starts with `prefix`, then for each
+    /// segment captures text up to the next literal and binds it (`_` binds nothing).
+    /// A last segment with an empty literal captures the rest of the string.
+    StrInterp {
+        prefix: &'static str,
+        segments: Vec<(&'static str, &'static str)>,
+    },
+    /// `Ok(n) as whole` — matches `inner` and also binds the whole value to `name`.
+    As {
+        name: &'static str,
+        inner: Box<Pattern>,
+    },
     /// `Red`, `Foo(a, b)`, `Wrap(Inner(s))` — patterns nest to any depth.
     Tag {
         name: &'static str,
@@ -614,8 +628,16 @@ impl fmt::Display for Pattern {
             Pattern::Wildcard => write!(f, "_"),
             Pattern::Binding(name) => write!(f, "{}", name),
             Pattern::Int(n) => write!(f, "{}", n),
-            Pattern::Float(n) => write!(f, "{}", n),
+            Pattern::Float(n, _) => write!(f, "{}", n),
             Pattern::Str(s) => write!(f, "\"{}\"", s),
+            Pattern::StrInterp { prefix, segments } => {
+                write!(f, "\"{}", prefix)?;
+                for (name, literal) in segments {
+                    write!(f, "${{{}}}{}", name, literal)?;
+                }
+                write!(f, "\"")
+            }
+            Pattern::As { name, inner } => write!(f, "{} as {}", inner, name),
             Pattern::Tag { name, args } => {
                 if args.is_empty() {
                     write!(f, "{}", name)

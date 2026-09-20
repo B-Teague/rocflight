@@ -358,14 +358,30 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
 
 fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
     let Some(member) = members_where(|name| name == module).pop() else { return Box::new([]) };
-    let Ok(desugared) = Desugarer::new(annotations_only(&member.source)).desugar() else {
+    // `Set(item) :: Dict(item, {})` — so `Set`'s own signatures only carry their
+    // element type if `Dict` is a known parameterised nominal while they are parsed.
+    // Alone, `Dict(item, {})` degrades to a placeholder and `item` is dropped, which is
+    // why `Set.from_list([...U64]).to_list()` came back a list of unconstrained numbers.
+    // Parse `Dict`'s declaration first, then keep only `Set`'s own signatures.
+    let source = if module == "Set" {
+        let dict = members_where(|name| name == "Dict").pop().map(|m| m.source).unwrap_or_default();
+        format!("{}\n{}", annotations_only(&dict), annotations_only(&member.source))
+    } else {
+        annotations_only(&member.source)
+    };
+    let Ok(desugared) = Desugarer::new(source).desugar() else {
         return Box::new([]);
     };
     let mut parser = Parser::new(&desugared);
     if parser.parse_expr().is_err() {
         return Box::new([]);
     }
-    parser.signatures().iter().map(|(name, ty)| (*name, normalise(ty))).collect()
+    parser
+        .signatures()
+        .iter()
+        .filter(|(name, _)| name.starts_with(&format!("{}.", module)))
+        .map(|(name, ty)| (*name, normalise(ty)))
+        .collect()
 }
 
 /// The member with its function BODIES removed.
@@ -464,6 +480,38 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
 ///
 /// Over-loading is a cost, never a wrong answer: the word in a comment buys a parse
 /// nobody reads. Under-loading is impossible for the same reason it is cheap to detect.
+/// Every method name `Builtin.roc` declares, anywhere in it.
+///
+/// A name roc has NO method for is a name no program can call — `list.reverse()` is
+/// `rev` spelled wrong, and roc reports it rather than running it. Scanned once from
+/// the source's annotation lines (`name : type`) and kept.
+pub fn declared_names() -> &'static std::collections::HashSet<&'static str> {
+    static NAMES: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        SOURCE
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_start();
+                // `name : type` — a declaration, not a `name = value` binding, and not
+                // a `::` type declaration.
+                let (name, rest) = trimmed.split_once(':')?;
+                if rest.starts_with(':') {
+                    return None;
+                }
+                let name = name.trim_end();
+                let ok = !name.is_empty()
+                    && name.starts_with(|c: char| c.is_lowercase() || c == '_')
+                    && name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '!')
+                    && line.len() - trimmed.len() > 0;
+                // Borrowed from `SOURCE`, which is already `'static`: leaking a copy
+                // of every one of them cost half a megabyte of peak memory.
+                ok.then_some(name)
+            })
+            .collect()
+    })
+}
+
 pub fn needed_by(source: &str) -> Vec<&'static str> {
     let mut wanted = Vec::new();
     // `Dict` and `Set` are inseparable — `Set(item) :: Dict(item, {})` — and both are
