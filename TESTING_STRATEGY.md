@@ -19,9 +19,9 @@ tests/check_eval.sh --strict     # full parity required: rocflight passes every 
 tests/check_eval.sh --filter Dict
 ```
 
-**Full feature parity is `--strict` green.** The tally as of 2026-09-19: **1,936 of
-1,953** backend-run tests pass through rocflight (957 before the plan's phases), and
-65 of the 72 problem tests are rejected as roc rejects them.
+**Full feature parity is `--strict` green — and it is.** The tally as of 2026-09-19:
+**1,953 of 1,953** backend-run tests pass through rocflight (957 before the plan's
+phases), and all 72 problem tests are rejected as roc rejects them.
 `tests/check_eval.sh --report` says why each miss missed. The gaps are catalogued by kind in
 [IMPLEMENTATION_PHASES.md → Phase 23](IMPLEMENTATION_PHASES.md#phase-23-rocs-eval-tests-as-a-backend),
 and [EVAL_PARITY_PLAN.md](EVAL_PARITY_PLAN.md) is the phased plan for closing them:
