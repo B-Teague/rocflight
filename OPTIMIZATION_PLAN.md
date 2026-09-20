@@ -600,20 +600,73 @@ two-arm `U128` probe, `as_dec` on both operands and a `dec_binop` returning
 fractional literal becomes — so it deserves the same treatment `BinInt` gave integers:
 a `BinDec` opcode where the checker proved both operands are `Dec`.
 
-### 4.3 — register writes drop a 48-byte `Value`
+### 4.3 — `Move` was the most executed opcode — **done, −17% to −26%**
 
-Every `regs[base + dst] = …` runs drop glue on whatever was there, and `Value` is 48
-bytes with `Rc` arms. That is a branch and possibly a refcount decrement on **every
-instruction**, which is the most likely home of the 15ns. Two things to try, separately
-and measured:
+This entry used to guess that the 15ns an opcode went on drop glue for a 48-byte `Value`.
+Counting first said otherwise. A throwaway build with a histogram of executed opcodes:
 
-- a destination hint through `Compiler::expr`, so `Bin` writes where the result is
-  wanted and the `Move` after it disappears (already identified as an `iter_range`
-  item);
-- shrinking `Value` below 48 bytes. `value_stays_narrow` guards the current width and
-  the history says 32 was tried and lost to `i128`; the `Range` variant is the widest
-  remaining inline payload and could be boxed. Measure across the whole suite — last
-  time a width change helped `records` and moved nothing else.
+```
+matching   Move 25.0%  TestTag 15.0%  BinInt 15.0%  LoadK 10.0%  Ret 7.5%
+records    Move 25.0%  GetField 16.7%  LoadK 8.3%   Ret 8.3%
+loop       LoadK 20%   Move 20%   IterNext 20%   BinInt 20%   Jump 20%
+calls      BinInt 29.4%  LoadK 23.5%  Move 11.8%  Ret 11.8%  CallFn 11.8%
+```
+
+`Move` is the most executed instruction in the interpreter, and `loop`'s five-instruction
+body had two that did nothing useful:
+
+```
+IterNext { dst: 4, … }
+BinInt   { dst: 5, a: 1, b: 4 }   total + i, into a temporary
+Move     { dst: 1, src: 5 }       the temporary into `total`
+LoadK    { dst: 5, k: Unit }      the statement's value, which nothing reads
+Jump
+```
+
+**`Compiler::discard`** compiles an expression for its effect. A loop body is a block whose
+tail is `{}`, and compiling that tail as an expression materialized `Unit` into a dead
+register once per iteration. Only the materialization is skipped; anything that is not a
+bare `{}` still runs.
+
+**`Compiler::wrote_directly`** is the destination hint: rather than computing into a
+temporary and moving, patch the instruction that produced the value to write the target.
+It is called from `assign` and from `values`, and `values` is every place a run of
+consecutive registers is filled — a call's arguments, a list's elements, a record's fields,
+a tag's payload.
+
+Two conditions make it sound, and both were needed:
+
+- **A straight-line run only.** In a sequence with no `Jump`, `Test*`, `Ret` or `TailCall`
+  in it, the last write to a register is the only one that reaches the end. With a branch
+  it is not: `total = if c { 1 } else { 2 }` ends with one arm's write, and redirecting
+  only that one leaves the other arm writing a register nobody reads. `branches()` lists
+  the control-flow opcodes explicitly rather than looking for a `to` field, so a new
+  jumping opcode has to be classified on purpose.
+- **A temporary only**, identified by `next_reg` from before the value was compiled.
+  Anything below it is a live local or an argument already in place, and patching a
+  local's write would leave the local unwritten.
+
+`CallFn`, `Call` and `DispatchMethod` are deliberately not redirectable: their `dst` is
+written after a frame starting at `base` has been torn down, and pointing it at a live
+local would need that overlap reasoned about.
+
+| | executed opcodes | wall |
+|---|---|---|
+| `loop` | −40% | 11.6ms → **8.6ms** |
+| `matching` | −15% | 25.9ms → **20.7ms** |
+| `records_tail` | | 10.9ms → **8.8ms** |
+| `matching_tail` | | 28.2ms → **23.4ms** |
+| `records` | −17% | 11.5ms → 10.7ms |
+| `calls` | −12% | 6.7ms → 6.1ms |
+
+Nothing regressed; `iter_range` is unmoved because it is the lazy path, which has no
+`Move` to remove.
+
+**What is left of the original guess.** `Value` is still 48 bytes and a register write
+still runs drop glue. That may well be the next 15ns, but it is now a *smaller* share than
+it looked, because a fifth to a quarter of the writes are gone. Measure again before
+shrinking `Value` — the histogram is ten lines and worth rebuilding whenever this section
+is reopened.
 
 ### 4.4 — `DispatchMethod` resolves from scratch on every call
 
@@ -817,7 +870,10 @@ Worth one afternoon, after everything above:
    compiled; the four that remain answer containers and are blocked on the `Iter`
    question.
 7. **Phase 4.2**, `Dec` arithmetic — smaller than it looked before 4.1 measured it.
-8. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
+8. ~~**Phase 4.3**~~ — done: `Move` was the most executed opcode, and a destination hint
+   plus not materializing a discarded `Unit` took `loop` −26%, `matching` −20%,
+   `records_tail` −19%. **4.4 and 4.5 are still open**, and the histogram that found this
+   is the way to decide whether they are worth it.
 9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
    discipline to keep it fresh, which Phase 3 does not.
 10. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over

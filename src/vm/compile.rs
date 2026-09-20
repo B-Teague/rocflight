@@ -641,6 +641,33 @@ struct Compiler {
     intrinsics: std::collections::HashSet<&'static str>,
 }
 
+/// Does this instruction move control, or leave the block?
+///
+/// Used by `Compiler::wrote_directly` to tell a straight-line run of instructions from one
+/// with more than one path through it. Listed explicitly rather than by looking for a `to`
+/// field, so that a new jumping opcode has to be classified here on purpose.
+fn branches(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Jump { .. }
+            | Op::JumpFalse { .. }
+            | Op::TestLit { .. }
+            | Op::TestLitDyn { .. }
+            | Op::TestStr { .. }
+            | Op::TestTag { .. }
+            | Op::TestTuple { .. }
+            | Op::TestRecord { .. }
+            | Op::TestList { .. }
+            | Op::TestBool { .. }
+            | Op::GetFieldOr { .. }
+            | Op::IterNext { .. }
+            | Op::NoMatch { .. }
+            | Op::Ret { .. }
+            | Op::TailCall { .. }
+            | Op::Crash { .. }
+    )
+}
+
 /// Which one-callback list method a compiled loop is.
 ///
 /// They share a skeleton — take the next element, run the callback on it, do something
@@ -1030,8 +1057,9 @@ impl Compiler {
             let target = arg_base + i as Reg;
             self.reserve(target)?;
             let save = self.st().next_reg;
+            let before = self.here();
             let reg = self.expr(arg)?;
-            if reg != target {
+            if reg != target && !self.wrote_directly(before, reg, target, save) {
                 self.emit(Op::Move { dst: target, src: reg });
             }
             // Free the argument's own temporaries but keep the argument itself.
@@ -1336,6 +1364,27 @@ impl Compiler {
             self.node = enclosing;
             cursor = next?;
         }
+    }
+
+    /// Compile `e` for its EFFECT: its value is not read, so it need not exist.
+    ///
+    /// A loop body is the case that matters. `for i in .. { total = total + i }` is a
+    /// block whose statements do the work and whose tail is `{}`, and compiling that tail
+    /// as an expression emitted a `LoadK` of `Unit` into a register nothing ever read —
+    /// one wasted instruction per iteration, which was 20% of the `loop` benchmark's
+    /// opcodes. Anything that is not a bare `{}` still has to run: only the
+    /// materialization is skipped, never the evaluation.
+    fn discard(&mut self, e: &Expr) -> Result<(), String> {
+        let (tail, pushed) = match e {
+            Expr::Let { .. } | Expr::VarDecl { .. } | Expr::Assign { .. } => self.statements(e)?,
+            other => (other, 0),
+        };
+        let result = match tail {
+            Expr::Unit(_) => Ok(()),
+            other => self.expr(other).map(|_| ()),
+        };
+        self.pop_locals(pushed);
+        result
     }
 
     fn pop_locals(&mut self, n: usize) {
@@ -2964,6 +3013,7 @@ impl Compiler {
     /// this resolves it once, at compile time, to a register or a global slot.
     fn assign(&mut self, name: &'static str, value: &Expr) -> Result<(), String> {
         let save = self.st().next_reg;
+        let before = self.here();
         let src = self.expr(value)?;
         self.st().next_reg = save;
 
@@ -2982,7 +3032,7 @@ impl Compiler {
                     name
                 ));
             }
-            if reg != src {
+            if reg != src && !self.wrote_directly(before, src, reg, save) {
                 self.emit(Op::Move { dst: reg, src });
             }
             return Ok(());
@@ -2994,6 +3044,74 @@ impl Compiler {
         // The tree-walker's wording: an assignment to a name that does not exist is
         // almost always a missing `var`.
         Err(format!("Cannot assign to `{}`: it is not declared with `var`", name))
+    }
+
+    /// Make the instruction that produced `src` write to `dst` instead, if it is safe to.
+    ///
+    /// `total = total + i` compiled to a `BinInt` into a temporary and then a `Move` into
+    /// `total` — and `Move` was the most executed opcode in the interpreter, a quarter of
+    /// `matching` and `records` and a fifth of `loop`. The arithmetic can just as well
+    /// land on the target.
+    ///
+    /// Only when the value compiled to a STRAIGHT LINE. In a run with no branch in it the
+    /// last write to a register is the only one that reaches the end, so redirecting it is
+    /// the whole story. With a branch it is not: `total = if c { 1 } else { 2 }` ends with
+    /// one arm's write, and redirecting only that one would leave the other arm writing a
+    /// register nobody reads any more. The operands are read before the destination is
+    /// written, so `dst` may alias one of them.
+    /// `temps` is `next_reg` from before the value was compiled: anything at or above it
+    /// is a temporary this expression made, and anything below is a live local or an
+    /// argument already in place. Only a temporary may be redirected — patching a local's
+    /// write would leave the local unwritten.
+    fn wrote_directly(&mut self, before: u32, src: Reg, dst: Reg, temps: Reg) -> bool {
+        if src < temps {
+            return false;
+        }
+        let st = self.st();
+        let Some(last) = st.code.len().checked_sub(1).filter(|at| *at >= before as usize) else {
+            return false;
+        };
+        if st.code[before as usize..].iter().any(branches) {
+            return false;
+        }
+        match &mut st.code[last] {
+            Op::LoadK { dst: d, .. }
+            | Op::Move { dst: d, .. }
+            | Op::LoadGlob { dst: d, .. }
+            | Op::LoadCap { dst: d, .. }
+            | Op::CellGet { dst: d, .. }
+            | Op::LoadSelf { dst: d }
+            | Op::Bin { dst: d, .. }
+            | Op::BinInt { dst: d, .. }
+            | Op::BinDispatch { dst: d, .. }
+            | Op::MakeClosure { dst: d, .. }
+            | Op::MakeList { dst: d, .. }
+            | Op::MakeTuple { dst: d, .. }
+            | Op::MakeTag { dst: d, .. }
+            | Op::MakeRecord { dst: d, .. }
+            | Op::UpdateRecord { dst: d, .. }
+            | Op::GetField { dst: d, .. }
+            | Op::GetOptField { dst: d, .. }
+            | Op::GetIndex { dst: d, .. }
+            | Op::GetPayload { dst: d, .. }
+            | Op::GetRest { dst: d, .. }
+            | Op::GetElem { dst: d, .. }
+            | Op::GetSlice { dst: d, .. }
+            | Op::MakeRange { dst: d, .. }
+            | Op::CallBuiltin { dst: d, .. }
+            | Op::CallHost { dst: d, .. }
+            | Op::MakeBuiltin { dst: d, .. }
+            | Op::Interp { dst: d, .. }
+                if *d == src =>
+            {
+                *d = dst;
+                true
+            }
+            // `CallFn`/`Call`/`DispatchMethod` are deliberately absent: their `dst` is
+            // written after a frame that starts at `base` has been torn down, and
+            // redirecting it onto a live local would need that overlap reasoned about.
+            _ => false,
+        }
     }
 
     /// `for x in iterable { body }` — one `IterNext` per iteration, and for a range
@@ -3016,7 +3134,7 @@ impl Compiler {
         self.st().locals.push(Local { name, reg: item, is_var: false, captured: false, boxed: false });
         self.st().loops.push(Vec::new());
         let body_base = self.st().next_reg;
-        let result = self.expr(body);
+        let result = self.discard(body);
         self.st().next_reg = body_base;
         let breaks = self.st().loops.pop().expect("pushed above");
         self.st().locals.pop();
@@ -3040,7 +3158,7 @@ impl Compiler {
         self.emit(Op::JumpFalse { cond, to: u32::MAX, kind: CondKind::While });
 
         self.st().loops.push(Vec::new());
-        let result = self.expr(body);
+        let result = self.discard(body);
         self.st().next_reg = save;
         let breaks = self.st().loops.pop().expect("pushed above");
         result?;
