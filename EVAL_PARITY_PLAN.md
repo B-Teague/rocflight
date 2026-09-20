@@ -16,11 +16,11 @@ check compile-time float bits with no backend at all.
 from 957 to 1,736, the refused problem tests from 22 of 71 to 49, and the hangs from 2
 to 0. They are summarised in "The first plan" at the end. What is left is **217 backend
 tests and 22 problem tests**, and this document is the plan for those: phases 8 to 17,
-each named for the family of tests it turns green. **As of 2026-09-19: 1,936 of 1,953,
-65 of 72 problem tests refused.** Phases 8, 9, 14, 15, 18, 19, 21, 22 and 23 are done;
-12, 20 and 24 mostly; 10, 11, 13, 16 and 17 partly. What is left is 17 backend tests and
-7 problem tests: phase 25 (libm and the one-offs), the three refusals phase 24 measured
-and reverted, and the two Phase 20 tests that need runtime integer widths. The 62 backend tests and ~16 problem tests still open no longer
+each named for the family of tests it turns green. **As of 2026-09-19 the plan is
+finished: 1,953 of 1,953, every problem test refused, `tests/check_eval.sh --strict`
+green.** The last two were `trmc benchmark: NQueens (n=9)` (Phase 25) and `inspect:
+numeric default specialization remains replaceable until constrained` (Phase 20); what
+each needed is in its phase below. The rest of this document is how it got there. The 62 backend tests and ~16 problem tests still open no longer
 split by feature — they split by a handful of shared mechanisms rocflight has never
 had, which are **phases 18 to 25** ("The remaining residue" below): nominal identity at
 run time, parameterized nominals, value-level monomorphization, capturing nominal
@@ -763,7 +763,7 @@ two nominals of one name unifies their backings. Four fixes:
   ranges iterable. `eval::call_range` builds the config and dispatches the element's
   `range_iter`. Check: `--filter "Set.fold" --filter 10049 --filter "Range.custom"`.
 
-### Phase 20: value-level monomorphization — MOSTLY DONE (+12, 2026-09-19)
+### Phase 20: value-level monomorphization — DONE (+13, 2026-09-19)
 
 *Turned green: 12 (estimate was 8).* Type-level monomorphization landed in phases 10 and
 11 (a qualified call checks its lambda against the declared signature); what remained
@@ -808,16 +808,30 @@ which cost a cross-section. All five are in `src/types/checker.rs`:
 Also turned green, as a side effect: the three `iterator-like map`/`keep_if`/`drop_if`
 tests of Phase 22, `issue 11243`, and `unconstrained empty list specialization`.
 
-**What is left needs the real thing.** Two tests want a value to carry its call site's
-WIDTH into a shared body, which rocflight cannot do without tagging integers by width
-at run time: `numeric default specialization remains replaceable until constrained`
-(`add_one = |x| x + 1` must be `Dec` at one site and `U8` at another — the body's `1`
-is one literal) and `overflow predicates return Bool across scalar and composite
-widths` (`u8 = |a, b| a.plus_overflows(b)` must overflow at 8 bits at one site and not
-at another; every integer value says `I64`). Generalising the lambda's numeral variable
-was tried and reverted: it buys neither test and costs six others, because an
-annotation's variable ids and the checker's fresh ones share a number space, so
-propagating numeral-ness through `instantiate` mismarks `List.append`'s element.
+**The last one, `numeric default specialization remains replaceable until constrained`,
+did NOT need runtime widths.** `add_one = |x| x + 1` must be a `Dec` at one call site
+and a `U8` at another while rocflight compiles one body, and the earlier attempt —
+generalising the lambda's numeral variable — cost six other tests. Three narrow rules
+make it hold, all in `src/types/checker.rs`:
+
+- **A LAMBDA generalises over its numerals; a value still does not.** `check_let` kept
+  every numeral variable out of `generics` because `birds = 3` has one type. A function
+  is the exception: roc monomorphises per call site, so the retain now skips
+  `Expr::Lambda`.
+- **Only those copies are marked numerals.** `instantiate` carries numeral-ness into a
+  fresh copy for the variables `check_let` generalised and no others — marking every
+  numeral variable's copy is what made `List.append`'s element "a number", because an
+  annotation's variable ids and the checker's fresh ones share a number space. A
+  variable a record UPDATE committed (`set_a = |r| { ..r, a: 5 }`) is carried the same
+  way, or the copy loses the commitment and the `{ a ?: U64 }` refusal with it.
+- **The body's literal follows its call sites.** `1` in `add_one`'s body is one node
+  with no one type. Where some instantiation pinned a width it is left a plain integer
+  and takes its operand's type at run time (`Dec` + `1` is a `Dec`, `U8` + `1` a `U8`);
+  where none did, it defaults to `Dec` with every use, which is what keeps
+  `rec = |n| if (n == 0) 0 else rec(n - 1) + 1` printing `2.0`.
+
+`overflow predicates return Bool across scalar and composite widths`, the other test
+this section called blocked, was already green by the time it was remeasured.
 
 Check: `--filter 11271 --filter "map2 record builder" --filter 11189 --filter
 "unconstrained empty list" --filter "projecting value" --filter 11243`.
@@ -1006,9 +1020,9 @@ each costs more than it buys:
 Left, with `custom from_numeral Err in an uncalled function` (which needs the conversion
 run at compile time): **7 problem tests**, none of which moves the backend tally.
 
-### Phase 25: libm bit-exactness and the last one-offs
+### Phase 25: libm bit-exactness and the last one-offs — DONE (2026-09-19)
 
-*Turns green: the rest, to 1,953.* The transcendental tests (`F32`/`F64` `sin`/`cos`/
+*Turned green: the rest, to 1,953.* The transcendental tests (`F32`/`F64` `sin`/`cos`/
 `tan`/`atan` exact bits — roc's zig `std.math` versus Rust's libm) need the zig routine
 ported or a matching implementation. Plus the true one-offs: `zero-sized list
 with_capacity reports zero capacity` (needs the element type at run time), `nominal
@@ -1020,6 +1034,20 @@ with a fractional `step_by`), and `B028`/`B059` (a lambda pattern that fails is 
 crash, but rocflight classifies "no match arm matched" as a compile problem to satisfy
 the comptime-exhaustiveness tests — these two need the crash-versus-problem distinction
 roc draws by whether the failure is in a called function or a folded constant).
+
+**`trmc benchmark: NQueens (n=9)` was not a TRMC or a stack problem at all** — it never
+ran. It was refused with "Cannot unify `[Cons(I64, ConsList), Nil]` with `I64`", and the
+cause was a parameterised nominal's OWN parameter variable being bindable. The parser
+parses `ConsList(a) := [Nil, Cons(a, ConsList(a))]` once, and `TypeChecker::expand`
+splices that one declaration in wherever a `ConsList` placeholder is met — so the
+declaration's `a` is a single variable shared by every occurrence of the type in the
+program. `append_safe`'s inner `ConsList.Cons(k, soln)` bound it to `I64`, and the outer
+`ConsList.Cons(ConsList.Cons(k, soln), solns)` in the same body then met an `I64` where
+its `ConsList(I64)` element belonged. A use site instantiates (fresh ids) before it
+constrains anything, so what reaches `unify` holding one of those ids is a spliced
+declaration: `unify`'s TypeVar arm now lets it through and binds nothing, pinning an
+ordinary variable met on the other side to it instead. `nominal_params`, until now a
+field the checker stored and never read, is what says which ids those are.
 
 ## Order and what it should look like
 
@@ -1037,12 +1065,12 @@ roc draws by whether the failure is in a called function or a folded constant).
 | 17 long tail | +24 | 1,890 | **+5** (partial) |
 | 18 nominal identity | +4 | 1,894 | **1,894** (+4) |
 | 19 parameterized nominals | +5 | 1,899 | **1,897** (+3) |
-| 20 value-level monomorphization | +8 | 1,907 | **1,909** (+12; 2 left, need runtime widths) |
+| 20 value-level monomorphization | +8 | 1,907 | **1,909** (+12), then +1 (generalised numerals) |
 | 21 nominal methods w/ capture | +13 | 1,920 | **1,927** (+11) |
 | 22 `Iter` for `Set`/`Dict` | +5 | 1,925 | **1,930** (+3; 3 more fell out of 20) |
 | 23 JSON codec protocol | +5 | 1,930 | **1,936** (+6) |
 | 24 last refusals | 50 → 71 refused | 1,930 | **51 → 65 of 72 refused**, 1,936 |
-| 25 libm + one-offs | +23 | 1,953 | |
+| 25 libm + one-offs | +23 | 1,953 | **1,953** (--strict green) |
 
 Each test is counted under the first phase it needs, so a phase that lands before its
 prerequisite (a `from_numeral` default before Phase 8, `hash_chunks` before Phase 9,

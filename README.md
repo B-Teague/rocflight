@@ -103,7 +103,7 @@ or WebAssembly.
 
 | | |
 |---|---|
-| roc's eval tests | **1,936 / 1,953** pass with rocflight as a fifth backend of roc's own eval harness, and 65 of its 72 problem tests are refused. Full parity is the goal; `EVAL_PARITY_PLAN.md` is the plan: phases 0 to 9, 14 (crypto), 15 (SIMD), 18 (nominal identity), 19 (parameterized nominals), 21 (capturing and cross-module methods), 22 (`Iter` for `Set`) and 23 (JSON codecs) done, 12, 20 and 24 (checker refusals) mostly; 10, 11, 13, 16 and 17 partly |
+| roc's eval tests | **1,953 / 1,953** pass with rocflight as a fifth backend of roc's own eval harness, and all 72 of its problem tests are refused: `tests/check_eval.sh --strict` is green. `EVAL_PARITY_PLAN.md` is how it got there, phase by phase (957 → 1,953) |
 | Golden pairs | **99 / 99** across 20 phases |
 | Rust tests | **535** |
 | Language examples | **20** match `roc` byte for byte — Snake among them, on basic-cli's real host, including a whole game played key by key; 7 platform apps pending on language gaps (`PLATFORM_HOST_PLAN.md`) |
@@ -295,7 +295,7 @@ tests/bench/     benchmark programs and the saved baseline
 | `PHASE_IMPLEMENTATION_GUIDE.md` | the golden-pair rule and how to add a feature |
 | `OPTIMIZATION_PLAN.md` | performance method, results, and the register-VM plan |
 | `TESTING_STRATEGY.md` | how the gates fit together, the eval harness first |
-| `EVAL_PARITY_PLAN.md` | the phased plan to all of roc's eval tests: phases 0 to 9, 14, 15, 18, 19, 21, 22 and 23 done, 12, 20 and 24 mostly, 10/11/13/16/17 partial (957 → 1,936); phase 25 holds the remaining 17 backend tests (libm bit-exactness and the one-offs) |
+| `EVAL_PARITY_PLAN.md` | the phased road to all of roc's eval tests, 957 → 1,953, every phase measured; finished 2026-09-19 |
 | `BUILTIN_PLAN.md` | how the vendored `Builtin.roc` is read, loaded and bounded |
 
 ---

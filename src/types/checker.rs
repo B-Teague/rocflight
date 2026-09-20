@@ -136,6 +136,15 @@ pub struct TypeChecker {
     /// because inference is not finished yet: the type here may still be a variable
     /// that later unifies with `I64`.
     binops: Vec<(crate::ast::NodeId, Type)>,
+    /// Numeral variables a `let` GENERALISED, so each call site gets its own copy.
+    /// A literal typed by one of these — the `1` of `add_one = |x| x + 1` — has no
+    /// single type: it is a `Dec` where the caller's argument is and a `U8` where
+    /// that is, and rocflight compiles one body. Left as a plain integer, it takes
+    /// the other operand's type at run time, which is the same answer either way.
+    generalized_numerals: std::collections::HashSet<u32>,
+    /// The copies `instantiate` made of each of those, one per call site: what the
+    /// uses settled on is what says whether the body's literal has a single type.
+    numeral_copies: std::collections::HashMap<u32, Vec<u32>>,
     next_var: u32,
     /// Methods a `where` clause promised, which may be dispatched on a type variable
     /// inference has not resolved. Set from the parser before checking.
@@ -395,6 +404,8 @@ impl TypeChecker {
             enclosing_type: Vec::new(),
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
+            generalized_numerals: std::collections::HashSet::new(),
+            numeral_copies: std::collections::HashMap::new(),
             committed_vars: std::collections::HashSet::new(),
             nominal_literals: std::collections::HashMap::new(),
             suffixed: std::collections::HashMap::new(),
@@ -506,9 +517,24 @@ impl TypeChecker {
     fn instantiate(&mut self, ty: &Type, generics: &[u32]) -> Type {
         let mapping: Vec<(u32, Type)> =
             generics.iter().map(|id| (*id, self.fresh_var())).collect();
-        // A quantified NUMERAL or string-literal variable stays one in each copy, so
-        // an instance nothing pins still defaults to `Dec` (or `Str`) and still finds
-        // a method block.
+        // A generalised NUMERAL stays one in each copy: `add_one = |x| x + 1` is
+        // generalised over a variable the body's `1` made a numeral, and a copy
+        // nothing pins has to default to `Dec` as roc's does, not stay open. Only the
+        // variables `check_let` generalised are carried — marking every numeral
+        // variable's copy made `List.append`'s element a number, because an
+        // annotation's variable ids and these share a number space.
+        for (id, fresh) in &mapping {
+            if let (Type::TypeVar(v), true) = (fresh, self.generalized_numerals.contains(id)) {
+                self.numeral_vars.insert(*v);
+                self.numeral_copies.entry(*id).or_default().push(*v);
+                // A field value COMMITTED by a record update stays committed in every
+                // copy: `set_a = |r| { ..r, a: 5 }` may not then write that `5` into a
+                // `{ a ?: U64 }`, and roc refuses the program at the call site.
+                if self.committed_vars.contains(id) {
+                    self.committed_vars.insert(*v);
+                }
+            }
+        }
         Self::substitute_vars(ty, &mapping)
     }
 
@@ -1921,6 +1947,16 @@ impl TypeChecker {
         let mut floating = std::collections::HashSet::new();
         for (id, ty) in &self.literals {
             match self.apply(ty) {
+                // A literal in a GENERALISED body follows its call sites: where one
+                // of them pinned a width, the literal has no single type, so it stays
+                // an integer and takes its operand's at run time (see
+                // `generalized_numerals`). Where none did, every use defaults to `Dec`
+                // and so does it — `rec = |n| … rec(n - 1) + 1` prints `2.0`.
+                Type::TypeVar(v)
+                    if self.generalized_numerals.contains(&v)
+                        && self.numeral_copies.get(&v).is_some_and(|copies| {
+                            copies.iter().any(|c| !matches!(self.apply(&Type::TypeVar(*c)), Type::TypeVar(_)))
+                        }) => {}
                 Type::TypeVar(_) => {
                     floating.insert(*id);
                 }
@@ -3233,7 +3269,13 @@ impl TypeChecker {
                         // could reach the literal and it would default to `Dec`.
                         // `unify` marks every variable a numeral's is bound to, either
                         // way round, so membership here is the whole test.
-                        generics.retain(|v| !self.numeral_vars.contains(v));
+                        // A FUNCTION is the exception: roc monomorphises per call
+                        // site, so `add_one = |x| x + 1` is a `Dec` where nothing
+                        // constrains it and a `U8` where an annotation does, in the
+                        // same block. Its copies stay numerals (see `instantiate`).
+                        if !matches!(value, Expr::Lambda { .. }) {
+                            generics.retain(|v| !self.numeral_vars.contains(v));
+                        }
                         // A body that asks a parameter whether an operation OVERFLOWS
                         // is asking about a WIDTH: `a.plus_overflows(b)` is a different
                         // question at `U8` than at `I64`. Generalising leaves each use
@@ -3255,6 +3297,8 @@ impl TypeChecker {
                         }
                         generics.dedup();
 
+                        self.generalized_numerals
+                            .extend(generics.iter().filter(|v| self.numeral_vars.contains(v)));
                         self.bind_poly(name, inferred, generics);
                     }
                 }
@@ -3788,6 +3832,22 @@ impl TypeChecker {
                 self.unify(&inner, &other)
             }
             (Type::TypeVar(v), t) | (t, Type::TypeVar(v)) => {
+                // A parameterised nominal's OWN parameter, as its declaration wrote it.
+                // `expand` splices the declaration in wherever a placeholder is met, so
+                // this one variable is SHARED by every occurrence of the type in the
+                // program — binding it made `ConsList(I64)`'s tail become whatever the
+                // last use said, and a `ConsList(ConsList(I64))` in the same function
+                // then met an `I64` where a list belonged. Every real use instantiates
+                // (fresh ids) before it constrains anything, so what reaches here is a
+                // spliced declaration: let it through, bind nothing.
+                if self.nominal_params.values().any(|params| params.contains(v)) {
+                    if let Type::TypeVar(w) = t {
+                        if !self.nominal_params.values().any(|params| params.contains(w)) {
+                            self.subst.insert(*w, Type::TypeVar(*v));
+                        }
+                    }
+                    return Ok(());
+                }
                 // A NUMERAL variable stands for a number whose width is not yet fixed,
                 // not for anything at all. Letting it become a `Bool` or a function is
                 // what made `x = 42` then `x(1)` type-check, and `r : { x: Bool }` accept
