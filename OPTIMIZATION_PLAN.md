@@ -477,11 +477,45 @@ integer range is 2.3× faster than either. So the residual is the lazy machinery
 operator dispatches and a `Value` clone per element — and 4.2 is worth only about 25ns of
 it here.
 
-**Still open, and now the cheapest thing in this section:** the wrapping iterators. A
-`map` over a `filter` over a list rebuilds three `Rc`s per element. The same
-`Rc::make_mut` trick applies — each wrapper mutates its own `inner` in place — but it
-needs `step` to thread ownership down through the layers, which the nested arms currently
-cannot because they only hold `&Rc`.
+### 4.1b — the wrapping iterators too — **done, −20% on a chain**
+
+`map` over `filter` over a list rebuilt three `Rc`s per element, because each wrapper
+stepped a CLONE of its inner and then built itself around the rest. It now allocates
+none. `step` is a shim over `advance(&mut self, out: &mut Value)`, which mutates the
+iterator in place and recurses into a wrapper's own `inner` through `Rc::make_mut`, so a
+chain advances down its layers under one mutable borrow instead of rebuilding itself on
+the way back up. Cloning the inner also defeated the leaf fix from 4.1 — a list under a
+`map` was stepped at a refcount of two, so it copied itself every element.
+
+| | before | after |
+|---|---|---|
+| 2-layer chain (`keep_if` then `map`), 400k | 124ms | **101ms** |
+| 4-layer chain, 400k | 155ms | **122ms** |
+| `iter_range` — no wrapper | 217ms | 217ms |
+| `Dec` range — no wrapper | 238ms | 241ms |
+| `F64` range — no wrapper | 190ms | 194ms |
+
+**Two things had to be right, and the obvious version got both wrong.** The first draft
+put every variant in one recursive `advance`; chains gained 14% and a plain range **lost
+10%**, which would have been a regression on the commoner path to speed up the rarer one.
+
+- **The leaves cannot share a recursive function with the wrappers.** With `List` and
+  `Range` in the same `advance` as the six wrappers, LLVM keeps the whole thing out of
+  line. `#[inline]` did not fix it. `advance` holds the two leaves and delegates;
+  `advance_wrapped` holds the wrappers and recurses back into `advance`. Necessary, and
+  still 7% short.
+- **The item goes through an out parameter.** `Result<Made, EvalError>` with a `Value`
+  inside moves 80 bytes per layer per element — a 48-byte `Value`, a `String`-carrying
+  error, and 16-byte alignment. With `Made` reduced to a three-case tag and the item
+  written through `&mut Value`, the leaf paths came back to parity and the chains kept
+  their 20%.
+
+Neither would have been visible against `tests/bench/baseline.tsv`, which reads ±10% on
+an untouched tree. A/B against a copied pre-change binary is what caught them.
+
+What is left in this area is small: `Lazy::Concat` clones the second iterator when the
+first runs out, once per concatenation, and `fold_native` and `materialize` hold their
+own handle so the first step of a walk still copies. Neither is per-element.
 
 ### 4.2 — `Dec` arithmetic
 
@@ -614,9 +648,9 @@ Worth one afternoon, after everything above:
    a missing `BinInt`. `Dec` and `F64` ranges are ~31% faster and `iter_range` went
    316ms → 222ms. **Confirming the mechanism first is what stopped a fix for a bug that
    does not exist.**
-4. **The lazy wrapping iterators** (see 4.1): a `map` over a `filter` over a list still
-   rebuilds three `Rc`s an element, and the same `make_mut` that fixed the range applies
-   once `step` can thread ownership through the layers. Cheapest item left.
+4. ~~**Phase 4.1b**~~ — done: the wrapping iterators advance in place too, so a chain is
+   ~20% faster and allocates nothing per element. Getting there needed two corrections
+   that only an A/B against the pre-change binary exposed; see 4.1b.
 5. **Phase 3**, the parser: 1.4µs a line of ordinary source and 2.7µs a line of
    annotations, which is 59% of what is left of a `Dict` program *and* the floor under
    every module a user imports. Start with the two cheap experiments, not the lexer.

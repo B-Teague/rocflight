@@ -103,33 +103,65 @@ fn negative(step: &Value) -> bool {
     }
 }
 
+/// What one step produced, before it is paired with the iterator that remains.
+///
+/// The same three cases as `Step` with neither payload: `advance` works on a `&mut Lazy`,
+/// so the iterator that remains IS the one it advanced, and the item goes through an out
+/// parameter. Both omissions are for size — a `Value` is 48 bytes and an `EvalError`
+/// carries a `String`, so returning them from each layer of a chain moved 80 bytes per
+/// layer per element. Measured: with the item in here, a plain range cost 7% more than
+/// not having this function at all.
+enum Made {
+    Done,
+    Skip,
+    One,
+}
+
 impl Lazy {
     /// One step: the item, and the iterator that remains.
     ///
-    /// Takes the `Rc` by VALUE so that the two iterators a loop walks element by
-    /// element — a list, and a range of anything but integers — can advance in place
-    /// when nothing else holds them. `Rc::get_mut` succeeds only at a refcount of one,
-    /// so that is Rust's copy-on-write rather than a mutation anyone can observe: a
-    /// caller who kept its own handle still gets a fresh rest, exactly as before.
+    /// Takes the `Rc` by VALUE and advances through `Rc::make_mut`, so an iterator
+    /// nothing else holds is stepped **in place** — the whole chain of it, because
+    /// `advance` recurses on `&mut Lazy` rather than on `Rc<Lazy>`. Walking n elements
+    /// of a `map` over a `filter` over a list allocates nothing; it used to allocate a
+    /// fresh rest per element PER LAYER, three deep for that chain.
     ///
-    /// It matters because the rest used to be a fresh allocation per element, and a
-    /// `Dec` range of two million of them is two million of those. Walking one now
-    /// allocates once. Every other variant keeps the pure path below, which is where
-    /// the semantics live — this is only the fast lane in front of it.
+    /// `make_mut` rather than `get_mut` is what keeps this invisible. A caller that kept
+    /// its own handle — `Iter.next` in Roc, which must not mutate the iterator the
+    /// program is holding — gets a copy to advance and leaves the original alone, which
+    /// is exactly the behaviour the old per-step allocation gave it.
     pub fn step(mut self: Rc<Self>) -> Result<Step, EvalError> {
-        // `Some(item)` advanced, `None` is exhausted, and falling through means this is
-        // not one of the two. The answer is computed inside the borrow and acted on
-        // outside it, because `Step::One` moves the `Rc` that the borrow came from.
-        let advanced: Option<Value> = match Rc::make_mut(&mut self) {
-            Lazy::List(items, at) => match items.get(*at).cloned() {
+        let mut item = Value::Unit;
+        Ok(match Rc::make_mut(&mut self).advance(&mut item)? {
+            Made::Done => Step::Done,
+            Made::Skip => Step::Skip(self),
+            Made::One => Step::One(item, self),
+        })
+    }
+
+    /// Advance this iterator by one, in place, and say what came out.
+    ///
+    /// A wrapper advances its own inner the same way, so the recursion carries the
+    /// mutable borrow down the chain instead of rebuilding it on the way back up.
+    ///
+    /// Split from `advance_wrapped` so that THIS half — the two iterators with no inner,
+    /// which is what a plain loop walks — carries no recursion and can be inlined into
+    /// `step`. Measured: with the leaves and the wrappers in one recursive function,
+    /// LLVM keeps the whole thing out of line and a plain range costs 10% more.
+    #[inline]
+    fn advance(&mut self, out: &mut Value) -> Result<Made, EvalError> {
+        match self {
+            Lazy::List(items, at) => Ok(match items.get(*at) {
                 Some(item) => {
+                    *out = item.clone();
                     *at += 1;
-                    Some(item)
+                    Made::One
                 }
-                None => None,
-            },
-            mine @ Lazy::Range { .. } => {
-                let Lazy::Range { at, end, step: by, inclusive } = mine else { unreachable!() };
+                None => Made::Done,
+            }),
+            Lazy::Range { at, end, step: by, inclusive } => {
+                // A negative step walks DOWN to `end`: a reversed range
+                // (`5.range_exclusive_from(1)`) is one.
                 let descending = negative(by);
                 let op = match (*inclusive, descending) {
                     (true, false) => BinOp::Le,
@@ -137,113 +169,119 @@ impl Lazy {
                     (true, true) => BinOp::Ge,
                     (false, true) => BinOp::Gt,
                 };
-                if truthy(apply_binop(op, at, end)?) {
-                    let item = at.clone();
-                    // Advancing past the last element can overflow the width (an
-                    // inclusive range ending at the maximum). That must stop the
-                    // iterator rather than crash, and a step that wraps without
-                    // advancing is the same case, so both become exhausted.
-                    let past = if descending { BinOp::Lt } else { BinOp::Gt };
-                    match apply_binop(BinOp::Add, at, by) {
-                        Ok(next) if apply_binop(past, &next, at).map(truthy).unwrap_or(false) => {
-                            *at = next;
-                        }
-                        _ => *mine = Lazy::List(Rc::new(Vec::new()), 0),
-                    }
-                    Some(item)
-                } else {
-                    None
+                if !truthy(apply_binop(op, at, end)?) {
+                    return Ok(Made::Done);
                 }
+                *out = at.clone();
+                // Advancing past the last element can overflow the width (an inclusive
+                // range ending at the maximum). That must stop the iterator rather than
+                // crash, and a step that wraps without advancing is the same case, so
+                // both become an iterator with nothing left in it.
+                let past = if descending { BinOp::Lt } else { BinOp::Gt };
+                match apply_binop(BinOp::Add, at, by) {
+                    Ok(next) if apply_binop(past, &next, at).map(truthy).unwrap_or(false) => {
+                        *at = next;
+                    }
+                    _ => *self = Lazy::List(Rc::new(Vec::new()), 0),
+                }
+                Ok(Made::One)
             }
-            // Every other variant is a wrapper whose own step is the general path.
-            _ => return Self::step_wrapped(&self),
-        };
-        return Ok(match advanced {
-            Some(item) => Step::One(item, self),
-            None => Step::Done,
-        });
+            _ => self.advance_wrapped(out),
+        }
     }
 
-    /// The wrapping iterators: each defers to its inner one and rebuilds itself.
-    ///
-    /// A list and a range are not here — `step` advances those in place. These allocate
-    /// a rest per element and always did; a `map` over a `filter` is three of them deep,
-    /// which is the next thing to look at if an iterator chain shows up hot.
-    fn step_wrapped(self: &Rc<Self>) -> Result<Step, EvalError> {
-        match &**self {
-            // `step` answers these without ever coming here. Handing them back to it
-            // rather than panicking costs nothing and terminates either way, because
-            // that path does not call this one.
-            Lazy::List(..) | Lazy::Range { .. } => Rc::clone(self).step(),
+    /// The wrapping iterators. Each advances its own inner IN PLACE — `Rc::make_mut`
+    /// hands it a `&mut Lazy` to recurse into — rather than stepping a clone and
+    /// rebuilding itself around the rest. A `map` over a `filter` over a list used to be
+    /// three allocations per element and is now none.
+    fn advance_wrapped(&mut self, out: &mut Value) -> Result<Made, EvalError> {
+        match self {
+            // `advance` answers these itself and never comes here; handing them back
+            // terminates, because that path does not call this one.
+            Lazy::List(..) | Lazy::Range { .. } => self.advance(out),
             Lazy::Custom { state, adv, hint } => {
                 match call_function(adv.clone(), vec![state.clone()])? {
                     Value::Tag("Ok", payload) => match payload.first() {
                         Some(Value::Tuple(pair)) if pair.len() == 2 => {
-                            let next = Hint::step_down(*hint);
-                            Ok(Step::One(
-                                pair[0].clone(),
-                                rc(Lazy::Custom { state: pair[1].clone(), adv: adv.clone(), hint: next }),
-                            ))
+                            *hint = Hint::step_down(*hint);
+                            *state = pair[1].clone();
+                            *out = pair[0].clone();
+                            Ok(Made::One)
                         }
                         other => Err(EvalError {
                             message: format!("Iter.custom step must give Ok((item, state)), got {:?}", other),
                         }),
                     },
-                    _ => Ok(Step::Done),
+                    _ => Ok(Made::Done),
                 }
             }
-            Lazy::Filter { inner, pred, keep } => match Rc::clone(inner).step()? {
-                Step::Done => Ok(Step::Done),
-                Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Filter { inner: rest, pred: pred.clone(), keep: *keep }))),
-                Step::One(item, rest) => {
-                    let next = rc(Lazy::Filter { inner: rest, pred: pred.clone(), keep: *keep });
-                    if truthy(call_function(pred.clone(), vec![item.clone()])?) == *keep {
-                        Ok(Step::One(item, next))
+            Lazy::Filter { inner, pred, keep } => match Rc::make_mut(inner).advance(out)? {
+                Made::Done => Ok(Made::Done),
+                Made::Skip => Ok(Made::Skip),
+                Made::One => {
+                    // A rejected item is a Skip, not an absence: roc's `Iter` reports
+                    // one so that a caller stepping by hand sees the work happen.
+                    if truthy(call_function(pred.clone(), vec![out.clone()])?) == *keep {
+                        Ok(Made::One)
                     } else {
-                        Ok(Step::Skip(next))
+                        Ok(Made::Skip)
                     }
                 }
             },
-            Lazy::Map { inner, f } => match Rc::clone(inner).step()? {
-                Step::Done => Ok(Step::Done),
-                Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Map { inner: rest, f: f.clone() }))),
-                Step::One(item, rest) => Ok(Step::One(
-                    call_function(f.clone(), vec![item])?,
-                    rc(Lazy::Map { inner: rest, f: f.clone() }),
-                )),
+            Lazy::Map { inner, f } => match Rc::make_mut(inner).advance(out)? {
+                Made::Done => Ok(Made::Done),
+                Made::Skip => Ok(Made::Skip),
+                Made::One => {
+                    let item = std::mem::replace(out, Value::Unit);
+                    *out = call_function(f.clone(), vec![item])?;
+                    Ok(Made::One)
+                }
             },
-            Lazy::WithIndex { inner, i } => match Rc::clone(inner).step()? {
-                Step::Done => Ok(Step::Done),
-                Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::WithIndex { inner: rest, i: *i }))),
-                Step::One(item, rest) => Ok(Step::One(
-                    Value::Tuple(vec![Value::Int(i128::from(*i)), item]),
-                    rc(Lazy::WithIndex { inner: rest, i: i + 1 }),
-                )),
+            Lazy::WithIndex { inner, i } => match Rc::make_mut(inner).advance(out)? {
+                Made::Done => Ok(Made::Done),
+                Made::Skip => Ok(Made::Skip),
+                Made::One => {
+                    let item = std::mem::replace(out, Value::Unit);
+                    *out = Value::Tuple(vec![Value::Int(i128::from(*i)), item]);
+                    *i += 1;
+                    Ok(Made::One)
+                }
             },
-            Lazy::StepBy { inner, step, skip } => match Rc::clone(inner).step()? {
-                Step::Done => Ok(Step::Done),
-                Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::StepBy { inner: rest, step: *step, skip: *skip }))),
-                Step::One(item, rest) => {
+            Lazy::StepBy { inner, step, skip } => match Rc::make_mut(inner).advance(out)? {
+                Made::Done => Ok(Made::Done),
+                Made::Skip => Ok(Made::Skip),
+                Made::One => {
                     if *skip == 0 {
-                        Ok(Step::One(item, rc(Lazy::StepBy { inner: rest, step: *step, skip: step.saturating_sub(1) })))
+                        *skip = step.saturating_sub(1);
+                        Ok(Made::One)
                     } else {
-                        Ok(Step::Skip(rc(Lazy::StepBy { inner: rest, step: *step, skip: skip - 1 })))
+                        *skip -= 1;
+                        Ok(Made::Skip)
                     }
                 }
             },
-            Lazy::Concat { first, second } => match Rc::clone(first).step()? {
-                Step::Done => Rc::clone(second).step(),
-                Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Concat { first: rest, second: second.clone() }))),
-                Step::One(item, rest) => Ok(Step::One(item, rc(Lazy::Concat { first: rest, second: second.clone() }))),
+            Lazy::Concat { first, second } => match Rc::make_mut(first).advance(out)? {
+                // The first is spent, so this iterator simply IS the second from here
+                // on — which is what returning `second.step()` did, one layer at a time.
+                Made::Done => {
+                    let rest = (**second).clone();
+                    *self = rest;
+                    self.advance(out)
+                }
+                Made::Skip => Ok(Made::Skip),
+                Made::One => Ok(Made::One),
             },
             Lazy::Take { inner, n } => {
                 if *n == 0 {
-                    return Ok(Step::Done);
+                    return Ok(Made::Done);
                 }
-                match Rc::clone(inner).step()? {
-                    Step::Done => Ok(Step::Done),
-                    Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Take { inner: rest, n: *n }))),
-                    Step::One(item, rest) => Ok(Step::One(item, rc(Lazy::Take { inner: rest, n: n - 1 }))),
+                match Rc::make_mut(inner).advance(out)? {
+                    Made::Done => Ok(Made::Done),
+                    Made::Skip => Ok(Made::Skip),
+                    Made::One => {
+                        *n -= 1;
+                        Ok(Made::One)
+                    }
                 }
             }
         }
