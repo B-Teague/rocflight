@@ -80,6 +80,10 @@ enum CapSource {
 enum Found {
     /// A register in this frame: a parameter or a `let`.
     Local(Reg),
+    /// A register holding a `Value::Cell`: a captured `var`, read through it.
+    LocalCell(Reg),
+    /// A captured `var`: the capture is the cell.
+    CaptureCell(u16),
     /// The function this name belongs to is the one running.
     SelfRef,
     /// An enclosing function's value, copied in when the closure was made.
@@ -131,12 +135,46 @@ pub struct Unit<'a> {
     /// Literal nodes the checker typed as `Dec`, from `TypeChecker::dec_literals`.
     /// They are lowered as fixed-point values rather than integers or floats.
     pub dec_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// Literal nodes the checker typed as `F32`, from `TypeChecker::f32_literals`.
+    pub f32_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// Literal nodes typed `U128`; emitted as `Value::U128`.
+    pub u128_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// Record literals with optional fields left out, and which, from
+    /// `TypeChecker::missing_fields`: each is filled with `Value::Missing`.
+    pub missing_fields: std::collections::HashMap<crate::ast::NodeId, Vec<&'static str>>,
+    /// Literals that are a nominal built through one of its conversions, and which
+    /// nominal and conversion, from `TypeChecker::literal_conversions`.
+    pub conversions: std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)>,
+    /// Every numeric literal's text, for `from_numeral`; from `Parser::numeral_texts`.
+    pub numeral_texts: std::collections::HashMap<crate::ast::NodeId, String>,
+    /// From `TypeChecker::coerce_values` and `coerce_params`: where a raw literal may
+    /// arrive at run time and which nominal it should be.
+    pub coerce_values: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    pub coerce_params: std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>>,
+    /// From `TypeChecker::zero_sized_capacity`: `List.with_capacity` calls compiled
+    /// with a capacity of 0, as roc never allocates for a zero-sized element.
+    pub zero_sized_capacity: std::collections::HashSet<crate::ast::NodeId>,
+    /// From `TypeChecker::match_types`: scrutinee types that mention such a nominal.
+    pub match_types: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    /// See `TypeChecker::for_iter_calls`.
+    pub for_iter_calls: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `TypeChecker::default_sites`: a record/unit literal node -> the nominal it
+    /// builds, whose omitted defaulted/optional fields the compiler materializes.
+    pub default_sites: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    /// Per-nominal defaulted fields and their default expressions.
+    pub nominal_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)>,
+    /// Run the top-level `expect`s as well as the program: `rocflight eval` does, and
+    /// reports a failing one as roc does, at compile time.
+    pub run_expects: bool,
     /// Literal nodes nothing pinned down, from `TypeChecker::fractional_literals`.
     /// roc defaults an unconstrained numeral to a fractional type.
     pub fractional_literals: std::collections::HashSet<crate::ast::NodeId>,
     /// `Json.parse` call sites and the type each must produce, from
     /// `TypeChecker::parse_targets`. Passed to the builtin as an extra argument.
     pub parse_targets: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    /// `collect()` call sites and the nominal whose `from_iter` builds the result,
+    /// from `TypeChecker::collect_targets`.
+    pub collect_targets: std::collections::HashMap<crate::ast::NodeId, String>,
     /// Bare names the builtin module DECLARES but does not define — its low-level ops.
     ///
     /// They are calls into Rust, so a missing one is a runtime message naming the op
@@ -162,8 +200,22 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
         nominals: Vec::new(),
         opaque_nominals: Vec::new(),
         dec_literals: std::collections::HashSet::new(),
+        f32_literals: std::collections::HashSet::new(),
+        u128_literals: std::collections::HashSet::new(),
+        conversions: std::collections::HashMap::new(),
+        numeral_texts: std::collections::HashMap::new(),
+        coerce_values: std::collections::HashMap::new(),
+        coerce_params: std::collections::HashMap::new(),
+        zero_sized_capacity: std::collections::HashSet::new(),
+        match_types: std::collections::HashMap::new(),
+        for_iter_calls: std::collections::HashSet::new(),
+        default_sites: std::collections::HashMap::new(),
+        nominal_defaults: Vec::new(),
+        missing_fields: std::collections::HashMap::new(),
+        run_expects: false,
         fractional_literals: std::collections::HashSet::new(),
         parse_targets: std::collections::HashMap::new(),
+        collect_targets: std::collections::HashMap::new(),
         intrinsics: std::collections::HashSet::new(),
         // The bare helper is what the unit tests and `vm::eval` use: run everything.
         test_mode: true,
@@ -268,14 +320,46 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         dispatch_modules: unit.dispatch_modules.clone(),
         binop_modules: unit.binop_modules.clone(),
         dec_literals: unit.dec_literals.clone(),
+        f32_literals: unit.f32_literals.clone(),
+        u128_literals: unit.u128_literals.clone(),
+        conversions: unit.conversions.clone(),
+        numeral_texts: unit.numeral_texts.clone(),
+        coerce_values: unit.coerce_values.clone(),
+        coerce_params: unit.coerce_params.clone(),
+        zero_sized_capacity: unit.zero_sized_capacity.clone(),
+        match_types: unit.match_types.clone(),
+        default_sites: unit.default_sites.clone(),
+        nominal_defaults: unit.nominal_defaults.clone(),
+        nominal_records: unit
+            .nominals
+            .iter()
+            .filter_map(|(name, backing)| {
+                let fields = match backing {
+                    crate::types::Type::Record { fields, .. } => Some(fields.clone()),
+                    crate::types::Type::Nominal { backing, .. } => match &**backing {
+                        crate::types::Type::Record { fields, .. } => Some(fields.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                }?;
+                Some((*name, fields))
+            })
+            .collect(),
+        pending_coerce: None,
+        literal_coercions: Vec::new(),
+        missing_fields: unit.missing_fields.clone(),
         fractional_literals: unit.fractional_literals.clone(),
         parse_targets: unit.parse_targets.clone(),
+        collect_targets: unit.collect_targets.clone(),
+        capture_free_methods: Vec::new(),
+        global_owner: None,
         intrinsics: unit.intrinsics.clone(),
     };
 
     for (name, value) in &bindings {
-        if let Expr::Lambda { params, body, .. } = value {
+        if let Expr::Lambda { params, body, id } = value {
             let (chunk, _) = c.tops.func(name).expect("collected above");
+            c.pending_coerce = c.coerce_params.get(id).cloned();
             // A top-level function is at the outermost level, so it has nothing to
             // capture: every free name in it is a global or another top-level function.
             let captures = c.function(chunk, name, params, body, None)?;
@@ -299,7 +383,9 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
             continue;
         }
         let save = c.st().next_reg;
+        c.global_owner = name.rsplit_once('.').map(|(owner, _)| owner);
         let src = c.expr(value)?;
+        c.global_owner = None;
         let idx = c.tops.global(name).expect("collected above");
         c.emit(Op::StoreGlob { idx, src });
         c.st().next_reg = save;
@@ -311,14 +397,14 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     // the declarations anyway; interleaving matters once those are compiled (V5).
     for statement in &statements {
         let save = c.st().next_reg;
-        c.top_statement(statement, unit.test_mode)?;
+        c.top_statement(statement, unit.test_mode || unit.run_expects)?;
         c.st().next_reg = save;
     }
     // A file whose last declaration is a top-level `expect` has it as the trailing
     // expression rather than a statement. It is still a test, so it gets the same
     // treatment and the top level's own value is `{}` either way.
     if matches!(tail, Expr::Expect(..)) {
-        c.top_statement(tail, unit.test_mode)?;
+        c.top_statement(tail, unit.test_mode || unit.run_expects)?;
         let src = c.literal(Value::Unit)?;
         c.emit(Op::Ret { src });
     } else {
@@ -345,17 +431,19 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     let mut methods = std::collections::HashMap::new();
     let mut methods_by_name: std::collections::HashMap<&'static str, Vec<(&'static str, ChunkId)>> =
         std::collections::HashMap::new();
-    for (qualified, chunk, _) in &c.tops.fns {
+    let block_local = c.capture_free_methods.clone();
+    for (qualified, chunk) in c.tops.fns.iter().map(|(q, c, _)| (*q, *c)).chain(block_local) {
         if let Some((module, method)) = qualified.rsplit_once('.') {
             let module: &'static str = Box::leak(module.to_string().into_boxed_str());
             let method: &'static str = Box::leak(method.to_string().into_boxed_str());
-            methods.insert((module, method), *chunk);
-            methods_by_name.entry(method).or_default().push((qualified, *chunk));
+            methods.entry((module, method)).or_insert(chunk);
+            methods_by_name.entry(method).or_default().push((qualified, chunk));
         }
     }
 
     Ok(Program {
         chunks,
+        literal_coercions: std::mem::take(&mut c.literal_coercions),
         n_globals: c.tops.globals.len(),
         top: 0,
         entry,
@@ -364,13 +452,18 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         nominal_shapes: unit
             .nominals
             .iter()
-            .map(|(name, backing)| (*name, crate::vm::shape_of(backing)))
+            .map(|(name, backing)| (*name, resolved_shape(&unit.nominals, backing)))
+            .collect(),
+        nominal_depth: unit
+            .nominals
+            .iter()
+            .map(|(name, backing)| (*name, resolved_shape_depth(&unit.nominals, backing).1))
             .collect(),
         opaque_shapes: unit
             .nominals
             .iter()
             .filter(|(name, _)| unit.opaque_nominals.contains(name))
-            .map(|(_, backing)| crate::vm::shape_of(backing))
+            .map(|(_, backing)| resolved_shape(&unit.nominals, backing))
             .collect(),
     })
 }
@@ -393,6 +486,8 @@ struct FnState {
     /// `LoadCap` uses at run time.
     captures: Vec<CapSource>,
     capture_names: Vec<&'static str>,
+    /// Which captures are cells (a captured `var`), read through `CellGet`.
+    capture_boxed: Vec<bool>,
     /// Field and tag names, by index. A record literal's names are appended as a
     /// consecutive run, which is what `MakeRecord` reads.
     names: Vec<&'static str>,
@@ -429,6 +524,7 @@ impl FnState {
             loops: Vec::new(),
             captures: Vec::new(),
             capture_names: Vec::new(),
+            capture_boxed: Vec::new(),
             names: Vec::new(),
             pats: Vec::new(),
             next_reg: 0,
@@ -487,6 +583,9 @@ struct Local {
     /// A closure has copied this value. Assigning it afterwards would leave that copy
     /// stale, so the assignment is refused — see `Compiler::upvalue`.
     captured: bool,
+    /// A `var` some lambda in its scope mentions: the register holds a `Value::Cell`
+    /// and every read and write goes through it, so the closures share the variable.
+    boxed: bool,
 }
 
 struct Compiler {
@@ -497,6 +596,28 @@ struct Compiler {
     node: crate::ast::NodeId,
     /// Which `BinOp` nodes may use the integer-only opcode.
     integer_binops: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `Unit::f32_literals`.
+    f32_literals: std::collections::HashSet<crate::ast::NodeId>,
+    u128_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `Unit::conversions` and the fields after it.
+    conversions: std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)>,
+    numeral_texts: std::collections::HashMap<crate::ast::NodeId, String>,
+    coerce_values: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    coerce_params: std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>>,
+    zero_sized_capacity: std::collections::HashSet<crate::ast::NodeId>,
+    match_types: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    default_sites: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    nominal_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)>,
+    /// Each default-site nominal's backing fields, so the compiler knows which omitted
+    /// fields are optional (fill `<missing>`) versus defaulted (fill the default).
+    nominal_records: std::collections::HashMap<&'static str, Vec<(String, crate::types::Type)>>,
+    /// The parameter conversions of the lambda about to be compiled; `function` takes
+    /// them.
+    pending_coerce: Option<Vec<(usize, &'static str)>>,
+    /// See `Program::literal_coercions`.
+    literal_coercions: Vec<(&'static str, Value)>,
+    /// See `Unit::missing_fields`.
+    missing_fields: std::collections::HashMap<crate::ast::NodeId, Vec<&'static str>>,
     /// See `Unit::dispatch_modules`.
     dispatch_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
     /// See `Unit::binop_modules`.
@@ -507,6 +628,15 @@ struct Compiler {
     fractional_literals: std::collections::HashSet<crate::ast::NodeId>,
     /// See `Unit::parse_targets`.
     parse_targets: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    /// See `Unit::collect_targets`.
+    collect_targets: std::collections::HashMap<crate::ast::NodeId, String>,
+    /// Block-local nominal methods that captured nothing, added to the runtime
+    /// dispatch tables. See `closure`.
+    capture_free_methods: Vec<(&'static str, ChunkId)>,
+    /// The nominal owning the VALUE being compiled, when it is a method-block member
+    /// that is not a function — a top-level `effects = { send: send }`, or a
+    /// block-local one. See `enclosing_type`.
+    global_owner: Option<&'static str>,
     /// Bare low-level names the builtin module declares; see `Unit::intrinsics`.
     intrinsics: std::collections::HashSet<&'static str>,
 }
@@ -567,6 +697,8 @@ impl Compiler {
             Op::Jump { to }
             | Op::JumpFalse { to, .. }
             | Op::TestLit { to, .. }
+            | Op::TestLitDyn { to, .. }
+            | Op::TestStr { to, .. }
             | Op::TestTag { to, .. }
             | Op::TestTuple { to, .. }
             | Op::TestRecord { to, .. }
@@ -614,23 +746,52 @@ impl Compiler {
     ///
     /// Inside `Graph :: … .{ … }` a sibling method is in scope UNQUALIFIED — roc lets
     /// `from_list` call `from_dict(…)` — but it is bound here as `Graph.from_dict`.
+    /// The one binding in scope named `Type.method`, if exactly one is. A block-local
+    /// nominal's methods are ordinary locals (they capture), so this is how a dispatch
+    /// the checker could not resolve statically still finds one.
+    fn unique_scoped_method(&self, method: &str) -> Option<&'static str> {
+        let suffix = format!(".{}", method);
+        let mut found: Option<&'static str> = None;
+        for state in &self.states {
+            for local in &state.locals {
+                if !local.name.ends_with(&suffix) {
+                    continue;
+                }
+                match found {
+                    Some(seen) if seen == local.name => {}
+                    Some(_) => return None,
+                    None => found = Some(local.name),
+                }
+            }
+        }
+        found
+    }
+
     fn enclosing_type(&self) -> Option<&'static str> {
         self.states
             .iter()
             .rev()
             .find_map(|state| state.name.rsplit_once('.').map(|(owner, _)| owner))
+            // A method-block member that is a VALUE rather than a function —
+            // `effects = { send: send }` — is compiled as a global at the top level,
+            // whose frame is called "top level". Without the owner its siblings are
+            // undefined names.
+            .or(self.global_owner)
     }
 
     fn resolve(&mut self, name: &'static str) -> Option<Found> {
         let level = self.states.len() - 1;
         if let Some(l) = self.states[level].local(name) {
-            return Some(Found::Local(l.reg));
+            return Some(if l.boxed { Found::LocalCell(l.reg) } else { Found::Local(l.reg) });
         }
         if self.states[level].self_name == Some(name) {
             return Some(Found::SelfRef);
         }
         match self.upvalue(level, name) {
             Err(e) => return Some(Found::Refused(e)),
+            Ok(Some(idx)) if self.states[level].capture_boxed[idx as usize] => {
+                return Some(Found::CaptureCell(idx))
+            }
             Ok(Some(idx)) => return Some(Found::Capture(idx)),
             Ok(None) => {}
         }
@@ -666,7 +827,7 @@ impl Compiler {
         let Some(parent) = level.checked_sub(1) else { return Ok(None) };
 
         if let Some(l) = self.states[parent].local_mut(name) {
-            if l.is_var {
+            if l.is_var && !l.boxed {
                 // ponytail: a `var` a closure captures needs a shared cell
                 // (`Rc<RefCell<Value>>`) so both see the assignments; captured by value
                 // it would silently go stale, and the tree-walker's shared frames make
@@ -678,23 +839,27 @@ impl Compiler {
                 ));
             }
             l.captured = true;
-            let reg = l.reg;
-            return Ok(self.add_capture(level, name, CapSource::Local(reg)));
+            let (reg, boxed) = (l.reg, l.boxed);
+            return Ok(self.add_capture(level, name, CapSource::Local(reg), boxed));
         }
         if self.states[parent].self_name == Some(name) {
-            return Ok(self.add_capture(level, name, CapSource::Enclosing));
+            return Ok(self.add_capture(level, name, CapSource::Enclosing, false));
         }
         match self.upvalue(parent, name)? {
             None => Ok(None),
-            Some(in_parent) => Ok(self.add_capture(level, name, CapSource::Capture(in_parent))),
+            Some(in_parent) => {
+                let boxed = self.states[parent].capture_boxed[in_parent as usize];
+                Ok(self.add_capture(level, name, CapSource::Capture(in_parent), boxed))
+            }
         }
     }
 
-    fn add_capture(&mut self, level: usize, name: &'static str, src: CapSource) -> Option<u16> {
+    fn add_capture(&mut self, level: usize, name: &'static str, src: CapSource, boxed: bool) -> Option<u16> {
         let st = &mut self.states[level];
         let idx = u16::try_from(st.captures.len()).ok()?;
         st.captures.push(src);
         st.capture_names.push(name);
+        st.capture_boxed.push(boxed);
         Some(idx)
     }
 
@@ -710,7 +875,18 @@ impl Compiler {
         self.states.push(FnState::new(name, params.clone(), self_name, true));
         for param in params.iter() {
             let reg = self.alloc()?;
-            self.st().locals.push(Local { name: param, reg, is_var: false, captured: false });
+            self.st().locals.push(Local { name: param, reg, is_var: false, captured: false, boxed: false });
+        }
+        // A parameter declared as a nominal with a literal conversion: a raw literal
+        // from a generic caller is converted on entry, anything else passes through.
+        if let Some(coerce) = self.pending_coerce.take() {
+            for (i, nominal) in coerce {
+                let reg = i as Reg;
+                let save = self.st().next_reg;
+                let got = self.coerce(reg, nominal)?;
+                self.emit(Op::Move { dst: reg, src: got });
+                self.st().next_reg = save;
+            }
         }
         // The body is in tail position by definition, which is what turns a
         // tail-recursive function into a loop.
@@ -735,6 +911,13 @@ impl Compiler {
         self.chunks.push(None);
         let chunk = (self.chunks.len() - 1) as ChunkId;
         let captures = self.function(chunk, name, params, body, self_name)?;
+        // A block-local nominal's method that captures NOTHING can also answer a
+        // runtime dispatch, which is how an imported generic helper — compiled long
+        // before this block — reaches it. One that does capture cannot: its chunk
+        // needs the closure's values, and only the binding in scope has them.
+        if captures.is_empty() && name.contains('.') {
+            self.capture_free_methods.push((name, chunk));
+        }
 
         // The captured values go in consecutive registers, which is where
         // `MakeClosure` reads them from.
@@ -795,6 +978,157 @@ impl Compiler {
         }
     }
 
+    /// The `Numeral` a literal node stands for: from its text where the parser kept
+    /// it, otherwise from the value.
+    fn numeral(&self, id: &crate::ast::NodeId, value: Value) -> Result<Value, String> {
+        self.numeral_texts
+            .get(id)
+            .and_then(|text| crate::eval::numeral::numeral_from_text(text))
+            .or_else(|| crate::eval::numeral::numeral_from_value(&value))
+            .ok_or_else(|| format!("vm: {} cannot be read as a numeral", value))
+    }
+
+    /// `"Roc"` where a `Tag` is expected: `Tag.from_quote("Roc")`, unwrapped; `42`
+    /// where a `Big` is: `Big.from_numeral(numeral)`. roc refuses a literal the
+    /// conversion rejects at compile time; here that is a runtime crash, since the
+    /// conversion only runs then.
+    fn convert_literal(&mut self, module: &str, method: &str, arg: Value) -> Result<Reg, String> {
+        let base = self.st().next_reg;
+        let got = self.literal(arg)?;
+        if got != base {
+            self.emit(Op::Move { dst: base, src: got });
+        }
+        self.call_conversion(module, method, base, 1)
+    }
+
+    /// `"a${b}"` where a `Url` is expected: `Url.from_interpolation(first, rest)`,
+    /// with `rest` the `(value, following text)` pairs — a list, which is what an
+    /// `Iter` is here.
+    fn interpolated(&mut self, module: &str, method: &str, parts: &[StrPart]) -> Result<Reg, String> {
+        let mut literals: Vec<&'static str> = vec![""];
+        let mut exprs: Vec<&Expr> = Vec::new();
+        for part in parts {
+            match part {
+                StrPart::Literal(text) => *literals.last_mut().expect("seeded") = text,
+                StrPart::Expr(e) => {
+                    exprs.push(e);
+                    literals.push("");
+                }
+            }
+        }
+        // `first` at `base`, the list of pairs at `base + 1`, each pair built from
+        // the two registers after it.
+        let base = self.st().next_reg;
+        self.place(base, |c| c.literal(Value::Str(Rc::from(literals[0]))))?;
+        let list = base + 1;
+        self.reserve(list)?;
+        let pairs = self.st().next_reg;
+        for (i, e) in exprs.iter().enumerate() {
+            let target = pairs + i as Reg;
+            self.reserve(target)?;
+            let save = self.st().next_reg;
+            let pair = save;
+            self.place(pair, |c| c.expr(e))?;
+            self.place(pair + 1, |c| c.literal(Value::Str(Rc::from(literals[i + 1]))))?;
+            self.emit(Op::MakeTuple { dst: target, base: pair, n: 2 });
+            self.st().next_reg = save;
+        }
+        let n = u16::try_from(exprs.len()).map_err(|_| "vm: too many interpolations".to_string())?;
+        self.emit(Op::MakeList { dst: list, base: pairs, n });
+        self.call_conversion(module, method, base, 2)
+    }
+
+    /// Compute a value into exactly `target`, freeing whatever temporaries it used.
+    fn place(&mut self, target: Reg, value: impl FnOnce(&mut Self) -> Result<Reg, String>) -> Result<(), String> {
+        self.reserve(target)?;
+        let save = self.st().next_reg;
+        let got = value(self)?;
+        if got != target {
+            self.emit(Op::Move { dst: target, src: got });
+        }
+        self.st().next_reg = save;
+        Ok(())
+    }
+
+    /// Call `Module.method` on the `argc` arguments at `base`; a `from_quote` or
+    /// `from_numeral` answers a `Try`, and the literal is its `Ok`.
+    fn call_conversion(&mut self, module: &str, method: &str, base: Reg, argc: u16) -> Result<Reg, String> {
+        let owner = qualify(module, method);
+        let (chunk, arity) = self
+            .tops
+            .func(owner)
+            .ok_or_else(|| format!("vm: `{}` has no `{}` for a literal", module, method))?;
+        check_arity(owner, arity, argc)?;
+        self.st().next_reg = base;
+        let dst = self.alloc()?;
+        self.emit(Op::CallFn { dst, chunk, base, argc });
+        if method == "from_interpolation" {
+            return Ok(dst);
+        }
+        let ok = self.name_idx("Ok")?;
+        let fail = self.here();
+        self.emit(Op::TestTag { obj: dst, name: ok, n: 1, to: u32::MAX });
+        let out = self.alloc()?;
+        self.emit(Op::GetPayload { dst: out, obj: dst, i: 0 });
+        let done = self.here();
+        self.emit(Op::Jump { to: u32::MAX });
+        self.patch_to_here(fail);
+        self.emit(Op::NoMatch { obj: dst });
+        self.patch_to_here(done);
+        Ok(out)
+    }
+
+    /// The `Ok` payload of a `Try` in `src`, crashing on an `Err` — what a
+    /// `from_numeral`/`from_quote` conversion answers with.
+    fn unwrap_ok(&mut self, src: Reg) -> Result<Reg, String> {
+        let ok = self.name_idx("Ok")?;
+        let fail = self.here();
+        self.emit(Op::TestTag { obj: src, name: ok, n: 1, to: u32::MAX });
+        let out = self.alloc()?;
+        self.emit(Op::GetPayload { dst: out, obj: src, i: 0 });
+        let done = self.here();
+        self.emit(Op::Jump { to: u32::MAX });
+        self.patch_to_here(fail);
+        self.emit(Op::NoMatch { obj: src });
+        self.patch_to_here(done);
+        Ok(out)
+    }
+
+    /// `Lit.coerce(value, from_quote, from_numeral, from_interpolation)` on `src`: a raw
+    /// literal that reached a nominal's slot through a generic body is converted, and
+    /// anything else comes back as it was. Each converter the nominal lacks is `{}`.
+    fn coerce(&mut self, src: Reg, nominal: &'static str) -> Result<Reg, String> {
+        let base = self.st().next_reg;
+        self.reserve(base)?;
+        self.emit(Op::Move { dst: base, src });
+        for (i, method) in ["from_quote", "from_numeral", "from_interpolation"].into_iter().enumerate() {
+            let target = base + 1 + i as Reg;
+            self.reserve(target)?;
+            let save = self.st().next_reg;
+            let owner = qualify(nominal, method);
+            let got = if self.tops.func(owner).is_some() {
+                self.use_name(owner)?
+            } else {
+                self.literal(Value::Unit)?
+            };
+            if got != target {
+                self.emit(Op::Move { dst: target, src: got });
+            }
+            self.st().next_reg = save;
+        }
+        self.st().next_reg = base;
+        let dst = self.alloc()?;
+        let name = self.names_run(&["Lit", "coerce"])?;
+        self.emit(Op::CallBuiltin { dst, name, base, argc: 4 });
+        Ok(dst)
+    }
+
+    /// Does the program declare a nominal that builds itself from a literal? Then a
+    /// literal pattern against a value of unknown type must ask the value.
+    fn converts_literals(&self) -> bool {
+        !self.tops.methods("from_numeral").is_empty() || !self.tops.methods("from_quote").is_empty()
+    }
+
     /// A statement at the top level, where `expect` means something different.
     ///
     /// A top-level `expect` is a TEST: `roc test` runs it and tallies it, and a normal
@@ -851,8 +1185,8 @@ impl Compiler {
 
             // Every arm's body is in tail position too, so a function that is one
             // `match` returns straight out of the arm that matched.
-            Expr::Match { scrutinee, arms, .. } => {
-                self.compile_match(scrutinee, arms, true)?;
+            Expr::Match { scrutinee, arms, id } => {
+                self.compile_match(scrutinee, arms, true, self.match_types.get(id).cloned())?;
                 Ok(())
             }
 
@@ -913,7 +1247,8 @@ impl Compiler {
                 // binding may be assigned — which, compiled, is a write to its register.
                 Expr::VarDecl { name, value, body, .. } => {
                     pushed += 1;
-                    self.bind(name, value, true).map(|()| &**body)
+                    let boxed = lambda_mentions(body, name);
+                    self.bind_var(name, value, boxed).map(|()| &**body)
                 }
                 Expr::Assign { name, value, body, .. } => self.assign(name, value).map(|()| &**body),
                 other => {
@@ -1011,7 +1346,7 @@ impl Compiler {
             let bound: &[(&'static str, Reg)] =
                 if fold { &[(params[0], dst), (params[1], item)] } else { &[(params[0], item)] };
             for &(name, reg) in bound {
-                self.st().locals.push(Local { name, reg, is_var: false, captured: false });
+                self.st().locals.push(Local { name, reg, is_var: false, captured: false, boxed: false });
             }
             let out = self.expr(&body)?;
             self.st().locals.truncate(locals_before);
@@ -1054,22 +1389,52 @@ impl Compiler {
     ///
     /// The caller pops the local when the binding goes out of scope.
     fn bind(&mut self, name: &'static str, value: &Expr, is_var: bool) -> Result<(), String> {
+        self.bind_in(name, value, is_var, false)
+    }
+
+    /// `var name = value`; `boxed` when a lambda in scope mentions it, so it lives in
+    /// a shared cell — see `Local::boxed`.
+    fn bind_var(&mut self, name: &'static str, value: &Expr, boxed: bool) -> Result<(), String> {
+        self.bind_in(name, value, true, boxed)
+    }
+
+    fn bind_in(&mut self, name: &'static str, value: &Expr, is_var: bool, boxed: bool) -> Result<(), String> {
         let save = self.st().next_reg;
+        // A block-local nominal's member — `Local.get` bound where its nominal was
+        // declared — has its siblings in scope UNQUALIFIED inside its body, the same
+        // way a top-level method block's do.
+        let outer_owner = self.global_owner;
+        if let Some((owner, _)) = name.rsplit_once('.') {
+            self.global_owner = Some(owner);
+        }
         // A lambda bound by a `let` may call itself by name: record the name so the
         // body resolves it to the running closure rather than to a binding that does
         // not exist yet.
         let src = match value {
-            Expr::Lambda { params, body, .. } => self.closure(name, params, body, Some(name))?,
-            other => self.expr(other)?,
+            Expr::Lambda { params, body, id } => {
+                self.pending_coerce = self.coerce_params.get(id).cloned();
+                self.closure(name, params, body, Some(name))
+            }
+            other => self.expr(other),
+        };
+        let src = match src {
+            Ok(reg) => reg,
+            Err(e) => {
+                self.global_owner = outer_owner;
+                return Err(e);
+            }
         };
         self.st().next_reg = save;
         // The binding gets a register of its own. Aliasing `src` would break as soon
         // as `src` was a temporary the next expression reuses.
         let slot = self.alloc()?;
-        if slot != src {
+        if boxed {
+            self.emit(Op::MakeCell { dst: slot, src });
+        } else if slot != src {
             self.emit(Op::Move { dst: slot, src });
         }
-        self.st().locals.push(Local { name, reg: slot, is_var, captured: false });
+        self.global_owner = outer_owner;
+        self.st().locals.push(Local { name, reg: slot, is_var, captured: false, boxed });
         Ok(())
     }
 
@@ -1079,6 +1444,28 @@ impl Compiler {
     /// except through an op that reads its inputs first (`Bin` does) or a fresh
     /// destination (everything else).
     fn expr(&mut self, e: &Expr) -> Result<Reg, String> {
+        // See `Unit::zero_sized_capacity`: the same call, asking for nothing.
+        if self.zero_sized_capacity.remove(&e.id()) {
+            if let Expr::Call { func, id, .. } = e {
+                let zero = Expr::Call { id: *id, func: func.clone(), args: vec![Expr::Int(0, *id)] };
+                return self.expr(&zero);
+            }
+        }
+        // Checked against a nominal with a literal conversion: convert at run time if
+        // a raw literal arrives. Taken out while the expression itself is compiled.
+        if let Some(nominal) = self.coerce_values.remove(&e.id()) {
+            // A LITERAL a nominal's `from_numeral` converts is folded before the
+            // program runs, as roc folds it at compile time — see `Program::literal_coercions`.
+            match e {
+                Expr::Int(n, _) => self.literal_coercions.push((nominal, Value::Int(*n))),
+                Expr::Float(f, ..) => self.literal_coercions.push((nominal, Value::Float(*f))),
+                _ => {}
+            }
+            let compiled = self.expr(e);
+            self.coerce_values.insert(e.id(), nominal);
+            let src = compiled?;
+            return self.coerce(src, nominal);
+        }
         // Whatever this node emits is attributed to it. Restored afterwards so a
         // parent's own instructions are not blamed on its last child.
         let enclosing = std::mem::replace(&mut self.node, e.id());
@@ -1089,6 +1476,23 @@ impl Compiler {
 
     fn expr_inner(&mut self, e: &Expr) -> Result<Reg, String> {
         match e {
+            // A literal that IS a nominal: the nominal's `from_numeral` of it.
+            Expr::Int(n, id) if self.conversions.contains_key(id) => {
+                let (module, method) = self.conversions[id];
+                if method == "from_numeral" {
+                    self.literal_coercions.push((module, Value::Int(*n)));
+                }
+                let numeral = self.numeral(id, Value::Int(*n))?;
+                self.convert_literal(module, method, numeral)
+            }
+            Expr::Float(f, _, id) if self.conversions.contains_key(id) => {
+                let (module, method) = self.conversions[id];
+                if method == "from_numeral" {
+                    self.literal_coercions.push((module, Value::Float(*f)));
+                }
+                let numeral = self.numeral(id, Value::Float(*f))?;
+                self.convert_literal(module, method, numeral)
+            }
             // A literal the checker typed as `Dec` is a FIXED-POINT value: `Dec` keeps
             // eighteen decimal places exactly, which an f64 cannot.
             Expr::Int(n, id) if self.dec_literals.contains(id) => {
@@ -1101,26 +1505,90 @@ impl Compiler {
             Expr::Int(n, id) if self.fractional_literals.contains(id) => {
                 self.literal(Value::Dec(n.saturating_mul(crate::eval::DEC_SCALE)))
             }
+            Expr::Int(n, id) if self.f32_literals.contains(id) => {
+                self.literal(Value::F32(*n as f32))
+            }
+            Expr::Int(n, id) if self.u128_literals.contains(id) => {
+                self.literal(Value::U128(*n as u128))
+            }
             Expr::Int(n, _) => self.literal(Value::Int(*n)),
-            // The literal as it was WRITTEN, not as the nearest double to it.
-            Expr::Float(_, exact, id) if self.dec_literals.contains(id) => {
+            // The literal as it was WRITTEN, not as the nearest double to it — and an
+            // unpinned one is a `Dec` too, which is roc's default for `0.1 + 0.2`.
+            Expr::Float(_, exact, id)
+                if self.dec_literals.contains(id) || self.fractional_literals.contains(id) =>
+            {
                 self.literal(Value::Dec(*exact))
+            }
+            Expr::Float(f, _, id) if self.f32_literals.contains(id) => {
+                self.literal(Value::F32(*f as f32))
             }
             Expr::Float(f, ..) => self.literal(Value::Float(*f)),
             Expr::Bool(b, _) => self.literal(Value::Bool(*b)),
+            Expr::Str(s, id) if self.conversions.contains_key(id) => {
+                let (module, method) = self.conversions[id];
+                self.convert_literal(module, method, Value::Str(Rc::from(*s)))
+            }
+            Expr::StrInterp(parts, id) if self.conversions.contains_key(id) => {
+                let (module, method) = self.conversions[id];
+                self.interpolated(module, method, parts)
+            }
             Expr::Str(s, _) => self.literal(Value::Str(Rc::from(*s))),
+            // `{}` where a record of optional fields was expected: every slot missing.
+            Expr::Unit(id) if self.default_sites.contains_key(id) => {
+                let name = self.default_sites[id];
+                self.build_defaulted_record(name, &[])
+            }
+            Expr::Unit(id) if self.missing_fields.contains_key(id) => {
+                let left_out = self.missing_fields[id].clone();
+                let name = self.names_run(&left_out)?;
+                let base = self.st().next_reg;
+                for _ in &left_out {
+                    self.literal(Value::Missing)?;
+                }
+                self.st().next_reg = base;
+                let dst = self.alloc()?;
+                self.emit(Op::MakeRecord { dst, name, base, n: left_out.len() as u16 });
+                Ok(dst)
+            }
             Expr::Unit(_) => self.literal(Value::Unit),
 
+            // `_` as a value is an unset optional field.
+            Expr::Ident("_", _) => self.literal(Value::Missing),
             Expr::Ident(name, _) => self.use_name(name),
 
-            Expr::Lambda { params, body, .. } => self.closure("<lambda>", params, body, None),
+            Expr::Lambda { params, body, id } => {
+                self.pending_coerce = self.coerce_params.get(id).cloned();
+                self.closure("<lambda>", params, body, None)
+            }
+
+            // `and` and `or` short-circuit, as roc's do: `False and crash "x"` is `False`.
+            Expr::BinOp { left, op: op @ (crate::ast::BinOp::And | crate::ast::BinOp::Or), right, .. } => {
+                let save = self.st().next_reg;
+                let dst = self.alloc()?;
+                let a = self.expr(left)?;
+                self.emit(Op::Move { dst, src: a });
+                let skip = self.here();
+                // `and`: a false left side IS the answer. `or`: a false left side means
+                // the right side decides, so jump INTO it; a true one jumps past.
+                self.emit(Op::JumpFalse { cond: dst, to: u32::MAX, kind: CondKind::Operand });
+                if matches!(op, crate::ast::BinOp::And) {
+                    let b = self.expr(right)?;
+                    self.emit(Op::Move { dst, src: b });
+                    self.patch_to_here(skip);
+                } else {
+                    let past = self.here();
+                    self.emit(Op::Jump { to: u32::MAX });
+                    self.patch_to_here(skip);
+                    let b = self.expr(right)?;
+                    self.emit(Op::Move { dst, src: b });
+                    self.patch_to_here(past);
+                }
+                self.st().next_reg = save + 1;
+                Ok(dst)
+            }
 
             Expr::BinOp { left, op, right, id } => {
                 let save = self.st().next_reg;
-                // Both sides are evaluated, `&&` and `||` included, because that is
-                // what the tree-walker does — see `apply_binop`. Short-circuiting is a
-                // change to the LANGUAGE's behaviour, not to the VM's, and it does not
-                // belong in a phase whose gate is "identical to the tree-walker".
                 let a = self.expr(left)?;
                 let b = self.expr(right)?;
                 self.st().next_reg = save;
@@ -1129,14 +1597,48 @@ impl Compiler {
                 // a nominal that defines the matching method. `operator_methods` alone
                 // is a program-wide switch: it sent every `==` through a method search,
                 // so one `Try.is_eq` in scope answered for tuples and tags too.
+                // The checker named the operands' nominal and it defines the method:
+                // call that method, rather than a runtime search that cannot tell a
+                // `Set` from the `Dict` it is built on.
+                let direct = self.binop_modules.get(id).copied().and_then(|module| {
+                    let method = operator_method_name(*op)?;
+                    self.tops.func(qualify(module, method)).filter(|(_, arity)| *arity == 2).map(|(chunk, _)| chunk)
+                });
+                if let Some(chunk) = direct {
+                    // The arguments go ABOVE both operands: `b` may sit right after
+                    // `a`, and copying `a` into the first slot must not overwrite it.
+                    self.st().next_reg = a.max(b).max(dst) + 1;
+                    let arg_base = self.st().next_reg;
+                    let first = self.alloc()?;
+                    let second = self.alloc()?;
+                    self.emit(Op::Move { dst: first, src: a });
+                    self.emit(Op::Move { dst: second, src: b });
+                    self.emit(Op::CallFn { dst, chunk, base: arg_base, argc: 2 });
+                    if matches!(op, crate::ast::BinOp::Ne) {
+                        let not = self.names_run(&["Bool", "not"])?;
+                        self.emit(Op::CallBuiltin { dst, name: not, base: dst, argc: 1 });
+                    }
+                    self.st().next_reg = dst + 1;
+                    return Ok(dst);
+                }
                 if self.tops.operator_methods && self.operator_dispatches(id, *op) {
                     self.emit(Op::BinDispatch { dst, a, b, op: *op });
                 } else if self.integer_binops.contains(id)
                     && !matches!(op, crate::ast::BinOp::And | crate::ast::BinOp::Or)
                 {
                     // The checker says both sides are integers, so the shapes need not
-                    // be examined again at run time.
-                    self.emit(Op::BinInt { dst, a, b, op: *op });
+                    // be examined again at run time — and which width, so the result
+                    // is checked against it.
+                    let width = match op {
+                        // `//` overflows only at the signed minimum divided by -1,
+                        // which roc crashes on — so it carries the width too.
+                        crate::ast::BinOp::Add | crate::ast::BinOp::Sub | crate::ast::BinOp::Mul
+                        | crate::ast::BinOp::IntDiv => {
+                            self.binop_modules.get(id).map_or(0, |m| crate::eval::width_code(m))
+                        }
+                        _ => 0,
+                    };
+                    self.emit(Op::BinInt { dst, a, b, op: *op, width });
                 } else {
                     self.emit(Op::Bin { dst, a, b, op: *op });
                 }
@@ -1256,11 +1758,23 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Record(fields, _) => {
-                let field_names: Vec<&'static str> = fields.iter().map(|(n, _)| *n).collect();
+            Expr::Record(fields, id) if self.default_sites.contains_key(id) => {
+                let name = self.default_sites[id];
+                self.build_defaulted_record(name, fields)
+            }
+            Expr::Record(fields, id) => {
+                // An optional field the literal left out is still a slot of the
+                // record, holding `<missing>`.
+                let left_out: Vec<&'static str> = self.missing_fields.get(id).cloned().unwrap_or_default();
+                let mut field_names: Vec<&'static str> = fields.iter().map(|(n, _)| *n).collect();
+                field_names.extend(left_out.iter().copied());
                 let name = self.names_run(&field_names)?;
                 let values: Vec<&Expr> = fields.iter().map(|(_, v)| v).collect();
-                let (base, n) = self.values(&values)?;
+                let (base, mut n) = self.values(&values)?;
+                for _ in &left_out {
+                    self.literal(Value::Missing)?;
+                    n += 1;
+                }
                 self.st().next_reg = base;
                 let dst = self.alloc()?;
                 self.emit(Op::MakeRecord { dst, name, base, n });
@@ -1312,8 +1826,8 @@ impl Compiler {
                 Ok(dst)
             }
 
-            Expr::Match { scrutinee, arms, .. } => {
-                let dst = self.compile_match(scrutinee, arms, false)?;
+            Expr::Match { scrutinee, arms, id } => {
+                let dst = self.compile_match(scrutinee, arms, false, self.match_types.get(id).cloned())?;
                 Ok(dst.expect("a non-tail match has a destination"))
             }
 
@@ -1441,6 +1955,7 @@ impl Compiler {
         scrutinee: &Expr,
         arms: &[MatchArm],
         tail: bool,
+        scrutinee_type: Option<crate::types::Type>,
     ) -> Result<Option<Reg>, String> {
         let v = self.expr(scrutinee)?;
         // The scrutinee is read by every arm, so its register stays allocated for the
@@ -1457,7 +1972,7 @@ impl Compiler {
             for pattern in &arm.patterns {
                 let locals_before = self.st().locals.len();
                 let mut fails: Vec<u32> = Vec::new();
-                self.pattern(pattern, v, &mut fails)?;
+                self.pattern(pattern, v, &mut fails, scrutinee_type.as_ref())?;
 
                 if let Some(guard) = &arm.guard {
                     // The guard sees the pattern's bindings, and a false guard skips
@@ -1509,18 +2024,165 @@ impl Compiler {
     /// Bindings become locals. A binding written before a LATER test fails is simply
     /// dead — the register is reused and the local is popped — which is the compiled
     /// equivalent of the tree-walker throwing away a half-filled bindings vector.
-    fn pattern(&mut self, pattern: &Pattern, v: Reg, fails: &mut Vec<u32>) -> Result<(), String> {
+    fn pattern(
+        &mut self,
+        pattern: &Pattern,
+        v: Reg,
+        fails: &mut Vec<u32>,
+        ty: Option<&crate::types::Type>,
+    ) -> Result<(), String> {
+        use crate::types::Type;
+        // What the value under this pattern is, through a nominal that is not itself
+        // built from literals; `None` where the checker did not say.
+        let shape = |ty: Option<&Type>| -> Option<Type> {
+            match ty? {
+                Type::Nominal { backing, .. } => Some((**backing).clone()),
+                other => Some(other.clone()),
+            }
+        };
         match pattern {
             Pattern::Wildcard => Ok(()),
 
+            // `(word, index) = pair` where `index` is a `var` in scope assigns it, as
+            // roc does, rather than binding a new name over it — which is what left the
+            // `while` loop spinning, its counter reset to the shadowed original.
+            Pattern::Binding(name) if self.st().local(name).is_some_and(|l| l.is_var) => {
+                let (reg, boxed) = self.st().local(name).map(|l| (l.reg, l.boxed)).expect("checked");
+                if boxed {
+                    self.emit(Op::CellSet { cell: reg, src: v });
+                } else {
+                    self.emit(Op::Move { dst: reg, src: v });
+                }
+                Ok(())
+            }
             Pattern::Binding(name) => {
                 let slot = self.alloc()?;
                 self.emit(Op::Move { dst: slot, src: v });
-                self.st().locals.push(Local { name, reg: slot, is_var: false, captured: false });
+                self.st().locals.push(Local { name, reg: slot, is_var: false, captured: false, boxed: false });
                 Ok(())
             }
 
-            Pattern::Int(_) | Pattern::Float(_) | Pattern::Str(_) => {
+            // The whole value under `name`, and then the inner pattern against it.
+            Pattern::As { name, inner } => {
+                self.pattern(&Pattern::Binding(name), v, fails, None)?;
+                self.pattern(inner, v, fails, ty)
+            }
+
+            // `TestStr` writes each capture into a register of its own, and the
+            // captures then bind like plain names.
+            Pattern::StrInterp { segments, .. } => {
+                let pat = self.pat_idx(pattern.clone())?;
+                let base = self.st().next_reg;
+                for _ in segments {
+                    self.alloc()?;
+                }
+                fails.push(self.here());
+                self.emit(Op::TestStr { obj: v, pat, base, to: u32::MAX });
+                for (i, (name, _)) in segments.iter().enumerate() {
+                    if *name != "_" {
+                        self.pattern(&Pattern::Binding(name), base + i as u16, fails, None)?;
+                    }
+                }
+                Ok(())
+            }
+
+            // A literal against a nominal built from literals: the nominal's conversion
+            // of the literal, compared with its `is_eq` — or structurally, where the
+            // equality is derived.
+            Pattern::Int(_) | Pattern::Float(..) | Pattern::Str(_)
+                if matches!(ty, Some(Type::Nominal { name, .. })
+                    if self.tops.func(qualify(name, "from_numeral")).is_some()
+                        || self.tops.func(qualify(name, "from_quote")).is_some()) =>
+            {
+                let Some(Type::Nominal { name, .. }) = ty else { unreachable!("matched") };
+                let nominal: &'static str = crate::memory::string_pool::intern(name);
+                let save = self.st().next_reg;
+                let (method, arg) = match pattern {
+                    Pattern::Int(n) => ("from_numeral", crate::eval::numeral::numeral_from_value(&Value::Int(*n))),
+                    Pattern::Float(f, _) => ("from_numeral", crate::eval::numeral::numeral_from_value(&Value::Float(*f))),
+                    Pattern::Str(s) => ("from_quote", Some(Value::Str(Rc::from(*s)))),
+                    _ => unreachable!("matched"),
+                };
+                let arg = arg.ok_or_else(|| format!("vm: {:?} cannot be read as a numeral", pattern))?;
+                let converted = self.convert_literal(nominal, method, arg)?;
+                let cond = match self.tops.func(qualify(nominal, "is_eq")).filter(|(_, arity)| *arity == 2) {
+                    Some((chunk, _)) => {
+                        let base = self.st().next_reg;
+                        let a = self.alloc()?;
+                        let b = self.alloc()?;
+                        self.emit(Op::Move { dst: a, src: v });
+                        self.emit(Op::Move { dst: b, src: converted });
+                        let dst = self.alloc()?;
+                        self.emit(Op::CallFn { dst, chunk, base, argc: 2 });
+                        dst
+                    }
+                    None => {
+                        let dst = self.alloc()?;
+                        self.emit(Op::Bin { dst, a: v, b: converted, op: crate::ast::BinOp::Eq });
+                        dst
+                    }
+                };
+                fails.push(self.here());
+                self.emit(Op::JumpFalse { cond, to: u32::MAX, kind: CondKind::Guard });
+                self.st().next_reg = save;
+                Ok(())
+            }
+            // The value's type is not known HERE — a `where`-constrained parameter —
+            // but a nominal declared in this block supplies both the conversion and
+            // the equality as ordinary locals, because a block-local method may
+            // capture. Exactly one such pair in scope is the one meant; the runtime
+            // test below cannot see them, since they are closures in registers rather
+            // than entries in the program's method table.
+            Pattern::Int(_) | Pattern::Float(..) | Pattern::Str(_)
+                if !matches!(ty, Some(t) if !matches!(t, Type::TypeVar(_)))
+                    && self.unique_scoped_method(match pattern {
+                        Pattern::Str(_) => "from_quote",
+                        _ => "from_numeral",
+                    }).is_some()
+                    && self.unique_scoped_method("is_eq").is_some() =>
+            {
+                let (method, arg) = match pattern {
+                    Pattern::Int(n) => ("from_numeral", crate::eval::numeral::numeral_from_value(&Value::Int(*n))),
+                    Pattern::Float(f, _) => ("from_numeral", crate::eval::numeral::numeral_from_value(&Value::Float(*f))),
+                    Pattern::Str(s) => ("from_quote", Some(Value::Str(Rc::from(*s)))),
+                    _ => unreachable!("matched"),
+                };
+                let arg = arg.ok_or_else(|| format!("vm: {:?} cannot be read as a numeral", pattern))?;
+                let convert = self.unique_scoped_method(method).expect("guarded");
+                let equals = self.unique_scoped_method("is_eq").expect("guarded");
+                let save = self.st().next_reg;
+                let func = self.use_name(convert)?;
+                let base = self.st().next_reg;
+                self.place(base, |c| c.literal(arg))?;
+                self.st().next_reg = base + 1;
+                let built = self.alloc()?;
+                self.emit(Op::Call { dst: built, func, base, argc: 1 });
+                let converted = self.unwrap_ok(built)?;
+                let eq = self.use_name(equals)?;
+                let pair = self.st().next_reg;
+                let a = self.alloc()?;
+                let b = self.alloc()?;
+                self.emit(Op::Move { dst: a, src: v });
+                self.emit(Op::Move { dst: b, src: converted });
+                let cond = self.alloc()?;
+                self.emit(Op::Call { dst: cond, func: eq, base: pair, argc: 2 });
+                fails.push(self.here());
+                self.emit(Op::JumpFalse { cond, to: u32::MAX, kind: CondKind::Guard });
+                self.st().next_reg = save;
+                Ok(())
+            }
+
+            // The value's type is not known here and the program has such nominals:
+            // the value says at run time whether it is one.
+            Pattern::Int(_) | Pattern::Float(..) | Pattern::Str(_)
+                if !matches!(ty, Some(t) if !matches!(t, Type::TypeVar(_))) && self.converts_literals() =>
+            {
+                let pat = self.pat_idx(pattern.clone())?;
+                fails.push(self.here());
+                self.emit(Op::TestLitDyn { obj: v, pat, to: u32::MAX });
+                Ok(())
+            }
+            Pattern::Int(_) | Pattern::Float(..) | Pattern::Str(_) => {
                 let pat = self.pat_idx(pattern.clone())?;
                 fails.push(self.here());
                 self.emit(Op::TestLit { obj: v, pat, to: u32::MAX });
@@ -1533,13 +2195,17 @@ impl Compiler {
                     .map_err(|_| "vm: too many tag arguments".to_string())?;
                 fails.push(self.here());
                 self.emit(Op::TestTag { obj: v, name: name_idx, n, to: u32::MAX });
+                let payload: Option<Vec<Type>> = match shape(ty) {
+                    Some(Type::TagUnion { tags, .. }) => tags.into_iter().find(|(t, _)| t == name).map(|(_, p)| p),
+                    _ => None,
+                };
                 for (i, arg) in args.iter().enumerate() {
                     if matches!(arg, Pattern::Wildcard) {
                         continue;
                     }
                     let elem = self.alloc()?;
                     self.emit(Op::GetPayload { dst: elem, obj: v, i: i as u16 });
-                    self.pattern(arg, elem, fails)?;
+                    self.pattern(arg, elem, fails, payload.as_ref().and_then(|p| p.get(i)))?;
                 }
                 Ok(())
             }
@@ -1549,13 +2215,17 @@ impl Compiler {
                     .map_err(|_| "vm: too many tuple elements".to_string())?;
                 fails.push(self.here());
                 self.emit(Op::TestTuple { obj: v, n, to: u32::MAX });
+                let item_types: Option<Vec<Type>> = match shape(ty) {
+                    Some(Type::Tuple(types)) => Some(types),
+                    _ => None,
+                };
                 for (i, item) in items.iter().enumerate() {
                     if matches!(item, Pattern::Wildcard) {
                         continue;
                     }
                     let elem = self.alloc()?;
                     self.emit(Op::GetIndex { dst: elem, obj: v, i: i as u16 });
-                    self.pattern(item, elem, fails)?;
+                    self.pattern(item, elem, fails, item_types.as_ref().and_then(|t| t.get(i)))?;
                 }
                 Ok(())
             }
@@ -1570,7 +2240,14 @@ impl Compiler {
                     // so this read is itself one of the tests.
                     fails.push(self.here());
                     self.emit(Op::GetFieldOr { dst: slot, obj: v, name, to: u32::MAX });
-                    self.pattern(sub, slot, fails)?;
+                    let field_type = match shape(ty) {
+                        Some(Type::Record { fields, .. }) => fields.into_iter().find(|(f, _)| f == field).map(|(_, t)| match t {
+                            Type::Optional(inner) => *inner,
+                            other => other,
+                        }),
+                        _ => None,
+                    };
+                    self.pattern(sub, slot, fails, field_type.as_ref())?;
                 }
                 if let Some(rest_name) = rest {
                     // `..rest` binds every field the pattern did NOT name.
@@ -1582,7 +2259,7 @@ impl Compiler {
                     self.emit(Op::GetRest { dst: slot, obj: v, name, n });
                     self.st()
                         .locals
-                        .push(Local { name: rest_name, reg: slot, is_var: false, captured: false });
+                        .push(Local { name: rest_name, reg: slot, is_var: false, captured: false, boxed: false });
                 }
                 Ok(())
             }
@@ -1594,6 +2271,10 @@ impl Compiler {
                 // Without a `..` the length has to be exact; with one the list only has
                 // to be long enough to cover the fixed patterns.
                 self.emit(Op::TestList { obj: v, n, exact: rest.is_none(), to: u32::MAX });
+                let element: Option<Type> = match shape(ty) {
+                    Some(Type::List(inner)) => Some(*inner),
+                    _ => None,
+                };
 
                 for (i, item) in before.iter().enumerate() {
                     if matches!(item, Pattern::Wildcard) {
@@ -1601,7 +2282,7 @@ impl Compiler {
                     }
                     let elem = self.alloc()?;
                     self.emit(Op::GetElem { dst: elem, obj: v, i: i as u16, from_end: false });
-                    self.pattern(item, elem, fails)?;
+                    self.pattern(item, elem, fails, element.as_ref())?;
                 }
                 // The trailing patterns are positioned from the END, since what `..`
                 // absorbed is only known at run time.
@@ -1612,7 +2293,7 @@ impl Compiler {
                     let from_end = (after.len() - 1 - j) as u16;
                     let elem = self.alloc()?;
                     self.emit(Op::GetElem { dst: elem, obj: v, i: from_end, from_end: true });
-                    self.pattern(item, elem, fails)?;
+                    self.pattern(item, elem, fails, element.as_ref())?;
                 }
                 if let Some(Some(rest_name)) = rest {
                     let slot = self.alloc()?;
@@ -1624,7 +2305,7 @@ impl Compiler {
                     });
                     self.st()
                         .locals
-                        .push(Local { name: rest_name, reg: slot, is_var: false, captured: false });
+                        .push(Local { name: rest_name, reg: slot, is_var: false, captured: false, boxed: false });
                 }
                 Ok(())
             }
@@ -1635,6 +2316,17 @@ impl Compiler {
     fn use_name(&mut self, name: &'static str) -> Result<Reg, String> {
         match self.resolve(name) {
             Some(Found::Local(reg)) => Ok(reg),
+            Some(Found::LocalCell(cell)) => {
+                let dst = self.alloc()?;
+                self.emit(Op::CellGet { dst, cell });
+                Ok(dst)
+            }
+            Some(Found::CaptureCell(idx)) => {
+                let dst = self.alloc()?;
+                self.emit(Op::LoadCap { dst, idx });
+                self.emit(Op::CellGet { dst, cell: dst });
+                Ok(dst)
+            }
             Some(Found::SelfRef) => {
                 let dst = self.alloc()?;
                 self.emit(Op::LoadSelf { dst });
@@ -1797,6 +2489,50 @@ impl Compiler {
     ) -> Result<Reg, String> {
         let all = self.tops.methods(method);
 
+        // `iter.collect()` is `Output.from_iter(iterator)`: the checker settled which
+        // `Output` the annotation asked for, and only that type's `from_iter` builds
+        // the right value. Taking the receiver's own module here — `List`/`Iter` — got
+        // the builtin `collect`, which materialized a plain list and left
+        // `Set.to_list` with no nominal to match.
+        // A nominal declared INSIDE a block binds its methods as ordinary local
+        // names — they may capture the enclosing scope, so they are closures rather
+        // than top-level chunks. The checker says which nominal the receiver is; the
+        // method is then just a value in scope, called with the receiver first.
+        let named = self.dispatch_modules.get(&node).copied().map(|module| qualify(module, method));
+        // With no module named — a generic parameter, whose type only the call site
+        // knows — a single in-scope `Type.method` binding is the one meant, the same
+        // rule `DispatchMethod` applies to the global table at run time.
+        let named = named.or_else(|| {
+            self.tops.methods(method).is_empty().then(|| self.unique_scoped_method(method)).flatten()
+        });
+        if let Some(qualified) = named {
+            if self.st().local(qualified).is_some() || matches!(self.resolve(qualified), Some(Found::Capture(_))) {
+                let save = self.st().next_reg;
+                let callee = self.use_name(qualified)?;
+                let arg_base = self.st().next_reg;
+                self.reserve(arg_base)?;
+                let inner = self.st().next_reg;
+                let got = self.expr(receiver)?;
+                if got != arg_base {
+                    self.emit(Op::Move { dst: arg_base, src: got });
+                }
+                self.st().next_reg = inner;
+                let (_, rest) = self.arguments(args)?;
+                self.st().next_reg = save;
+                let dst = self.alloc()?;
+                self.emit(Op::Call { dst, func: callee, base: arg_base, argc: rest + 1 });
+                return Ok(dst);
+            }
+        }
+
+        let forced: Option<(&'static str, ChunkId, u16)> = (method == "collect")
+            .then(|| self.collect_targets.get(&node).cloned())
+            .flatten()
+            .and_then(|nominal| {
+                let owner = qualify(&nominal, "from_iter");
+                self.tops.methods("from_iter").iter().copied().find(|(name, ..)| *name == owner)
+            });
+
         // What the CHECKER says the receiver is. A method name alone cannot pick a
         // definition once more than one type defines it, and `Builtin.roc` has every
         // type defining `map`, `len`, `is_eq` and `to_hash`. With the receiver's module
@@ -1818,8 +2554,11 @@ impl Compiler {
         // looks the method up by what the receiver turns out to be, and falls back to a
         // uniquely-named one for a nominal, which is a bare record at run time. Picking
         // the only candidate HERE is what made a loaded `Stream` answer `xs.map(f)`.
-        let candidates: Vec<(&'static str, ChunkId, u16)> =
-            if self.dispatch_modules.contains_key(&node) { candidates } else { Vec::new() };
+        let candidates: Vec<(&'static str, ChunkId, u16)> = match forced {
+            Some(one) => vec![one],
+            None if self.dispatch_modules.contains_key(&node) => candidates,
+            None => Vec::new(),
+        };
 
         // A list's `fold` or `map`, with nothing roc-defined answering to it: a loop
         // in this frame rather than a builtin that re-enters the VM per element.
@@ -1852,11 +2591,78 @@ impl Compiler {
                 check_arity(name, arity, argc)?;
                 self.emit(Op::CallFn { dst, chunk, base: arg_base, argc });
             }
+            // A numeric receiver whose WIDTH the checker knows: call the builtin for
+            // that width. A runtime dispatch would read the value's module instead,
+            // and every integer value says `I64` — so `x.shl_wrap(1)` on a `U8` was
+            // shifted at 64 bits.
+            None if self.dispatch_modules.get(&node).is_some_and(|m| crate::eval::is_numeric_module(m) || *m == "Numeral") => {
+                let module = self.dispatch_modules[&node];
+                let name = self.names_run(&[module, method])?;
+                self.emit(Op::CallBuiltin { dst, name, base: arg_base, argc });
+            }
             None => {
                 let name = self.name_idx(method)?;
                 self.emit(Op::DispatchMethod { dst, name, base: arg_base, argc });
             }
         }
+        Ok(dst)
+    }
+
+    /// Build a nominal's record with its omitted fields materialized: the fields the
+    /// literal wrote, plus each defaulted field's default expression, plus `<missing>`
+    /// for each optional field left out. This is what makes a bare `{}` or a partial
+    /// `{ bar: n }` checked against a nominal carry that nominal's defaults, even when
+    /// the parser could not tell the type at the literal.
+    fn build_defaulted_record(&mut self, nominal: &'static str, written: &[(&'static str, Expr)]) -> Result<Reg, String> {
+        let defaults = self.nominal_defaults.iter().find(|(n, _)| n == nominal).map(|(_, d)| d.clone()).unwrap_or_default();
+        let all_fields = self.nominal_records.get(nominal).cloned().unwrap_or_default();
+        // Collect the pieces: (field_name, source) where source is a written expr, a
+        // default expr, or `<missing>`.
+        enum Src<'a> { Expr(&'a Expr), Default(Expr), Missing }
+        let mut pieces: Vec<(&'static str, Src)> = Vec::new();
+        for (name, value) in written {
+            pieces.push((*name, Src::Expr(value)));
+        }
+        for (field, ty) in &all_fields {
+            if written.iter().any(|(w, _)| w == field) {
+                continue;
+            }
+            let field_name = crate::memory::string_pool::intern(field);
+            if let Some((_, default)) = defaults.iter().find(|(f, _)| f == field) {
+                pieces.push((field_name, Src::Default(default.clone())));
+            } else if matches!(ty, crate::types::Type::Optional(_)) {
+                pieces.push((field_name, Src::Missing));
+            }
+        }
+        // A field with a default that the nominal_records did not list (e.g. an
+        // imported nominal whose type is not in scope) is still filled.
+        for (field, default) in &defaults {
+            let field_name = crate::memory::string_pool::intern(field);
+            if !pieces.iter().any(|(n, _)| *n == field_name) {
+                pieces.push((field_name, Src::Default(default.clone())));
+            }
+        }
+        let names: Vec<&'static str> = pieces.iter().map(|(n, _)| *n).collect();
+        let name_idx = self.names_run(&names)?;
+        let base = self.st().next_reg;
+        let n = u16::try_from(pieces.len()).map_err(|_| "vm: too many record fields".to_string())?;
+        for (i, (_, src)) in pieces.iter().enumerate() {
+            let target = base + i as Reg;
+            self.reserve(target)?;
+            let save = self.st().next_reg;
+            let got = match src {
+                Src::Expr(e) => self.expr(e)?,
+                Src::Default(e) => self.expr(e)?,
+                Src::Missing => self.literal(Value::Missing)?,
+            };
+            if got != target {
+                self.emit(Op::Move { dst: target, src: got });
+            }
+            self.st().next_reg = save;
+        }
+        self.st().next_reg = base;
+        let dst = self.alloc()?;
+        self.emit(Op::MakeRecord { dst, name: name_idx, base, n });
         Ok(dst)
     }
 
@@ -1904,7 +2710,11 @@ impl Compiler {
         self.st().next_reg = save;
 
         if let Some(l) = self.st().local(name) {
-            let (reg, captured) = (l.reg, l.captured);
+            let (reg, captured, boxed) = (l.reg, l.captured, l.boxed);
+            if boxed {
+                self.emit(Op::CellSet { cell: reg, src });
+                return Ok(());
+            }
             if captured {
                 // A closure has already copied this value, so assigning it now would
                 // leave that copy stale. The same shared cell that a captured `var`
@@ -1945,7 +2755,7 @@ impl Compiler {
         let top = self.here();
         self.emit(Op::IterNext { dst: item, iter, idx, to: u32::MAX });
 
-        self.st().locals.push(Local { name, reg: item, is_var: false, captured: false });
+        self.st().locals.push(Local { name, reg: item, is_var: false, captured: false, boxed: false });
         self.st().loops.push(Vec::new());
         let body_base = self.st().next_reg;
         let result = self.expr(body);
@@ -2029,6 +2839,44 @@ fn func_name(func: &Expr) -> &'static str {
 
 /// The method an operator is sugar for. Agrees with `eval::dispatch_operator`, which
 /// makes the same mapping when the call actually runs.
+/// A nominal's shape, following a nominal declared OVER another one by name:
+/// `Set(item) :: Dict(item, {})` has `Dict`'s fields, which its own backing — a
+/// placeholder with the arguments dropped — cannot say.
+fn resolved_shape(nominals: &[(&'static str, crate::types::Type)], backing: &crate::types::Type) -> crate::vm::NominalShape {
+    resolved_shape_depth(nominals, backing).0
+}
+
+/// The shape, and how many nominals were followed to reach it: `Set` over `Dict` is
+/// one deeper than `Dict`, which is what makes it the more specific of two candidates
+/// that fit the same value.
+fn resolved_shape_depth(nominals: &[(&'static str, crate::types::Type)], backing: &crate::types::Type) -> (crate::vm::NominalShape, u8) {
+    use crate::types::Type;
+    let mut ty = backing;
+    let mut depth = 0u8;
+    for _ in 0..8 {
+        // A placeholder — a nominal named but not declared here — is resolved by its
+        // name, whether it stands alone or is what a declared nominal is built over.
+        let placeholder = match ty {
+            Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(_)) => Some(name),
+            Type::Nominal { backing, .. } => match &**backing {
+                Type::Nominal { name, backing: inner } if matches!(**inner, Type::TypeVar(_)) => Some(name),
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(name) = placeholder else { return (crate::vm::shape_of(ty), depth) };
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        match nominals.iter().find(|(n, _)| *n == bare) {
+            Some((_, declared)) => {
+                ty = declared;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    (crate::vm::shape_of(ty), depth)
+}
+
 fn operator_method_name(op: crate::ast::BinOp) -> Option<&'static str> {
     use crate::ast::BinOp;
     Some(match op {
@@ -2056,9 +2904,28 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
     use crate::types::Type;
     match ty {
         Type::List(inner) => Value::tag("List", vec![type_descriptor(inner)]),
-        Type::Nominal { name, .. } => Value::tag(
+        // A record's FIELDS carry the shape down: without them a field holding a
+        // nominal with its own `parser_for` was read as whatever the document said.
+        Type::Record { fields, .. } => Value::tag(
+            "Record",
+            vec![Value::list(
+                fields
+                    .iter()
+                    .map(|(name, field)| {
+                        Value::Tuple(vec![
+                            crate::eval::str_value(name.clone()),
+                            type_descriptor(field),
+                        ])
+                    })
+                    .collect(),
+            )],
+        ),
+        // The second payload is what the nominal WRAPS — `Opt(Inner)`'s `Inner` — so a
+        // `parser_for` that delegates through its type parameter has something to
+        // delegate to.
+        Type::Nominal { name, backing } => Value::tag(
             "Nominal",
-            vec![crate::eval::str_value(name.clone())],
+            vec![crate::eval::str_value(name.clone()), wrapped_descriptor(backing)],
         ),
         // `Try(a, e)` is how a parse result is written, and the `a` is what to read.
         Type::TagUnion { tags, .. } => match tags.iter().find(|(tag, _)| tag == "Ok") {
@@ -2067,4 +2934,25 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
         },
         _ => Value::Unit,
     }
+}
+
+/// The type a nominal wraps, when exactly one of its tags carries a single payload:
+/// `Opt(a) := [None, Has(a)]` wraps `a`. Anything else has no single element.
+fn wrapped_descriptor(backing: &crate::types::Type) -> Value {
+    use crate::types::Type;
+    let Type::TagUnion { tags, .. } = backing else { return Value::Unit };
+    let mut carrying = tags.iter().filter(|(_, payload)| payload.len() == 1);
+    match (carrying.next(), carrying.next()) {
+        (Some((_, payload)), None) => type_descriptor(&payload[0]),
+        _ => Value::Unit,
+    }
+}
+
+/// Does a lambda inside `expr` mention `name` as a free variable? A `var` such a
+/// lambda captures has to live in a shared cell (`Local::boxed`).
+fn lambda_mentions(expr: &Expr, name: &str) -> bool {
+    if matches!(expr, Expr::Lambda { .. }) && crate::parser::Parser::mentions_free(expr, name) {
+        return true;
+    }
+    expr.children().into_iter().any(|child| lambda_mentions(child, name))
 }

@@ -444,8 +444,11 @@ fn an_unmatched_value_and_a_bad_guard_are_reported() {
 }
 #[test]
 fn aggregate_access_errors_name_the_field() {
+    // A field a record lacks is caught by the checker, not here: to the VM an absent
+    // field is an optional one left out.
+    let missing = parse("p = { x: 1 }\n\np.nope");
+    assert!(rocflight::types::checker::TypeChecker::new().synth(&missing).is_err());
     for (src, expected) in [
-        ("p = { x: 1 }\n\np.nope", "Runtime error: Record has no field 'nope'"),
         ("p = 1\n\nf = |r| r.x\n\nf(p)", "Runtime error: Cannot access field 'x' on 1"),
         (
             "p = { x: 1 }\n\nq = { ..p, y: 2 }\n\nq.y",
@@ -556,10 +559,8 @@ fn loop_errors_say_what_was_wrong() {
             "f = || {\n\tvar n = 0\n\twhile 1 {\n\t\tn = 1\n\t}\n\tn\n}\n\nf()",
             "Runtime error: A `while` condition must be a Bool, got 1",
         ),
-        (
-            "f = || {\n\tvar n = 0\n\tfor x in 1.5..<3 {\n\t\tn = x\n\t}\n\tn\n}\n\nf()",
-            "Runtime error: A range needs whole numbers, got 1.5",
-        ),
+        // (A fractional range like `1.5..<3` is no longer an error — it iterates, as
+        // roc's does.)
     ] {
         assert_eq!(run_err(src), expected, "on: {}", src);
     }
@@ -654,8 +655,8 @@ fn a_builtin_callback_can_be_a_vm_closure() {
 
 #[test]
 fn try_methods() {
-    assert_eq!(run("Ok(1).with_default(0)"), "1");
-    assert_eq!(run("Err(Nope).with_default(0)"), "0");
+    assert_eq!(run("Ok(1).ok_or(0)"), "1");
+    assert_eq!(run("Err(Nope).ok_or(0)"), "0");
     assert_eq!(run("Ok(2).map_ok(|x| x * 10)"), "Ok(20)");
     assert_eq!(run("Err(Nope).map_ok(|x| x * 10)"), "Err(Nope)");
     assert_eq!(run("Ok(1).is_ok()"), "True");
@@ -736,6 +737,20 @@ fn a_top_level_expect_only_runs_under_test_mode() {
         dec_literals: Default::default(),
         fractional_literals: Default::default(),
         parse_targets: Default::default(),
+        collect_targets: Default::default(),
+        f32_literals: Default::default(),
+        u128_literals: Default::default(),
+        default_sites: Default::default(),
+        nominal_defaults: Default::default(),
+        missing_fields: Default::default(),
+        run_expects: false,
+        conversions: Default::default(),
+        numeral_texts: Default::default(),
+        coerce_values: Default::default(),
+        coerce_params: Default::default(),
+        zero_sized_capacity: Default::default(),
+        match_types: Default::default(),
+        for_iter_calls: Default::default(),
     };
     let skipped = std::rc::Rc::new(vm::compile_unit(&unit(false)).expect("compile failed"));
     assert_eq!(vm::run(&skipped).expect("vm failed").to_string(), "42");
@@ -793,6 +808,20 @@ fn a_module_is_compiled_into_the_same_program() {
         dec_literals: Default::default(),
         fractional_literals: Default::default(),
         parse_targets: Default::default(),
+        collect_targets: Default::default(),
+        f32_literals: Default::default(),
+        u128_literals: Default::default(),
+        default_sites: Default::default(),
+        nominal_defaults: Default::default(),
+        missing_fields: Default::default(),
+        run_expects: false,
+        conversions: Default::default(),
+        numeral_texts: Default::default(),
+        coerce_values: Default::default(),
+        coerce_params: Default::default(),
+        zero_sized_capacity: Default::default(),
+        match_types: Default::default(),
+        for_iter_calls: Default::default(),
     };
     let program = std::rc::Rc::new(vm::compile_unit(&unit).expect("compile failed"));
     assert_eq!(vm::run(&program).expect("vm failed").to_string(), "\"Hello World\"");
@@ -817,6 +846,20 @@ fn a_module_is_compiled_into_the_same_program() {
         dec_literals: Default::default(),
         fractional_literals: Default::default(),
         parse_targets: Default::default(),
+        collect_targets: Default::default(),
+        f32_literals: Default::default(),
+        u128_literals: Default::default(),
+        default_sites: Default::default(),
+        nominal_defaults: Default::default(),
+        missing_fields: Default::default(),
+        run_expects: false,
+        conversions: Default::default(),
+        numeral_texts: Default::default(),
+        coerce_values: Default::default(),
+        coerce_params: Default::default(),
+        zero_sized_capacity: Default::default(),
+        match_types: Default::default(),
+        for_iter_calls: Default::default(),
     };
     assert!(vm::compile_unit(&unit).is_err(), "an unexposed name was in scope");
 }
@@ -839,6 +882,20 @@ fn an_ingested_file_is_a_top_level_string() {
         dec_literals: Default::default(),
         fractional_literals: Default::default(),
         parse_targets: Default::default(),
+        collect_targets: Default::default(),
+        f32_literals: Default::default(),
+        u128_literals: Default::default(),
+        default_sites: Default::default(),
+        nominal_defaults: Default::default(),
+        missing_fields: Default::default(),
+        run_expects: false,
+        conversions: Default::default(),
+        numeral_texts: Default::default(),
+        coerce_values: Default::default(),
+        coerce_params: Default::default(),
+        zero_sized_capacity: Default::default(),
+        match_types: Default::default(),
+        for_iter_calls: Default::default(),
     };
     let program = std::rc::Rc::new(vm::compile_unit(&unit).expect("compile failed"));
     assert_eq!(vm::run(&program).expect("vm failed").to_string(), "\"hello\"");

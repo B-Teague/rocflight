@@ -27,6 +27,12 @@ pub struct Options {
     /// instead of the app's `main!`. Set by `roc_main`, inside the host, where the
     /// platform's Roc is what maps `main!`'s answer to an exit code.
     pub host_entry: bool,
+    /// Also run the top-level `expect`s, and report a failing one the way roc's
+    /// compile-time evaluation does. `rocflight eval` sets this.
+    pub check_expects: bool,
+    /// Render `Str.inspect` of the result while the program is still installed, so a
+    /// nominal's own `to_inspect` steers it. `rocflight eval` (non-raw) sets this.
+    pub inspect_result: bool,
 }
 
 /// What a run produced.
@@ -35,6 +41,9 @@ pub struct Ran {
     pub value: Value,
     /// Whether the file declared an entry point (an app) or is a module.
     pub is_app: bool,
+    /// `Str.inspect` of the result, rendered inside the run when `inspect_result` was
+    /// asked — the only place a top-level nominal `to_inspect` can be dispatched.
+    pub inspected: Option<String>,
     pub elapsed: Duration,
 }
 
@@ -45,7 +54,7 @@ pub struct Ran {
 /// the same pipeline serves `rocflight file.roc`, `rocflight test`, and `roc_main`
 /// inside a platform's host.
 pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn Error>> {
-    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry } = options;
+    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _ } = options;
     // `roc test` times the whole invocation, compile included, not just the expects.
     let started = Instant::now();
 
@@ -127,6 +136,9 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // the app runs; `exposing` then aliases the named ones so they can be used bare.
     let mut module_asts = Vec::new();
     let mut module_nominals: Vec<(&'static str, Type)> = Vec::new();
+    let mut module_params: Vec<(String, Vec<u32>)> = Vec::new();
+    let mut module_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)> = Vec::new();
+    let mut module_where_methods: Vec<String> = Vec::new();
     for (path, exposed) in parser.local_modules() {
         let file = source_dir.join(format!("{}.roc", path));
         let text = std::fs::read_to_string(&file)
@@ -139,6 +151,11 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         // `Dir/Hello` exposes them as `Hello.hello`.
         let type_name = path.rsplit('/').next().unwrap_or(path).to_string();
         module_nominals.extend(module_parser.nominals().iter().cloned());
+        module_params.extend(module_parser.nominal_params().iter().cloned());
+        // A module's own `where` clauses promise dispatch on a generic parameter, the
+        // same as the app's: `read : item -> U64 where [item.get : item -> U64]`.
+        module_where_methods.extend(module_parser.where_methods());
+        module_defaults.extend(module_parser.field_default_exprs().iter().cloned());
         module_asts.push((module_ast, type_name, exposed.clone()));
     }
 
@@ -176,12 +193,18 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // module — resolves rather than standing as a placeholder.
     type_checker.declare_types(parser.nominals().iter().map(|(n, t)| (*n, t.clone())));
     type_checker.declare_types(module_nominals.iter().map(|(n, t)| (*n, t.clone())));
+    type_checker.declare_nominal_params(parser.nominal_params().iter().cloned().chain(module_params.iter().cloned()));
     for loaded in &platform_loaded {
         type_checker.declare_types(loaded.nominals.iter().map(|(n, t)| (*n, t.clone())));
     }
     type_checker.allow_dispatch(parser.where_methods());
+    type_checker.allow_dispatch(module_where_methods.clone());
     type_checker.declare_nominal_literals(parser.nominal_literals());
+    type_checker.declare_defaults(parser.field_default_exprs());
+    type_checker.declare_defaults(&module_defaults);
     type_checker.declare_suffixed_literals(&parser.suffixed_literals());
+    type_checker.declare_suffixed_nominals(parser.nominal_suffixes());
+    type_checker.declare_overflowed_literals(parser.overflowed_literals());
     for loaded in &platform_loaded {
         type_checker.declare_signatures(loaded.signatures.iter().cloned());
         type_checker.declare_nominal_literals(&loaded.nominal_literals);
@@ -190,13 +213,43 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
             type_checker.synth(&module.ast)?;
         }
     }
-    for (module_ast, _, _) in &module_asts {
+    for (module_ast, type_name, exposed) in &module_asts {
         // Checked first so the app sees the module's names with their real types.
         type_checker.predeclare(module_ast);
         type_checker.synth(module_ast)?;
+        // `import Foo exposing [bar]` — the bare name is `Foo.bar`, as the compiler
+        // already treats it.
+        type_checker.expose(type_name, exposed);
+    }
+    // Problems only the type parser can see — an extension alias applied to something
+    // it cannot extend. `parse_type`'s own errors are swallowed on purpose.
+    if let Some(problem) = parser.type_problems().first() {
+        return Err(format!("Type error: {}", problem).into());
+    }
+    // A top-level constant roc folds at compile time and finds crashing — in the app
+    // or in any module it imports.
+    for (tree, is_program) in std::iter::once((&ast, true))
+        .chain(module_asts.iter().map(|(m, ..)| (m, false)))
+    {
+        if let Some(problem) = type_checker.comptime_crash_problems(tree, is_program) {
+            return Err(format!("Type error: {}", problem).into());
+        }
+    }
+    if let Some(problem) = type_checker.declaration_problems() {
+        return Err(format!("Type error: {}", problem).into());
     }
     type_checker.predeclare(&ast);
     let inferred = type_checker.synth(&ast)?;
+    // A literal that does not fit the type it was given: refused, as roc refuses it.
+    if let Some(problem) = type_checker.method_problems() {
+        return Err(format!("Type error: {}", problem).into());
+    }
+    if let Some(problem) = type_checker.literal_problems() {
+        return Err(format!("Type error: {}", problem).into());
+    }
+    if let Some(problem) = type_checker.polymorphic_problems() {
+        return Err(format!("Type error: {}", problem).into());
+    }
     // The platform's entry references the app's `main!`, so it comes after the app.
     for loaded in &platform_loaded {
         if let Some((module, _)) = &loaded.entry {
@@ -305,14 +358,34 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         dispatch_modules: type_checker.dispatch_modules(),
         binop_modules: type_checker.binop_modules(),
         dec_literals: type_checker.dec_literals(),
+        f32_literals: type_checker.f32_literals(),
+        u128_literals: type_checker.u128_literals(),
+        conversions: type_checker.literal_conversions(),
+        numeral_texts: parser.numeral_texts(),
+        coerce_values: type_checker.coerce_values(),
+        coerce_params: type_checker.coerce_params(),
+        zero_sized_capacity: type_checker.zero_sized_capacity(),
+        match_types: type_checker.match_types(),
+        for_iter_calls: type_checker.for_iter_calls(),
+        default_sites: type_checker.default_sites(),
+        nominal_defaults: parser
+            .field_default_exprs()
+            .iter()
+            .cloned()
+            .chain(module_defaults.iter().cloned())
+            .collect(),
+        missing_fields: type_checker.missing_fields(),
+        run_expects: check_expects,
         fractional_literals: type_checker.fractional_literals(),
         parse_targets: type_checker.json_parse_targets(),
+        collect_targets: type_checker.collect_targets(),
         // Every nominal in scope, the app's and each loaded builtin member's: the VM
         // needs their shapes to tell whose method a value can have meant.
         nominals: builtins
             .iter()
             .flat_map(|b| b.nominals.iter().cloned())
             .chain(platform_loaded.iter().flat_map(|l| l.nominals.iter().cloned()))
+            .chain(module_nominals.iter().cloned())
             .chain(parser.nominals().iter().cloned())
             .collect(),
         opaque_nominals: parser.opaque_nominals().to_vec(),
@@ -325,7 +398,12 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     //
     // Top-level `expect`s are compiled in only under `test`; an ordinary run skips
     // them the way `roc run` does, so this runs the declarations and the program.
-    let value = crate::vm::run_with_args(&program, args)?;
-    Ok(Some(Ran { value, is_app: app_entry_point.is_some(), elapsed: started.elapsed() }))
+    let (value, inspected) = if options.inspect_result {
+        let (value, shown) = crate::vm::run_and_inspect(&program, args)?;
+        (value, Some(shown))
+    } else {
+        (crate::vm::run_with_args(&program, args)?, None)
+    };
+    Ok(Some(Ran { value, is_app: app_entry_point.is_some(), inspected, elapsed: started.elapsed() }))
 }
 

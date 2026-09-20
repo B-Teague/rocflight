@@ -62,6 +62,24 @@ fn with_running<R>(f: impl FnOnce(&Program) -> R) -> Option<R> {
 /// Used by the two builtins that dispatch on a user's own method: `Str.inspect` looking
 /// for a `to_inspect`, and operator dispatch looking for `plus`/`is_eq`/…
 pub fn methods_named(method: &str, receiver: &Value) -> Vec<(&'static str, Value)> {
+    ranked_methods(method, receiver).into_iter().map(|(_, name, value)| (name, value)).collect()
+}
+
+/// The one method meant for `receiver`, when the shapes can say: the only candidate,
+/// or the most specific of those that fit the value EXACTLY. `None` when several
+/// merely admit it — the tree of `Try.is_eq` answering every `==` is what that avoids.
+pub fn best_method(method: &str, receiver: &Value) -> Option<(&'static str, Value)> {
+    let ranked = ranked_methods(method, receiver);
+    match ranked.len() {
+        0 => None,
+        1 => ranked.into_iter().next().map(|(_, name, value)| (name, value)),
+        _ => ranked.into_iter().next().filter(|((exact, _), ..)| *exact).map(|(_, name, value)| (name, value)),
+    }
+}
+
+/// `methods_named` with each candidate's rank: an exact shape fit, and the nominal's
+/// depth. Most specific first.
+fn ranked_methods(method: &str, receiver: &Value) -> Vec<((bool, u8), &'static str, Value)> {
     with_running(|program| {
         let Some(defined) = program.methods_by_name.get(method) else { return Vec::new() };
         defined
@@ -78,11 +96,22 @@ pub fn methods_named(method: &str, receiver: &Value) -> Vec<(&'static str, Value
                 None => true,
             })
             .map(|(qualified, chunk)| {
-                (*qualified, Value::Closure(Rc::clone(&program.chunks[*chunk as usize].bare)))
+                // The most specific first: an EXACT shape fit before a mere
+                // admission, and a nominal declared over another before that other.
+                let owner = qualified.split('.').next().unwrap_or(qualified);
+                let exact = program.nominal_shapes.get(owner).is_some_and(|s| s.is_exactly(receiver));
+                let depth = program.nominal_depth.get(owner).copied().unwrap_or(0);
+                ((exact, depth), *qualified, Value::Closure(Rc::clone(&program.chunks[*chunk as usize].bare)))
             })
-            .collect()
+            .collect::<Vec<_>>()
     })
     .unwrap_or_default()
+    .into_iter()
+    .fold(Vec::new(), |mut sorted: Vec<((bool, u8), &'static str, Value)>, item| {
+        let at = sorted.iter().position(|(rank, ..)| *rank < item.0).unwrap_or(sorted.len());
+        sorted.insert(at, item);
+        sorted
+    })
 }
 
 /// Call a VM closure from outside the VM — from a builtin's callback.
@@ -92,6 +121,46 @@ pub fn methods_named(method: &str, receiver: &Value) -> Vec<(&'static str, Value
 /// recurse in Rust" holds for Roc calls but NOT across a builtin's callback boundary,
 /// so deeply nested `map`-inside-`map` is bounded by the Rust stack again. Lowering the
 /// callback-taking builtins into bytecode is what removes the last such bound.
+/// A literal pattern against a value that is a nominal built from literals — which
+/// nominal, its shape says — is the nominal's conversion of the literal, compared
+/// with its `is_eq` where it has one and structurally where that is derived.
+/// A nominal iterable's `iter` method applied to it: the list or iterator to loop.
+fn call_iter_method(program: &Rc<Program>, value: &Value) -> Result<Option<Value>, EvalError> {
+    let owner = program.methods.iter().find(|((module, m), _)| {
+        *m == "iter" && program.nominal_shapes.get(module).is_some_and(|shape| shape.is_exactly(value))
+    });
+    match owner {
+        Some((_, chunk)) => Ok(Some(call_closure(&program.chunks[*chunk as usize].bare, vec![value.clone()])?)),
+        None => Ok(None),
+    }
+}
+
+fn nominal_literal_matches(program: &Rc<Program>, pattern: &crate::ast::Pattern, value: &Value) -> Result<bool, EvalError> {
+    use crate::ast::Pattern;
+    let (method, literal) = match pattern {
+        Pattern::Int(n) => ("from_numeral", crate::eval::numeral::numeral_from_value(&Value::Int(*n))),
+        Pattern::Float(f, _) => ("from_numeral", crate::eval::numeral::numeral_from_value(&Value::Float(*f))),
+        Pattern::Str(s) => ("from_quote", Some(Value::Str(Rc::from(*s)))),
+        _ => return Ok(false),
+    };
+    let Some(literal) = literal else { return Ok(false) };
+    let owner = program.methods.iter().find(|((module, m), _)| {
+        *m == method && program.nominal_shapes.get(module).is_some_and(|shape| shape.is_exactly(value))
+    });
+    let Some(((module, _), chunk)) = owner else { return Ok(false) };
+    let converted = match call_closure(&program.chunks[*chunk as usize].bare, vec![literal])? {
+        Value::Tag("Ok", payload) if payload.len() == 1 => payload[0].clone(),
+        other => return Err(EvalError { message: format!("No match arm matched {}", other) }),
+    };
+    match program.methods.get(&(module, "is_eq")) {
+        Some(is_eq) => Ok(matches!(
+            call_closure(&program.chunks[*is_eq as usize].bare, vec![value.clone(), converted])?,
+            Value::Bool(true)
+        )),
+        None => Ok(crate::eval::values_equal(value, &converted)),
+    }
+}
+
 pub fn call_closure(closure: &Rc<Closure>, args: Vec<Value>) -> Result<Value, EvalError> {
     let context = RUNNING.with(|r| r.borrow().last().cloned());
     let (program, globals) = context.ok_or_else(|| EvalError {
@@ -128,6 +197,12 @@ pub enum Op {
     StoreGlob { idx: u32, src: Reg },
     /// `dst = this closure's captures[idx]`
     LoadCap { dst: Reg, idx: u16 },
+    /// `dst = Cell(src)`: a `var` a closure captures lives in a shared cell.
+    MakeCell { dst: Reg, src: Reg },
+    /// `dst = *cell`
+    CellGet { dst: Reg, cell: Reg },
+    /// `*cell = src`
+    CellSet { cell: Reg, src: Reg },
     /// `dst = the closure that is running`.
     ///
     /// How a block-local function calls itself. The tree-walker rebinds a rebuilt
@@ -143,7 +218,9 @@ pub enum Op {
     /// `TypeChecker::integer_binops` says so, and it falls back to the generic path if
     /// a value turns out not to be an integer after all — being right matters more
     /// than the assumption being kept.
-    BinInt { dst: Reg, a: Reg, b: Reg, op: BinOp },
+    /// `width` is the operands' integer width as `bits | (signed << 7)`, or 0 when the
+    /// checker did not name one; a result outside it is roc's overflow crash.
+    BinInt { dst: Reg, a: Reg, b: Reg, op: BinOp, width: u8 },
     /// `ip = to`
     Jump { to: u32 },
     /// `if cond == False { ip = to }`. The condition must be a `Bool`, and `kind`
@@ -197,6 +274,12 @@ pub enum Op {
     // ---- pattern tests: each jumps to `to` when the value does NOT match ----
     /// A literal pattern from this chunk's `pats`.
     TestLit { obj: Reg, pat: u16, to: u32 },
+    /// `TestLit`, unless the value is a nominal built from literals: then the
+    /// literal is converted through that nominal and compared with its `is_eq`.
+    TestLitDyn { obj: Reg, pat: u16, to: u32 },
+    /// Match `obj` against the string pattern `pat`, writing its captures into
+    /// `base`, `base+1`, …; jump to `to` if it does not match.
+    TestStr { obj: Reg, pat: u16, base: Reg, to: u32 },
     /// A tag with this name and this many payload elements.
     TestTag { obj: Reg, name: u16, n: u16, to: u32 },
     /// A tuple of exactly this length.
@@ -280,6 +363,8 @@ pub enum CondKind {
     If,
     Guard,
     While,
+    /// The left side of `and` / `or`, which decides whether the right side runs.
+    Operand,
 }
 
 impl CondKind {
@@ -289,6 +374,7 @@ impl CondKind {
                 CondKind::If => format!("An if condition must be a Bool, got {}", got),
                 CondKind::Guard => format!("A match guard must be a Bool, got {}", got),
                 CondKind::While => format!("A `while` condition must be a Bool, got {}", got),
+                CondKind::Operand => format!("`and` and `or` need Bool operands, got {}", got),
             },
         }
     }
@@ -347,6 +433,10 @@ pub struct Closure {
 #[derive(Debug)]
 pub struct Program {
     pub chunks: Vec<Chunk>,
+    /// Numeric literals a nominal's `from_numeral` converts, with the nominal: roc
+    /// folds each at compile time, so one the conversion rejects is a compile problem
+    /// even in a function nothing calls. Checked before the program runs.
+    pub literal_coercions: Vec<(&'static str, Value)>,
     /// Top-level bindings whose value is not a function.
     pub n_globals: usize,
     /// The chunk holding the top level itself.
@@ -370,6 +460,9 @@ pub struct Program {
     /// not answer `(1, "x") == (1, "x")`. This is the runtime half of nominal identity
     /// — the compiler resolves it from the type wherever the checker knows one.
     pub nominal_shapes: std::collections::HashMap<&'static str, NominalShape>,
+    /// How many nominals each nominal is declared over: `Set :: Dict(…)` is 1, `Dict`
+    /// is 0. Two candidates of one shape are told apart by it — the wrapper is meant.
+    pub nominal_depth: std::collections::HashMap<&'static str, u8>,
     /// The shapes of the nominals declared with `::`, the OPAQUE form.
     ///
     /// roc shows one as `<opaque>` instead of its backing value, and that is the only
@@ -381,11 +474,71 @@ pub struct Program {
 #[derive(Debug, Clone)]
 pub enum NominalShape {
     Tags(Vec<String>),
-    Fields(Vec<String>),
+    /// The field names, each with the coarse kind its declared type implies — what
+    /// tells `{ value : F32 }` from `{ value : F64 }` when the names alone cannot.
+    Fields(Vec<(String, FieldKind)>),
     Tuple(usize),
+    /// A SIMD backing — `Vector := U64x2`. Holds the element-kind byte so a
+    /// `Value::Simd` of the right width is recognised as this nominal.
+    Simd(u8),
     /// A backing this cannot rule anything out from — a type variable, or another
     /// nominal whose own shape is unknown. Never filters.
     Unknown,
+}
+
+/// What a declared field type says about the value it holds, as coarsely as a
+/// `Value` variant: enough to break a tie between two nominals of one field list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Any,
+    Int,
+    Float,
+    F32,
+    Dec,
+    Str,
+    Bool,
+    List,
+    Record,
+    Tag,
+    Tuple,
+}
+
+impl FieldKind {
+    fn of(ty: &crate::types::Type) -> FieldKind {
+        use crate::types::Type;
+        match ty {
+            Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128
+            | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 => FieldKind::Int,
+            Type::F64 => FieldKind::Float,
+            Type::F32 => FieldKind::F32,
+            Type::Dec => FieldKind::Dec,
+            Type::Str => FieldKind::Str,
+            Type::Bool => FieldKind::Bool,
+            Type::List(_) => FieldKind::List,
+            Type::Record { .. } => FieldKind::Record,
+            Type::TagUnion { .. } => FieldKind::Tag,
+            Type::Tuple(_) => FieldKind::Tuple,
+            Type::Nominal { backing, .. } => FieldKind::of(backing),
+            _ => FieldKind::Any,
+        }
+    }
+
+    fn holds(self, value: &Value) -> bool {
+        match (self, value) {
+            (FieldKind::Any, _) => true,
+            (FieldKind::Int, Value::Int(_)) => true,
+            (FieldKind::Float, Value::Float(_)) => true,
+            (FieldKind::F32, Value::F32(_)) => true,
+            (FieldKind::Dec, Value::Dec(_)) => true,
+            (FieldKind::Str, Value::Str(_)) => true,
+            (FieldKind::Bool, Value::Bool(_)) => true,
+            (FieldKind::List, Value::List(_) | Value::Range { .. }) => true,
+            (FieldKind::Record, Value::Record(_) | Value::Unit) => true,
+            (FieldKind::Tag, Value::Tag(..) | Value::Bool(_)) => true,
+            (FieldKind::Tuple, Value::Tuple(_)) => true,
+            _ => false,
+        }
+    }
 }
 
 /// A top-level method by its qualified name, as a callable value.
@@ -421,11 +574,23 @@ impl NominalShape {
         match (self, value) {
             (NominalShape::Fields(declared), Value::Record(fields)) => {
                 declared.len() == fields.len()
-                    && declared.iter().all(|want| fields.iter().any(|(have, _)| have == want))
+                    && declared.iter().all(|(want, _)| fields.iter().any(|(have, _)| have == want))
             }
             (NominalShape::Tags(names), Value::Tag(tag, _)) => names.iter().any(|n| n == tag),
             (NominalShape::Tuple(n), Value::Tuple(items)) => items.len() == *n,
+            (NominalShape::Simd(kind), Value::Simd { kind: k, .. }) => k == kind,
             _ => false,
+        }
+    }
+
+    /// `is_exactly`, and each field holds what its declared type says: the tie-break
+    /// between `{ value : F32 }` and `{ value : F64 }`, which share a field list.
+    pub fn holds_kinds(&self, value: &Value) -> bool {
+        match (self, value) {
+            (NominalShape::Fields(declared), Value::Record(fields)) => declared.iter().all(|(want, kind)| {
+                fields.iter().any(|(have, held)| have == want && kind.holds(held))
+            }),
+            _ => true,
         }
     }
 
@@ -435,11 +600,13 @@ impl NominalShape {
             (NominalShape::Tags(names), Value::Tag(tag, _)) => names.iter().any(|n| n == tag),
             (NominalShape::Tags(_), _) => false,
             (NominalShape::Fields(declared), Value::Record(fields)) => {
-                declared.iter().all(|want| fields.iter().any(|(have, _)| have == want))
+                declared.iter().all(|(want, _)| fields.iter().any(|(have, _)| have == want))
             }
             (NominalShape::Fields(_), _) => false,
             (NominalShape::Tuple(n), Value::Tuple(items)) => items.len() == *n,
             (NominalShape::Tuple(_), _) => false,
+            (NominalShape::Simd(kind), Value::Simd { kind: k, .. }) => k == kind,
+            (NominalShape::Simd(_), _) => false,
             (NominalShape::Unknown, _) => true,
         }
     }
@@ -453,10 +620,13 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
             NominalShape::Tags(tags.iter().map(|(name, _)| name.clone()).collect())
         }
         Type::Record { fields, .. } => {
-            NominalShape::Fields(fields.iter().map(|(name, _)| name.clone()).collect())
+            NominalShape::Fields(fields.iter().map(|(name, ty)| (name.clone(), FieldKind::of(ty))).collect())
         }
         Type::Tuple(items) => NominalShape::Tuple(items.len()),
-        Type::Nominal { backing, .. } => shape_of(backing),
+        Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
+            Some(kind) => NominalShape::Simd(kind),
+            None => shape_of(backing),
+        },
         _ => NominalShape::Unknown,
     }
 }
@@ -495,6 +665,27 @@ pub fn eval(ast: &crate::ast::Expr) -> Result<Value, EvalError> {
 ///
 /// The return value is the entry point's, or the top level's if there is none — which
 /// is what a module is.
+/// Run each `from_numeral` a literal needs, the way roc's compile-time evaluation
+/// does; see `Program::literal_coercions`. The message is what `main` reports as a
+/// compile problem.
+fn fold_literal_coercions(program: &Program) -> Result<(), EvalError> {
+    for (nominal, literal) in &program.literal_coercions {
+        let Some(chunk) = program.methods.get(&(*nominal, "from_numeral")) else { continue };
+        let Some(numeral) = crate::eval::numeral::numeral_from_value(literal) else { continue };
+        if let Value::Tag("Err", payload) = call_closure(&program.chunks[*chunk as usize].bare, vec![numeral])? {
+            return Err(EvalError {
+                message: format!(
+                    "`{}.from_numeral` rejects the literal {}: {}",
+                    nominal,
+                    literal,
+                    payload.first().map(|p| p.to_string()).unwrap_or_default()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn run(program: &Rc<Program>) -> Result<Value, EvalError> {
     run_with_args(program, None)
 }
@@ -502,12 +693,34 @@ pub fn run(program: &Rc<Program>) -> Result<Value, EvalError> {
 /// Run, handing the entry point `args` — what a platform's host passes to `main!`.
 /// `None` is an empty argument list, which is all a platformless run can offer.
 pub fn run_with_args(program: &Rc<Program>, args: Option<Value>) -> Result<Value, EvalError> {
+    run_scoped(program, args, |_| ()).map(|(value, _)| value)
+}
+
+/// Run, and while the program is still installed render `Str.inspect` of the result —
+/// which a nominal's own `to_inspect` can steer, and that dispatch needs the running
+/// program and its globals, both gone the moment the run returns.
+pub fn run_and_inspect(program: &Rc<Program>, args: Option<Value>) -> Result<(Value, String), EvalError> {
+    run_scoped(program, args, crate::eval::inspect)
+}
+
+/// Run with `program` installed as the running program, then — before uninstalling it,
+/// so a callback or a `to_inspect` can still reach it — hand the result to `after`.
+fn run_scoped<R>(
+    program: &Rc<Program>,
+    args: Option<Value>,
+    after: impl FnOnce(&Value) -> R,
+) -> Result<(Value, R), EvalError> {
     let mut vm = Vm::new(program);
     vm.entry_args = args;
     // Installed for as long as this program runs, so a builtin's callback can find the
     // machine to run a closure on.
     RUNNING.with(|r| r.borrow_mut().push((Rc::clone(program), Rc::clone(&vm.globals))));
-    let result = vm.run_program();
+    let result = fold_literal_coercions(program).and_then(|()| {
+        vm.run_program().map(|value| {
+            let extra = after(&value);
+            (value, extra)
+        })
+    });
     RUNNING.with(|r| {
         r.borrow_mut().pop();
     });
@@ -634,6 +847,24 @@ impl Vm {
                 Op::LoadCap { dst, idx } => {
                     regs[base + dst as usize] = cur.captures[idx as usize].clone();
                 }
+                Op::MakeCell { dst, src } => {
+                    let value = regs[base + src as usize].clone();
+                    regs[base + dst as usize] = Value::Cell(Rc::new(std::cell::RefCell::new(value)));
+                }
+                Op::CellGet { dst, cell } => {
+                    let Value::Cell(shared) = &regs[base + cell as usize] else {
+                        return Err(EvalError { message: "vm: CellGet on a value that is not a cell".to_string() });
+                    };
+                    let value = shared.borrow().clone();
+                    regs[base + dst as usize] = value;
+                }
+                Op::CellSet { cell, src } => {
+                    let value = regs[base + src as usize].clone();
+                    let Value::Cell(shared) = &regs[base + cell as usize] else {
+                        return Err(EvalError { message: "vm: CellSet on a value that is not a cell".to_string() });
+                    };
+                    *shared.borrow_mut() = value;
+                }
                 Op::LoadSelf { dst } => {
                     regs[base + dst as usize] = Value::Closure(cur.clone());
                 }
@@ -653,10 +884,38 @@ impl Vm {
                     .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
-                Op::BinInt { dst, a, b, op } => {
+                Op::BinInt { dst, a, b, op, width } => {
+                    // `I128` cannot be range-checked after the fact — its arithmetic
+                    // wraps at the same width the value lives in — so its overflow is
+                    // caught with checked i128 math here, before `int_binop` wraps it.
+                    if width == crate::eval::I128_WIDTH {
+                        if let (Value::Int(x), Value::Int(y)) = (&regs[base + a as usize], &regs[base + b as usize]) {
+                            let checked = match op {
+                                crate::ast::BinOp::Add => x.checked_add(*y),
+                                crate::ast::BinOp::Sub => x.checked_sub(*y),
+                                crate::ast::BinOp::Mul => x.checked_mul(*y),
+                                crate::ast::BinOp::IntDiv | crate::ast::BinOp::Div => x.checked_div(*y),
+                                _ => Some(0),
+                            };
+                            match checked {
+                                Some(_) if !matches!(op, crate::ast::BinOp::Add | crate::ast::BinOp::Sub | crate::ast::BinOp::Mul | crate::ast::BinOp::IntDiv | crate::ast::BinOp::Div) => {}
+                                Some(n) => { regs[base + dst as usize] = Value::Int(n); continue; }
+                                None => {
+                                    return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                        message: "crash: integer overflow: I128 arithmetic overflowed".to_string(),
+                                    }))
+                                }
+                            }
+                        }
+                    }
                     let value = match (&regs[base + a as usize], &regs[base + b as usize]) {
                         (Value::Int(x), Value::Int(y)) => match crate::eval::int_binop(op, *x, *y)
                         {
+                            Some(Ok(Value::Int(n))) if width != 0 && !crate::eval::fits_width(n, width) => {
+                                return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                    message: format!("crash: integer overflow: {} does not fit", n),
+                                }))
+                            }
                             Some(result) => result,
                             // `and`/`or` are the only ops `int_binop` declines, and the
                             // compiler never specialises those.
@@ -760,6 +1019,32 @@ impl Vm {
                     ip = 0;
                 }
                 Op::TailCall { func, chunk, base: arg_base, argc } => {
+                    // A BUILTIN held as a value, called in tail position: there is no
+                    // chunk to jump to, so compute it here and return as this frame's
+                    // result, exactly as `Op::Ret` does.
+                    if chunk.is_none() {
+                        if let Value::Builtin(qualified, _) = &regs[base + func as usize] {
+                            let qualified = *qualified;
+                            let args = collect(regs, base + arg_base as usize, argc);
+                            let value = crate::eval::call_function(
+                                Value::Builtin(qualified, args.len()),
+                                args,
+                            )
+                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                            match frames.pop() {
+                                None => return Ok(value),
+                                Some(caller) => {
+                                    chunk_id = caller.chunk;
+                                    code = &program.chunks[chunk_id as usize].code;
+                                    base = caller.base as usize;
+                                    ip = caller.ip as usize;
+                                    cur = caller.closure;
+                                    regs[base + caller.dst as usize] = value;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // No frame is pushed and none is popped: the arguments move down
                     // to where this frame's own parameters are, and execution starts
                     // again at the top of the callee. A tail-recursive function is
@@ -847,13 +1132,22 @@ impl Vm {
                 Op::GetField { dst, obj, name } => {
                     let field = program.chunks[chunk_id as usize].names[name as usize];
                     let value = match &regs[base + obj as usize] {
+                        // A field the record does not have is an optional one that was
+                        // left out — the checker refuses a missing required field.
                         Value::Record(fields) => fields
                             .iter()
                             .find(|(f, _)| *f == field)
                             .map(|(_, v)| v.clone())
-                            .ok_or_else(|| EvalError {
-                                message: format!("Record has no field '{}'", field),
-                            })?,
+                            .unwrap_or(Value::Missing),
+                        Value::Unit => Value::Missing,
+                        // `Builtin.roc`'s `Set.from_iter`/`Dict.from_iter` READ
+                        // `iterator.len_if_known` off roc's `Iter` record. rocflight's
+                        // iterator is the list, range or lazy value it walks, so the
+                        // field is answered from its size hint rather than stored.
+                        other if field == "len_if_known" && crate::eval::module_for(other) == Some("List") => {
+                            crate::eval::size_hint_of(other)
+                                .map_err(|e| locate_error(&program, chunk_id, ip, e))?
+                        }
                         other => {
                             return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!("Cannot access field '{}' on {}", field, other),
@@ -866,10 +1160,14 @@ impl Vm {
                     let field = program.chunks[chunk_id as usize].names[name as usize];
                     let value = match &regs[base + obj as usize] {
                         Value::Record(fields) => match fields.iter().find(|(f, _)| *f == field) {
+                            Some((_, Value::Missing)) | None => {
+                                // Absent, which is the point of an optional field.
+                                Value::tag("Err", vec![Value::tag("MissingField", vec![])])
+                            }
                             Some((_, v)) => Value::tag("Ok", vec![v.clone()]),
-                            // Absent, which is the point of an optional field.
-                            None => Value::tag("Err", vec![Value::tag("MissingField", vec![])]),
                         },
+                        // `{}` is the empty record: every optional field is absent.
+                        Value::Unit => Value::tag("Err", vec![Value::tag("MissingField", vec![])]),
                         other => {
                             return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!(
@@ -908,11 +1206,48 @@ impl Vm {
                         ip = to as usize;
                     }
                 }
+                Op::TestLitDyn { obj, pat, to } => {
+                    let pattern = &program.chunks[chunk_id as usize].pats[pat as usize];
+                    let value = &regs[base + obj as usize];
+                    let matched = match value {
+                        Value::Record(_) | Value::Tag(..) | Value::Tuple(_) => {
+                            nominal_literal_matches(&program, pattern, value)
+                                .map_err(|e| locate_error(&program, chunk_id, ip, e))?
+                        }
+                        _ => crate::eval::literal_pattern_matches(pattern, value),
+                    };
+                    if !matched {
+                        ip = to as usize;
+                    }
+                }
+                Op::TestStr { obj, pat, base: captures, to } => {
+                    let pattern = &program.chunks[chunk_id as usize].pats[pat as usize];
+                    let found = match (pattern, &regs[base + obj as usize]) {
+                        (crate::ast::Pattern::StrInterp { prefix, segments }, Value::Str(text)) => {
+                            crate::eval::interp_captures(prefix, segments, text)
+                        }
+                        _ => None,
+                    };
+                    match found {
+                        Some(values) => {
+                            for (i, value) in values.into_iter().enumerate() {
+                                regs[base + captures as usize + i] = value;
+                            }
+                        }
+                        None => ip = to as usize,
+                    }
+                }
                 Op::TestTag { obj, name, n, to } => {
                     let want = program.chunks[chunk_id as usize].names[name as usize];
                     match &regs[base + obj as usize] {
                         Value::Tag(tag, payload)
                             if *tag == want && payload.len() == n as usize => {}
+                        // `True` and `False` are the booleans spelled as tags.
+                        Value::Bool(b) if n == 0 && want == if *b { "True" } else { "False" } => {}
+                        // An optional field read as a `Try`: a present value IS `Ok(value)`,
+                        // and a missing slot IS `Err(MissingField)`.
+                        Value::Missing if want == "Err" && n == 1 => {}
+                        other if want == "Ok" && n == 1 && !matches!(other, Value::Tag(..) | Value::Missing) => {}
                         _ => ip = to as usize,
                     }
                 }
@@ -943,7 +1278,10 @@ impl Vm {
                 Op::GetPayload { dst, obj, i } => {
                     let value = match &regs[base + obj as usize] {
                         Value::Tag(_, payload) => payload[i as usize].clone(),
-                        other => unreachable_shape("a tag", other)?,
+                        // See `TestTag`: an optional field's `Ok` payload is the value,
+                        // and a missing one's `Err` payload is `MissingField`.
+                        Value::Missing => Value::tag("MissingField", vec![]),
+                        other => other.clone(),
                     };
                     regs[base + dst as usize] = value;
                 }
@@ -999,15 +1337,26 @@ impl Vm {
 
                 // ---- loops ----
                 Op::MakeRange { dst, start, end, inclusive } => {
-                    let bound = |v: &Value| match v {
-                        Value::Int(n) => Ok(*n),
-                        other => Err(EvalError {
-                            message: format!("A range needs whole numbers, got {}", other),
-                        }),
+                    let (lo, hi) = (&regs[base + start as usize], &regs[base + end as usize]);
+                    // Two integers stay the fast `Range`; anything else (a `Dec`, a
+                    // float) becomes a lazy iterator walked element by element.
+                    regs[base + dst as usize] = match (lo, hi) {
+                        (Value::Int(a), Value::Int(b)) => Value::Range { start: *a, end: *b, inclusive, step: 1 },
+                        (a, b) => {
+                            let step = match a {
+                                Value::Dec(_) => Value::Dec(crate::eval::DEC_SCALE),
+                                Value::Float(_) => Value::Float(1.0),
+                                Value::F32(_) => Value::F32(1.0),
+                                _ => Value::Int(1),
+                            };
+                            Value::Iter(std::rc::Rc::new(crate::eval::lazy::Lazy::Range {
+                                at: a.clone(),
+                                end: b.clone(),
+                                step,
+                                inclusive,
+                            }))
+                        }
                     };
-                    let start = bound(&regs[base + start as usize])?;
-                    let end = bound(&regs[base + end as usize])?;
-                    regs[base + dst as usize] = Value::Range { start, end, inclusive };
                 }
                 Op::IterNext { dst, iter, idx, to } => {
                     let at = match &regs[base + idx as usize] {
@@ -1018,11 +1367,40 @@ impl Vm {
                             }))
                         }
                     };
+                    // A lazy iterator carries its own state, not an index: step it,
+                    // skipping past `Skip`s, and write the rest back for next time.
+                    if let Value::Iter(lazy) = &regs[base + iter as usize] {
+                        let mut current = lazy.clone();
+                        let stepped = loop {
+                            match current.step().map_err(|e| locate_error(&program, chunk_id, ip, e))? {
+                                crate::eval::lazy::Step::Done => break None,
+                                crate::eval::lazy::Step::Skip(rest) => current = rest,
+                                crate::eval::lazy::Step::One(item, rest) => break Some((item, rest)),
+                            }
+                        };
+                        match stepped {
+                            None => ip = to as usize,
+                            Some((item, rest)) => {
+                                regs[base + dst as usize] = item;
+                                regs[base + iter as usize] = Value::Iter(rest);
+                            }
+                        }
+                        continue;
+                    }
+                    // A nominal iterable — a record or tag with an `iter` method —
+                    // is turned into its iterator once, in place, then looped.
+                    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
+                        if let Some(iterated) = call_iter_method(&program, &regs[base + iter as usize])
+                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?
+                        {
+                            regs[base + iter as usize] = iterated;
+                        }
+                    }
                     let next = match &regs[base + iter as usize] {
-                        Value::Range { start, end, inclusive } => {
+                        Value::Range { start, end, inclusive, step } => {
                             let last = if *inclusive { *end } else { *end - 1 };
-                            let current = start + at;
-                            (current <= last).then_some(Value::Int(current))
+                            let current = start + at * i128::from(*step);
+                            (*step > 0 && current <= last).then_some(Value::Int(current))
                         }
                         Value::List(items) => items.get(at as usize).cloned(),
                         other => {
@@ -1079,9 +1457,65 @@ impl Vm {
                         // meant; if several do, only the checker could have known.
                         None => match program.methods_by_name.get(method) {
                             Some(defined) if defined.len() == 1 => Some(defined[0].1),
-                            // Several types define it and the value cannot say which it
-                            // is. Guessing would silently run the wrong one, so name
-                            // them and let the caller be explicit.
+                            // Several types define it. The value's SHAPE can still say
+                            // which nominal it is — `Key.{ value: n }` is a record of
+                            // exactly `Key`'s fields — so the candidates whose nominal
+                            // fits are the ones meant. Two nominals of one shape (`Set`
+                            // over `Dict`) are told apart by depth: the wrapper is the
+                            // more specific.
+                            Some(defined)
+                                if defined.iter().any(|(owner, _)| {
+                                    let module = owner.split('.').next().unwrap_or(owner);
+                                    program.nominal_shapes.get(module).is_some_and(|shape| shape.is_exactly(&regs[base + b as usize]))
+                                }) =>
+                            {
+                                let depth_of = |owner: &str| {
+                                    let module = owner.split('.').next().unwrap_or(owner);
+                                    program.nominal_depth.get(module).copied().unwrap_or(0)
+                                };
+                                let fitting: Vec<&(&'static str, ChunkId)> = defined
+                                    .iter()
+                                    .filter(|(owner, _)| {
+                                        let module = owner.split('.').next().unwrap_or(owner);
+                                        program.nominal_shapes.get(module).is_some_and(|shape| shape.is_exactly(&regs[base + b as usize]))
+                                    })
+                                    .collect();
+                                let best = fitting.iter().map(|(owner, _)| depth_of(owner)).max().unwrap_or(0);
+                                let deepest: Vec<&&(&'static str, ChunkId)> =
+                                    fitting.iter().filter(|(owner, _)| depth_of(owner) == best).collect();
+                                // Two nominals of one field list at one depth: the
+                                // fields' KINDS may still tell them apart (`{ value :
+                                // F32 }` from `{ value : F64 }`). If not, only the
+                                // checker could have known, so name them both.
+                                let held: Vec<&&(&'static str, ChunkId)> = deepest
+                                    .iter()
+                                    .copied()
+                                    .filter(|(owner, _)| {
+                                        let module = owner.split('.').next().unwrap_or(owner);
+                                        program.nominal_shapes.get(module).is_some_and(|shape| shape.holds_kinds(&regs[base + b as usize]))
+                                    })
+                                    .collect();
+                                let mut winners = if held.len() == 1 { held.into_iter() } else { deepest.into_iter() };
+                                match (winners.next(), winners.next()) {
+                                    (Some((_, chunk)), None) => Some(*chunk),
+                                    _ => {
+                                        let names: Vec<&str> = fitting.iter().map(|(name, _)| *name).collect();
+                                        return Err(locate_error(&program, chunk_id, ip, EvalError {
+                                            message: format!(
+                                                "`{}` is ambiguous: {} all define it. Call it explicitly.",
+                                                method,
+                                                names.join(", ")
+                                            ),
+                                        }));
+                                    }
+                                }
+                            }
+                            // Several types define it but the value is none of them —
+                            // `Dict.to_hash`/`Set.to_hash` against a record, tuple or
+                            // tag KEY, which `Dict` hashes structurally. A method the
+                            // interpreter provides for any value (`to_hash`) falls back
+                            // to that builtin rather than being called ambiguous.
+                            Some(_) if crate::eval::has_structural_builtin(method) => None,
                             Some(defined) => {
                                 let names: Vec<&str> =
                                     defined.iter().map(|(name, _)| *name).collect();

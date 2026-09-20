@@ -1,16 +1,22 @@
-# matching.roc's work, written so BOTH engines can run it: a tail-recursive loop
+# matching.roc's work as a tail-recursive loop instead of `var` + `for`: the same tag
 # expect: 215998199970000
-# instead of `var` + `for`, and the module's own value instead of `echo!`. Tag
-# construction and matching, 180,000 of each.
-Shape : [Circle(I64), Rect(I64, I64), Dot]
+# construction and matching, 180,000 of each, with a frame-reusing call per step.
+# The loop starts from `args.len()` so that roc cannot fold `go(0, 0)` at compile time.
+app [main!] {}
 
-area : Shape -> I64
+Shape : [Circle(U64), Rect(U64, U64), Dot]
+
+area : Shape -> U64
 area = |s| match s {
 	Circle(r) => 3 * r * r
 	Rect(w, h) => w * h
 	Dot => 0
 }
 
+go : U64, U64 -> U64
 go = |i, total| if i == 60000 { total } else { go(i + 1, total + area(Rect(i, 2)) + area(Circle(i)) + area(Dot)) }
 
-go(0, 0)
+main! = |args| {
+	echo!(U64.to_str(go(args.len(), 0)))
+	Ok({})
+}

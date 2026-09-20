@@ -9,6 +9,14 @@ checked by running the compiler, not from memory. Re-verify when the nightly mov
 
 ---
 
+## The parity gate above every phase
+
+Before any per-feature test: roc's own eval tests run through rocflight as a backend of
+roc's own harness — `tests/check_eval.sh`. A feature is not done while a test in
+`roc-compiler/src/eval/test/` that exercises it fails through rocflight, whatever the
+golden pair says. `tests/check_eval.sh --filter <word>` narrows the run to the tests
+naming or using the feature. See TESTING_STRATEGY.md.
+
 ## The golden-pair rule
 
 **Every single syntax feature gets its own pair of `.roc` files, and both must

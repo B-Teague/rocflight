@@ -29,7 +29,7 @@ fn declarations(file: &str) -> (Vec<(&'static str, Type)>, Vec<(&'static str, Ty
 
 #[test]
 fn every_basic_cli_hosted_function_has_a_call_shape() {
-    let (host_sigs, host_types) = declarations("Host.roc");
+    let (host_sigs, _host_types) = declarations("Host.roc");
     let mut decls: HashMap<String, Type> = HashMap::new();
     for file in ["IOErr.roc", "InternalHttp.roc", "InternalSqlite.roc", "InternalDateTime.roc", "Host.roc"] {
         let (_, types) = declarations(file);

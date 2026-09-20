@@ -38,6 +38,7 @@ Usage: rocflight [ROC_FILE] [ARGS_FOR_APP]...
 
 Commands:
   test     Run all top-level `expect`s in a module
+  eval     Print `Str.inspect` of a module's value, for roc's eval test runner (`--raw` for the Str itself)
   version  Print rocflight's version
   help     Print this message
 
@@ -114,7 +115,7 @@ fn cli() {
 
     // `test` is the one subcommand that goes on to run a file; the other two answer
     // and leave.
-    let (test_mode, rest) = match args.first().map(String::as_str) {
+    let (test_mode, eval_mode, rest) = match args.first().map(String::as_str) {
         Some("help") | Some("-h") | Some("--help") => {
             usage();
             return;
@@ -123,12 +124,15 @@ fn cli() {
             println!("rocflight {}", env!("CARGO_PKG_VERSION"));
             return;
         }
-        Some("test") => (true, &args[1..]),
-        _ => (false, &args[..]),
+        Some("test") => (true, false, &args[1..]),
+        Some("eval") => (false, true, &args[1..]),
+        _ => (false, false, &args[..]),
     };
 
     let mut dbg = Debug::default();
     let mut filename = None;
+    // `eval --raw`: a Str answer is printed as itself, not as `Str.inspect` would.
+    let mut raw = false;
     // Everything after the file is the app's, as `roc app.roc -- a b` passes it on;
     // the `--` itself is optional here.
     let mut app_args: Vec<String> = Vec::new();
@@ -140,6 +144,10 @@ fn cli() {
             continue;
         }
         if debug_flag(arg, &mut dbg) {
+            continue;
+        }
+        if eval_mode && arg == "--raw" {
+            raw = true;
             continue;
         }
         if arg.starts_with('-') {
@@ -156,7 +164,7 @@ fn cli() {
     // An app on a real platform runs on that platform's compiled host: link it (once
     // per platform) and hand over. `test` and the debugging flags stay in-process —
     // a test never reaches an effect, and the flags are about this pipeline.
-    let in_process = test_mode || dbg.show_desugared || dbg.show_ast || dbg.ast_only || dbg.show_platforms;
+    let in_process = test_mode || eval_mode || dbg.show_desugared || dbg.show_ast || dbg.ast_only || dbg.show_platforms;
     if !in_process {
         if let Err(e) = launch_on_host(&filename, &app_args) {
             eprintln!("Error: {}", e);
@@ -164,10 +172,69 @@ fn cli() {
         }
     }
 
+    if eval_mode {
+        eval_for_harness(&filename, raw);
+    }
+
     // Run the interpreter with proper error handling
     if let Err(e) = run(&filename, dbg, test_mode) {
         eprintln!("Error: {}", e);
         process::exit(1);
+    }
+}
+
+/// `rocflight eval FILE`: one backend of roc's own eval test runner.
+///
+/// `roc-compiler/src/eval/test/parallel_runner.zig` runs every eval test through the
+/// interpreter, the dev backend and wasm, and compares their `Str.inspect` strings.
+/// With `--rocflight <binary>` it runs this too, over the same pipe protocol its forked
+/// backends use: exit 0 with the inspect string on stdout, or exit 2 with an error NAME
+/// on stdout — `Crash` is what a crash test expects, and `CompileError` is what a
+/// problem test expects. Nothing else may reach stdout, and stderr is discarded.
+///
+/// `raw`: the runner's allocation tests compare a plain `Str`, not its inspection,
+/// so `"ok"` has to come out as `ok`.
+fn eval_for_harness(filename: &str, raw: bool) -> ! {
+    let options = rocflight::run::Options { check_expects: true, inspect_result: !raw, ..Default::default() };
+    match rocflight::run::run_file(filename, options) {
+        // A failing `expect` is a compile-time problem in roc's evaluation of a
+        // constant, and the harness expects to hear so.
+        Ok(Some(_)) if rocflight::eval::expect_tally().1 > 0 || rocflight::eval::assert_failed() => {
+            eprintln!("expect failed");
+            println!("CompileError");
+            process::exit(2);
+        }
+        Ok(Some(ran)) => {
+            match (&ran.value, raw) {
+                (rocflight::eval::value::Value::Str(text), true) => println!("{}", text),
+                // Rendered inside the run, where a nominal `to_inspect` could dispatch.
+                (_, false) => println!("{}", ran.inspected.as_deref().unwrap_or_default()),
+                (value, _) => println!("{}", rocflight::eval::inspect(value)),
+            }
+            process::exit(0);
+        }
+        Ok(None) => process::exit(0),
+        Err(e) => {
+            let message = e.to_string();
+            let name = if message.contains("Runtime error: crash") {
+                "Crash"
+            } else if message.contains("No match arm matched")
+                || message.contains("Division by zero")
+                || message.contains("rejects the literal")
+            {
+                // A case a top-level constant reaches that its match lacks: roc
+                // finds it evaluating the constant, and reports a problem.
+                "CompileError"
+            } else if message.starts_with("Runtime error") {
+                "RuntimeError"
+            } else {
+                "CompileError"
+            };
+            // The runner discards stderr; a person reading by hand gets the reason.
+            eprintln!("{}", message);
+            println!("{}", name);
+            process::exit(2);
+        }
     }
 }
 
@@ -198,6 +265,8 @@ fn run(filename: &str, dbg: Debug, test_mode: bool) -> Result<(), Box<dyn Error>
         test_mode,
         args: None,
         host_entry: false,
+        check_expects: false,
+        inspect_result: false,
     };
     let Some(ran) = rocflight::run::run_file(filename, options)? else {
         return Ok(());

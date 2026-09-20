@@ -54,7 +54,8 @@ pub enum Type {
     /// so unification falls through to the backing when only one side is nominal.
     Nominal { name: String, backing: Box<Type> },
     /// The type of a range expression. Opaque, like roc's.
-    Range,
+    /// A numeric range, `1..=n`; the element is what iterating it yields.
+    Range(Box<Type>),
     /// Tuple type: `(Str, I64)`. Positional, so element order is part of the type.
     Tuple(Vec<Type>),
     /// Tag union type: `[Red, Green]`, `[Foo(I64, Str), Bar]`, `[Exit(I8), ..]`.
@@ -72,6 +73,13 @@ pub enum Type {
 }
 
 impl Type {
+    /// Is this a nominal named but not declared here — an import, or the recursive
+    /// reference inside a declaration's own body? Its backing is a stand-in variable:
+    /// the parser's sentinel, or a fresh variable once an annotation was instantiated.
+    pub fn is_placeholder(&self) -> bool {
+        matches!(self, Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)))
+    }
+
     /// A record whose fields are exactly these. The common case — an open record only
     /// comes from an annotation that writes `..`.
     pub fn closed_record(fields: Vec<(String, Type)>) -> Type {
@@ -106,7 +114,7 @@ impl fmt::Display for Type {
         match self {
             Type::Str => write!(f, "Str"),
             Type::Unit => write!(f, "{{}}"),
-            Type::Range => write!(f, "Range"),
+            Type::Range(elem) => write!(f, "Range({})", elem),
             Type::Optional(inner) => write!(f, "{}?", inner),
             Type::Nominal { name, .. } => write!(f, "{}", name),
             Type::Tuple(items) => {
@@ -213,6 +221,7 @@ impl Substitution {
                 }
             }
             Type::List(inner) => Type::List(Box::new(self.apply(inner))),
+            Type::Range(inner) => Type::Range(Box::new(self.apply(inner))),
             Type::Function(a, b) => {
                 Type::Function(Box::new(self.apply(a)), Box::new(self.apply(b)))
             }

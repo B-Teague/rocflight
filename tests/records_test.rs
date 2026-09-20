@@ -95,14 +95,13 @@ fn uppercase_receiver_is_a_module_not_a_field() {
 
 #[test]
 fn missing_field_is_an_error() {
-    // Caught at eval. The type checker cannot catch it here: the receiver is an
-    // identifier, which synths to a fresh type variable because there is still no
-    // type environment, so the record's field list is not visible.
-    // ponytail: moves to the type checker once `synth` has an environment.
+    // Caught by the type checker: `r` is bound to a closed record without `nope`.
+    // The VM no longer checks — an absent field there is an optional one left out.
     let desugared = Desugarer::new("r = { a: 1 }\nr.nope".to_string()).desugar().unwrap();
     let mut parser = Parser::new(&desugared);
     let ast = parser.parse_expr().unwrap();
-    assert!(rocflight::vm::eval(&ast).is_err(), "missing field should fail at eval");
+    let mut checker = rocflight::types::checker::TypeChecker::new();
+    assert!(checker.synth(&ast).is_err(), "missing field should be a type error");
 }
 
 #[test]

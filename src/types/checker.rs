@@ -24,6 +24,10 @@ pub struct TypeChecker {
     /// Each `Dispatch` node and its RECEIVER's type, before the substitution is
     /// finished. Resolved afterwards into the module whose method block owns the call.
     dispatches: Vec<(crate::ast::NodeId, Type)>,
+    /// `iter.collect()` nodes whose OUTPUT type is a nominal with its own `from_iter`.
+    /// roc's `collect` is `Output.from_iter(iterator)` — the expectation picks the
+    /// implementation — so the compiler needs the name the annotation settled on.
+    collect_targets: std::collections::HashMap<crate::ast::NodeId, String>,
     /// Numeric LITERAL nodes and the type they were checked against.
     ///
     /// `Dec` is a 128-bit fixed-point value, not a float, so `0.0` in a `List(Dec)` has
@@ -37,11 +41,73 @@ pub struct TypeChecker {
     /// stand for one, which is what lets a dispatch on an unresolved numeral still
     /// resolve, and what `fractional_literals` defaults at the end.
     numeral_vars: std::collections::HashSet<u32>,
+    /// Field-value variables of a record UPDATE whose base is still unknown. Such a
+    /// field is written unconditionally, so the slot it lands in must be a plain one:
+    /// roc rejects `|r| { ..r, a: 5 }` applied to a `{ a ?: U64 }`. Everywhere else an
+    /// optional slot happily accepts a value of its inner type, so this set is the
+    /// only thing that tells the two apart.
+    committed_vars: std::collections::HashSet<u32>,
     /// Record literals written as `Name.{ … }`, from `Parser::nominal_literals`.
     /// The nominal is erased in the AST, so this is how the fields keep their types.
     nominal_literals: std::collections::HashMap<crate::ast::NodeId, Type>,
     /// Literal nodes with an explicit type suffix, from `Parser::suffixed_literals`.
     suffixed: std::collections::HashMap<crate::ast::NodeId, Type>,
+    /// Every numeric literal's VALUE (for a fractional one, its `Dec` attos) and
+    /// whether it was written with a point — what `literal_problems` checks against
+    /// the width each one ended up with.
+    literal_values: std::collections::HashMap<crate::ast::NodeId, (i128, bool)>,
+    /// Literal nodes the parser could not hold exactly, from
+    /// `Parser::overflowed_literals`: a `Dec` past its bounds or with too many places.
+    overflowed_literals: std::collections::HashSet<crate::ast::NodeId>,
+    /// Record literal nodes checked against a type with optional fields they left
+    /// out, and which fields: the compiler fills each with `Value::Missing`, which is
+    /// what `{ a: <missing>, b: 2 }` inspects from.
+    missing_fields: std::collections::HashMap<crate::ast::NodeId, Vec<String>>,
+    /// Nominal -> its DEFAULTED field names (fields declared `name : T ?? default`),
+    /// so a `{}` or partial record checked against the nominal may omit them.
+    defaulted: std::collections::HashMap<String, Vec<String>>,
+    /// Record/unit literal nodes checked against a nominal with defaulted or optional
+    /// fields, and the nominal name: the compiler fills the omitted ones there.
+    default_sites: std::collections::HashMap<crate::ast::NodeId, String>,
+    /// See `declare_nominal_params`.
+    nominal_params: std::collections::HashMap<String, Vec<u32>>,
+    /// `List.with_capacity` calls whose element type is zero-sized; see `zero_sized`.
+    zero_sized_capacity: std::collections::HashSet<crate::ast::NodeId>,
+    /// See `note_polymorphic_use`.
+    poly_problems: Vec<String>,
+    /// Annotation result variables that the BODY may not pin; see `unify`.
+    rigid_vars: std::collections::HashSet<u32>,
+    /// Literal nodes standing for a nominal, and which conversion builds it:
+    /// `x : Tag = "Roc"` is `Tag.from_quote("Roc")`, `n : Big = 42` is
+    /// `Big.from_numeral(42)`, `u : Url = "a${b}"` is `Url.from_interpolation(..)`.
+    /// The ones decided while checking; `literal_conversions` adds the ones inference
+    /// decided later.
+    converted: std::collections::HashMap<crate::ast::NodeId, (String, &'static str)>,
+    /// Does the program declare a `from_quote` or `from_interpolation` anywhere? Only
+    /// then is a string literal polymorphic; otherwise it is a `Str`, as cheaply as
+    /// before.
+    quotable: bool,
+    /// The nominals declaring any literal conversion, so asking is a set lookup and
+    /// not a walk of the environment per checked expression.
+    conversion_nominals: std::collections::HashSet<String>,
+    /// Variables standing for a string literal, which may still become a nominal
+    /// with `from_quote`; see `numeral_vars`.
+    quote_vars: std::collections::HashSet<u32>,
+    /// String literal nodes and their variables, plain and interpolated.
+    str_literals: Vec<(crate::ast::NodeId, Type)>,
+    interp_literals: Vec<(crate::ast::NodeId, Type)>,
+    /// Literals with a nominal suffix, from `Parser::nominal_suffixes`.
+    suffixed_nominals: std::collections::HashMap<crate::ast::NodeId, String>,
+    /// Expressions checked against a nominal with a literal conversion, which a raw
+    /// literal may reach through a generic body; the compiler converts at run time.
+    coerce_values: std::collections::HashMap<crate::ast::NodeId, String>,
+    /// Lambdas whose declared parameters are such nominals: `(param index, nominal)`.
+    coerce_params: std::collections::HashMap<crate::ast::NodeId, Vec<(usize, String)>>,
+    /// Every `match` and its scrutinee's type, for literal patterns on a nominal.
+    matches: Vec<(crate::ast::NodeId, Type)>,
+    /// `for` loops whose iterable is a nominal with an `iter` method: the compiler
+    /// inserts the `.iter()` call.
+    for_iter_calls: std::collections::HashSet<crate::ast::NodeId>,
     /// The result type of each lambda currently being checked, innermost last.
     ///
     /// A `return` leaves the FUNCTION, so what it hands back is the function's result
@@ -124,12 +190,76 @@ impl TypeChecker {
             }
             cursor = body;
         }
+        for (name, ..) in self.env.iter().flatten() {
+            for method in [".from_quote", ".from_numeral", ".from_interpolation"] {
+                if let Some(owner) = name.strip_suffix(method) {
+                    self.conversion_nominals.insert(owner.to_string());
+                    self.quotable |= method != ".from_numeral";
+                }
+            }
+        }
+    }
+
+    /// Does the nominal `name` declare `method`? By the declared name, without
+    /// instantiating it — asked from `unify` and from the exporters alike.
+    fn has_method(&self, name: &str, method: &str) -> bool {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.env.iter().flatten().any(|(n, ..)| {
+            n.strip_suffix(method).and_then(|n| n.strip_suffix('.')).is_some_and(|n| n == name || n == bare)
+        })
+    }
+
+    /// A nominal that builds itself from a literal, by any of the three conversions.
+    fn converts_literals(&self, ty: &Type) -> bool {
+        !self.conversion_nominals.is_empty()
+            && matches!(ty, Type::Nominal { name, .. }
+                if self.conversion_nominals.contains(name)
+                    || self.conversion_nominals.contains(name.rsplit('.').next().unwrap_or(name)))
+    }
+
+    /// The nominal a suffix names, as the program declared it.
+    fn nominal_named(&self, name: &str) -> Type {
+        self.apply(&Type::Nominal { name: name.to_string(), backing: Box::new(Type::TypeVar(u32::MAX)) })
+    }
+
+    /// What `Name.from_interpolation` gives back, where it is declared.
+    fn interpolation_result(&mut self, name: &str) -> Option<Type> {
+        let signature = self.declared(name, "from_interpolation")?;
+        Self::peel_params(&signature, 2).map(|(_, result)| result)
+    }
+
+    pub fn declare_suffixed_nominals(&mut self, suffixes: &[(crate::ast::NodeId, &'static str)]) {
+        self.suffixed_nominals.extend(suffixes.iter().map(|(id, name)| (*id, name.to_string())));
+    }
+
+    fn leak(name: &str) -> &'static str {
+        crate::memory::string_pool::intern(name)
     }
 
     /// Make the program's type declarations known by name; see `declared_types`.
     pub fn declare_types<'a>(&mut self, declared: impl IntoIterator<Item = (&'a str, Type)>) {
         for (name, ty) in declared {
-            self.declared_types.entry(name.to_string()).or_insert(ty);
+            // A name the app merely IMPORTS is registered by its own parser as a
+            // placeholder — a nominal whose backing is the sentinel variable — because
+            // the app's file never declared it. The module's real declaration comes
+            // second and must win, or an imported nominal's tags have no payload types.
+            // A placeholder carries no information: it stands for the name itself with
+            // an unparsed backing. `ThingAlias : ThingMod.Thing` in another module is
+            // NOT one — it names `Thing`, which resolves — so it must win over the
+            // app's own `Nominal { ThingAlias, ? }` stand-in.
+            let placeholder = |t: &Type| {
+                matches!(t, Type::Nominal { name: n, backing }
+                    if n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
+            };
+            match self.declared_types.get(name) {
+                Some(existing) if placeholder(existing) && !placeholder(&ty) => {
+                    self.declared_types.insert(name.to_string(), ty);
+                }
+                Some(_) => {}
+                None => {
+                    self.declared_types.insert(name.to_string(), ty);
+                }
+            }
         }
     }
 
@@ -151,12 +281,34 @@ impl TypeChecker {
     ///
     /// A `:=` nominal whose own backing is a bare variable — `Wrapper(a) := a` — is
     /// not a placeholder, and is left alone.
+    /// Does a record pattern name a field the scrutinee declares OPTIONAL?
+    fn reads_optional_fields(&self, pattern: &Pattern, scrutinee: &Type) -> bool {
+        let Pattern::Record { fields, .. } = pattern else { return false };
+        let resolved = self.apply(scrutinee);
+        let known = match &resolved {
+            Type::Record { fields, .. } => fields,
+            Type::Nominal { backing, .. } => match &**backing {
+                Type::Record { fields, .. } => fields,
+                _ => return false,
+            },
+            _ => return false,
+        };
+        fields.iter().any(|(name, _)| {
+            known.iter().any(|(field, ty)| field == name && matches!(ty, Type::Optional(_)))
+        })
+    }
+
     fn placeholder_target(&self, name: &str) -> Option<&Type> {
         // `OsStr.OsStr` is `OsStr`'s own declaration seen from outside.
         let bare = name.rsplit('.').next().unwrap_or(name);
         let declared = self.declared_types.get(name).or_else(|| self.declared_types.get(bare))?;
         match declared {
-            Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)) => None,
+            // `Wrapper(a) := a` — a nominal whose OWN backing is a variable is a real
+            // declaration, not a stand-in. A cross-module alias to another nominal,
+            // `ThingAlias : ThingMod.Thing`, has a different name and does resolve:
+            // one more expansion reaches `Thing`'s declaration.
+            Type::Nominal { name: n, backing }
+                if matches!(**backing, Type::TypeVar(_)) && (n == name || n == bare) => None,
             _ => Some(declared),
         }
     }
@@ -166,8 +318,9 @@ impl TypeChecker {
             Type::Nominal { name, backing } => {
                 if matches!(**backing, Type::TypeVar(_)) && !seen.iter().any(|s| s == name) {
                     if let Some(target) = self.placeholder_target(name) {
+                        let target = target.clone();
                         seen.push(name.clone());
-                        let expanded = self.expand(target, seen);
+                        let expanded = self.expand(&target, seen);
                         seen.pop();
                         return expanded;
                     }
@@ -178,6 +331,7 @@ impl TypeChecker {
                 Type::Nominal { name: name.clone(), backing: Box::new(backing) }
             }
             Type::List(inner) => Type::List(Box::new(self.expand(inner, seen))),
+            Type::Range(inner) => Type::Range(Box::new(self.expand(inner, seen))),
             Type::Optional(inner) => Type::Optional(Box::new(self.expand(inner, seen))),
             Type::Function(a, b) => Type::Function(Box::new(self.expand(a, seen)), Box::new(self.expand(b, seen))),
             Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.expand(t, seen)).collect()),
@@ -196,13 +350,36 @@ impl TypeChecker {
         }
     }
 
+    /// A type with no bits at run time: `{}`, or a record or tuple of only such.
+    fn zero_sized(ty: &Type) -> bool {
+        match ty {
+            Type::Unit => true,
+            Type::Record { fields, open: false } => fields.iter().all(|(_, t)| Self::zero_sized(t)),
+            Type::Tuple(items) => items.iter().all(Self::zero_sized),
+            Type::TagUnion { tags, open: false } => tags.len() == 1 && tags[0].1.iter().all(Self::zero_sized),
+            _ => false,
+        }
+    }
+
+    /// The `List.with_capacity` calls that get a capacity of 0 — see `zero_sized`.
+    pub fn zero_sized_capacity(&self) -> std::collections::HashSet<crate::ast::NodeId> {
+        self.zero_sized_capacity.clone()
+    }
+
+    /// The parameters of each parameterised nominal — see `expand`.
+    pub fn declare_nominal_params(&mut self, params: impl IntoIterator<Item = (String, Vec<u32>)>) {
+        self.nominal_params.extend(params);
+    }
+
     /// Make `Module.member : Type` annotations from a platform's modules known.
     pub fn declare_signatures(&mut self, signatures: impl IntoIterator<Item = (String, Type)>) {
         self.declared_signatures.extend(signatures);
     }
 
     pub fn allow_dispatch(&mut self, methods: Vec<String>) {
-        self.where_methods = methods;
+        // EXTENDS: the app's `where` clauses and each imported module's both grant
+        // permission, and assigning dropped whichever came first.
+        self.where_methods.extend(methods);
     }
 
     pub fn new() -> Self {
@@ -214,11 +391,33 @@ impl TypeChecker {
             subst: Substitution::new(),
             binops: Vec::new(),
             dispatches: Vec::new(),
+            collect_targets: std::collections::HashMap::new(),
             enclosing_type: Vec::new(),
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
+            committed_vars: std::collections::HashSet::new(),
             nominal_literals: std::collections::HashMap::new(),
             suffixed: std::collections::HashMap::new(),
+            literal_values: std::collections::HashMap::new(),
+            overflowed_literals: std::collections::HashSet::new(),
+            converted: std::collections::HashMap::new(),
+            quotable: false,
+            conversion_nominals: std::collections::HashSet::new(),
+            quote_vars: std::collections::HashSet::new(),
+            str_literals: Vec::new(),
+            interp_literals: Vec::new(),
+            suffixed_nominals: std::collections::HashMap::new(),
+            coerce_values: std::collections::HashMap::new(),
+            coerce_params: std::collections::HashMap::new(),
+            matches: Vec::new(),
+            for_iter_calls: std::collections::HashSet::new(),
+            missing_fields: std::collections::HashMap::new(),
+            defaulted: std::collections::HashMap::new(),
+            default_sites: std::collections::HashMap::new(),
+            nominal_params: std::collections::HashMap::new(),
+            zero_sized_capacity: std::collections::HashSet::new(),
+            poly_problems: Vec::new(),
+            rigid_vars: std::collections::HashSet::new(),
             returns: Vec::new(),
             parse_targets: std::collections::HashMap::new(),
             next_var: 0,
@@ -242,6 +441,21 @@ impl TypeChecker {
     fn bind(&mut self, name: &str, ty: Type) {
         if let Some(scope) = self.env.last_mut() {
             scope.push((name.to_string(), ty, Vec::new()));
+        }
+    }
+
+    /// `import Foo exposing [bar]`: the bare name is the module's `Foo.bar`, with the
+    /// same type and the same quantified variables. Without it the bare spelling is an
+    /// unknown name, so `bar(0).baz({})` dispatched on an unresolved type.
+    pub fn expose(&mut self, type_name: &str, names: &[String]) {
+        for name in names {
+            let qualified = format!("{}.{}", type_name, name);
+            let found = self.env.iter().rev().find_map(|scope| {
+                scope.iter().rev().find(|(n, _, _)| *n == qualified).cloned()
+            });
+            if let Some((_, ty, generics)) = found {
+                self.bind_poly(name, ty, generics);
+            }
         }
     }
 
@@ -292,6 +506,9 @@ impl TypeChecker {
     fn instantiate(&mut self, ty: &Type, generics: &[u32]) -> Type {
         let mapping: Vec<(u32, Type)> =
             generics.iter().map(|id| (*id, self.fresh_var())).collect();
+        // A quantified NUMERAL or string-literal variable stays one in each copy, so
+        // an instance nothing pins still defaults to `Dec` (or `Str`) and still finds
+        // a method block.
         Self::substitute_vars(ty, &mapping)
     }
 
@@ -306,6 +523,7 @@ impl TypeChecker {
             Type::List(inner) => {
                 Type::List(Box::new(Self::substitute_vars(inner, mapping)))
             }
+            Type::Range(inner) => Type::Range(Box::new(Self::substitute_vars(inner, mapping))),
             Type::Function(param, result) => Type::Function(
                 Box::new(Self::substitute_vars(param, mapping)),
                 Box::new(Self::substitute_vars(result, mapping)),
@@ -313,12 +531,19 @@ impl TypeChecker {
             Type::Tuple(items) => Type::Tuple(
                 items.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
             ),
-            Type::Record { fields, .. } => Type::closed_record(
-                fields
+            // `open` is carried: closing it here made every instantiation of a
+            // generalised `|c| c.help` demand a record with EXACTLY `help`, so
+            // `get_help({ help, value })` failed with "unexpected field `value`".
+            Type::Record { fields, open } => Type::Record {
+                fields: fields
                     .iter()
                     .map(|(n, t)| (n.clone(), Self::substitute_vars(t, mapping)))
                     .collect(),
-            ),
+                open: *open,
+            },
+            Type::Optional(inner) => {
+                Type::Optional(Box::new(Self::substitute_vars(inner, mapping)))
+            }
             Type::TagUnion { tags, open } => Type::TagUnion {
                 tags: tags
                     .iter()
@@ -353,7 +578,7 @@ impl TypeChecker {
                     out.push(*id);
                 }
             }
-            Type::List(inner) | Type::Nominal { backing: inner, .. } => {
+            Type::List(inner) | Type::Range(inner) | Type::Nominal { backing: inner, .. } => {
                 Self::type_vars_in(inner, out)
             }
             Type::Function(param, result) => {
@@ -384,15 +609,49 @@ impl TypeChecker {
     pub fn check(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
         let resolved = self.apply(expected);
 
+        // A string literal where a nominal with `from_quote` is expected IS that
+        // nominal: roc builds it by calling `from_quote`, and so does the compiler.
+        if let (Expr::Str(_, id), Type::Nominal { name, .. }) = (expr, &resolved) {
+            if self.has_method(name, "from_quote") {
+                self.converted.insert(*id, (name.clone(), "from_quote"));
+                return Ok(());
+            }
+        }
+        // An interpolated string where a nominal with `from_interpolation` is expected
+        // — or a `Try` of one, when that is what the method returns — is that call.
+        if let Expr::StrInterp(parts, id) = expr {
+            let target = match &resolved {
+                Type::Nominal { name, .. } => Some(name.clone()),
+                Type::TagUnion { tags, .. } => tags.iter().find(|(t, _)| t == "Ok").and_then(|(_, p)| match p.as_slice() {
+                    [Type::Nominal { name, .. }] => Some(name.clone()),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            if let Some(name) = target.filter(|n| self.has_method(n, "from_interpolation")) {
+                for part in parts {
+                    if let crate::ast::StrPart::Expr(inner) = part {
+                        self.synth(inner)?;
+                    }
+                }
+                let result = self.interpolation_result(&name).unwrap_or_else(|| resolved.clone());
+                self.unify(&result, &resolved)?;
+                self.converted.insert(*id, (name, "from_interpolation"));
+                return Ok(());
+            }
+        }
+
         match expr {
             // Numeric literals are POLYMORPHIC: `255` is a U8 in `x : U8`, an I64 in
             // `x : I64`. Synthesising them as I64 and unifying would reject every
             // annotation that is not I64.
-            Expr::Int(_, id) if resolved.is_numeric() => {
+            Expr::Int(n, id) if resolved.is_numeric() => {
+                self.literal_values.insert(*id, (*n, false));
                 self.literals.push((*id, resolved.clone()));
                 Ok(())
             }
-            Expr::Float(_, _, id) if resolved.is_fractional() => {
+            Expr::Float(_, exact, id) if resolved.is_fractional() => {
+                self.literal_values.insert(*id, (*exact, true));
                 self.literals.push((*id, resolved.clone()));
                 Ok(())
             }
@@ -422,6 +681,96 @@ impl TypeChecker {
                 self.unify(&actual, &resolved)
             }
 
+            // `iter.collect()` builds whatever it is CHECKED against, through that
+            // type's own `from_iter` — roc declares it
+            // `collect : Iter(item) -> output where [output.from_iter : ...]`.
+            // Synthesising alone gives a list, and `Set.to_list` on a list then has no
+            // nominal to match. Whether the nominal really HAS a `from_iter` is left to
+            // the compiler, which has the definitions; a name with none falls back to
+            // the builtin `collect` exactly as before.
+            Expr::Dispatch { method: "collect", id, .. }
+                if matches!(&resolved, Type::Nominal { .. }) =>
+            {
+                let Type::Nominal { name, .. } = &resolved else { unreachable!("matched") };
+                self.collect_targets.insert(*id, name.clone());
+                let actual = self.synth(expr)?;
+                let _ = self.unify(&actual, &resolved);
+                Ok(())
+            }
+
+            // `{}` against a record (or nominal over one) whose every field is
+            // optional or defaulted: the unit is that record with all fields omitted,
+            // filled at construction. The nominal name lets the compiler find the
+            // defaults; an anonymous record fills its optionals with `<missing>`.
+            Expr::Unit(id)
+                if self.omittable_record(&resolved).is_some() =>
+            {
+                let (nominal, fields) = self.omittable_record(&resolved).expect("guarded");
+                if let Some(name) = nominal {
+                    self.default_sites.insert(*id, name.to_string());
+                } else {
+                    self.missing_fields.insert(*id, fields);
+                }
+                Ok(())
+            }
+
+            // A call's expectation belongs to its RESULT, and pushing it there BEFORE
+            // the arguments are checked is what lets `{}` reach a nominal's defaults
+            // through a generic function: `value : Config = id({})` resolves `id`'s
+            // type variable to `Config` first, so the unit is checked against the
+            // nominal rather than against a bare variable and left as a bare `{}`.
+            // Qualified calls keep their own synth path, which types builtins.
+            Expr::Call { func, args, .. } if !args.is_empty() => {
+                // A builtin or method is typed by its DECLARED signature rather than
+                // by synthesising the qualified name, which has no type of its own.
+                let callee = match &**func {
+                    Expr::Qualified { module, name, .. } => {
+                        match self.declared(module, name) {
+                            Some(signature) => signature,
+                            // No signature: the builtin table types this one, and it
+                            // does so only from the call as a whole.
+                            None => {
+                                let actual = self.synth(expr)?;
+                                return self.unify(&actual, &resolved);
+                            }
+                        }
+                    }
+                    _ => self.synth(func)?,
+                };
+                let peeled = Self::peel_params(&self.apply(&callee), args.len());
+                match peeled {
+                    Some((params, result)) => {
+                        self.unify(&result, &resolved)?;
+                        // `List.with_capacity(n)` of a zero-sized element never
+                        // allocates, so roc reports its capacity as 0.
+                        if matches!(&**func, Expr::Qualified { module: "List", name: "with_capacity", .. }) {
+                            if let Type::List(elem) = self.apply(&resolved) {
+                                if Self::zero_sized(&elem) {
+                                    self.zero_sized_capacity.insert(expr.id());
+                                }
+                            }
+                        }
+                        for (arg, ty) in args.iter().zip(params.iter()) {
+                            let ty = self.apply(ty);
+                            self.check(arg, &ty)?;
+                        }
+                        // As the fallback arm does: a generic call whose result is a
+                        // nominal that converts literals hands back a raw literal at
+                        // run time, and the conversion happens at this node.
+                        if let Type::Nominal { name, .. } = &resolved {
+                            if self.converts_literals(&resolved) {
+                                self.coerce_values.insert(expr.id(), name.clone());
+                            }
+                        }
+                        Ok(())
+                    }
+                    None => {
+                        let actual = self.synth(expr)?;
+                        self.unify(&actual, &resolved)
+                    }
+                }
+            }
+
             // A nominal construction knows its own field types better than whatever it
             // is being checked against — an open record grown from field reads names
             // only the fields that were read. Synthesising routes it through the
@@ -444,30 +793,101 @@ impl TypeChecker {
             // of fixed-point values, not of integers.
             Expr::List(items, _) if matches!(resolved, Type::List(_)) => {
                 let Type::List(element) = &resolved else { unreachable!("matched") };
+                let element = (**element).clone();
                 for item in items {
-                    self.check(item, element)?;
+                    self.check(item, &element)?;
                 }
                 Ok(())
             }
+            // Both branches of an `if` are checked against the expected type rather
+            // than joined and then unified: `if c { a: 5 } else {}` against
+            // `{ a ?: U8 }` checks `{ a: 5 }` and `{}` each against the optional-field
+            // record, where joining them (a record with `{}`) would fail.
+            Expr::If { condition, then_branch, otherwise, .. } => {
+                let cond = self.synth(condition)?;
+                self.unify(&cond, &Type::Bool)?;
+                self.check(then_branch, &resolved)?;
+                self.check(otherwise, &resolved)
+            }
+            // Each arm body checked against the expected type — so a `|_| {}` lambda
+            // (whose `_` param wraps the body in a match) checks its `{}` against the
+            // annotated result rather than synthesising it to a bare unit. Still
+            // exhaustiveness-checked, via the shared helper.
+            Expr::Match { scrutinee, arms, .. } => {
+                let scrutinee_type = self.synth(scrutinee)?;
+                for arm in arms {
+                    for pattern in &arm.patterns {
+                        // `{ age: Ok(v) }` against `{ age ?: U8 }`: the sub-pattern
+                        // reads the optional field as `Ok`/`Err`, which `bind_pattern`
+                        // types; a structural unify would demand a `U8` there.
+                        if self.reads_optional_fields(pattern, &scrutinee_type) {
+                            continue;
+                        }
+                        let pat = self.pattern_type(pattern)?;
+                        self.unify(&scrutinee_type, &pat)?;
+                    }
+                    self.push_scope();
+                    let resolved_scrut = self.apply(&scrutinee_type);
+                    for pattern in &arm.patterns {
+                        self.bind_pattern(pattern, &resolved_scrut);
+                    }
+                    let outcome = (|c: &mut Self| -> Result<(), TypeError> {
+                        if let Some(guard) = &arm.guard {
+                            let g = c.synth(guard)?;
+                            c.unify(&g, &Type::Bool)?;
+                        }
+                        c.check(&arm.body, &resolved)
+                    })(self);
+                    self.pop_scope();
+                    outcome?;
+                }
+                self.check_exhaustive(arms, &scrutinee_type)
+            }
 
-            // Every field against what the record declares for it, so a literal in one
-            // takes its type from the annotation rather than defaulting.
-            Expr::Record(written, _) if matches!(resolved, Type::Record { .. }) => {
-                let (declared, open) = match &resolved {
-                    Type::Record { fields, open } => (fields.clone(), *open),
-                    _ => unreachable!("matched"),
-                };
+
+            Expr::Record(written, id)
+                if matches!(self.record_backing(&resolved), Some(_)) =>
+            {
+                let (declared, open) = self.record_backing(&resolved).expect("guarded");
+                // A nominal whose omitted fields are all optional/defaulted: the
+                // compiler fills them from the nominal's defaults.
+                if let Type::Nominal { name, .. } = &resolved {
+                    let omitted_ok = declared.iter().all(|(field, ty)| {
+                        written.iter().any(|(w, _)| w == field)
+                            || matches!(ty, Type::Optional(_))
+                            || self.defaulted.get(name).is_some_and(|d| d.contains(field))
+                    });
+                    if omitted_ok {
+                        self.default_sites.insert(*id, name.clone());
+                    }
+                }
+                let left_out: Vec<String> = declared
+                    .iter()
+                    .filter(|(name, ty)| {
+                        matches!(ty, Type::Optional(_)) && !written.iter().any(|(w, _)| w == name)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                if !left_out.is_empty() {
+                    self.missing_fields.insert(*id, left_out);
+                }
                 for (name, value) in written {
                     match declared.iter().find(|(field, _)| field == name) {
                         Some((_, ty)) => {
                             let ty = ty.clone();
                             self.check(value, &ty)?;
                         }
-                        // Checking the fields it HAS is not checking the record:
-                        // an unexpected field is still a mismatch, and a required one
-                        // left out is too.
+                        // An OPEN row promises only the fields it lists, so a field
+                        // the literal adds GROWS it — the same rule field access
+                        // applies. Without this `set = |r| { ..r, a: 2 }` kept a row
+                        // of just `a`, and `set({ a: 1, b: "x" }).b` had no `b`.
                         None if open => {
-                            self.synth(value)?;
+                            let extra = self.synth(value)?;
+                            let mut grown = declared.clone();
+                            grown.push((name.to_string(), extra));
+                            grown.sort_by(|a, b| a.0.cmp(&b.0));
+                            let grown = Type::Record { fields: grown, open: true };
+                            self.subst.rebind(&resolved, grown);
                         }
                         None => {
                             self.synth(value)?;
@@ -481,19 +901,26 @@ impl TypeChecker {
                         }
                     }
                 }
-                for (name, ty) in &declared {
-                    if written.iter().any(|(field, _)| field == name) {
+                let nominal_name = match &resolved {
+                    Type::Nominal { name, .. } => Some(name.clone()),
+                    _ => None,
+                };
+                for (field, ty) in &declared {
+                    if written.iter().any(|(w, _)| w == field) || matches!(ty, Type::Optional(_)) {
                         continue;
                     }
-                    if !matches!(ty, Type::Optional(_)) {
-                        return Err(TypeError {
-                            message: format!("Record is missing field `{}`", name),
-                            expected: resolved.to_string(),
-                            actual: "a record without it".to_string(),
-                            line: 0,
-                            col: 0,
-                        });
+                    // A DEFAULTED field of a nominal may be omitted — it materializes
+                    // at construction; only a genuinely required field is an error.
+                    if nominal_name.as_ref().is_some_and(|n| self.defaulted.get(n).is_some_and(|d| d.contains(field))) {
+                        continue;
                     }
+                    return Err(TypeError {
+                        message: format!("Record is missing field `{}`", field),
+                        expected: resolved.to_string(),
+                        actual: "a record without it".to_string(),
+                        line: 0,
+                        col: 0,
+                    });
                 }
                 Ok(())
             }
@@ -522,6 +949,32 @@ impl TypeChecker {
             // literal inside one takes its type from the union: `Ok(147.66…)` against
             // `Try(Dec, …)` is a fixed-point value, not a float.
             Expr::Tag { name, args, .. } if matches!(resolved, Type::TagUnion { .. }) => {
+                // An IMPORTED nominal's constructor checked against a row the caller
+                // merely inferred — `lookup(MyTag.Foo({ x: 42 }))`, where `lookup`'s
+                // parameter is known only to be `[Foo(a), ..]` — takes its payload
+                // types from the DECLARATION. Without this the `42` is checked against
+                // a bare variable and defaults to `Dec`. Only when the row says nothing
+                // about the payload, so this can add information but never contradict.
+                // An OPEN row is one the checker inferred from uses, not one the
+                // program declared, so the declaration is the better authority. A
+                // CLOSED union came from an annotation and keeps its own types.
+                let row_is_inferred = matches!(&resolved, Type::TagUnion { tags, open: true }
+                    if tags.iter().any(|(t, payload)| t == name && payload.len() == args.len()));
+                if row_is_inferred && !args.is_empty() && !matches!(*name, "Ok" | "Err" | "True" | "False") {
+                    if let Some(declared) = self.nominal_declaring_tag(name, args.len()) {
+                        let backing = match &declared {
+                            Type::Nominal { backing, .. } => (**backing).clone(),
+                            other => other.clone(),
+                        };
+                        // Guarded against re-entering this arm forever: the recursive
+                        // check arrives with the declaration as its expectation, and
+                        // that row is no longer blank.
+                        if backing != resolved {
+                            self.check(expr, &backing)?;
+                            return self.unify(&declared, &resolved);
+                        }
+                    }
+                }
                 let Type::TagUnion { tags, .. } = &resolved else { unreachable!("matched") };
                 match tags.iter().find(|(tag, _)| tag == name) {
                     Some((_, declared)) if declared.len() == args.len() => {
@@ -553,6 +1006,20 @@ impl TypeChecker {
                 };
                 match Self::peel_params(&resolved, arity) {
                     Some((param_types, result_type)) => {
+                        // A parameter declared as a nominal with a literal conversion
+                        // may receive a raw literal from a generic caller.
+                        let coerce: Vec<(usize, String)> = param_types
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, t)| self.converts_literals(&self.apply(t)))
+                            .map(|(i, t)| match self.apply(t) {
+                                Type::Nominal { name, .. } => (i, name),
+                                _ => unreachable!("filtered"),
+                            })
+                            .collect();
+                        if !coerce.is_empty() {
+                            self.coerce_params.insert(expr.id(), coerce);
+                        }
                         self.push_scope();
                         for (param, ty) in params.iter().zip(param_types.iter()) {
                             self.bind(param, ty.clone());
@@ -577,9 +1044,34 @@ impl TypeChecker {
                     }
                 }
             }
+            // A BLOCK's value is its last expression, so the expectation belongs there:
+            // `f : a -> a` with `f = |x| { unused = 0  … }` must check the tail against
+            // `a`, not synthesise the block and compare afterwards — by then the arms
+            // of a `match` in that tail have already agreed among themselves.
+            Expr::Let { name, annotation, value, body, .. } => {
+                self.check_let(name, annotation, value)?;
+                let bound = self.lookup(name);
+                self.push_scope();
+                if let Some(ty) = bound {
+                    self.bind(name, ty);
+                }
+                let outcome = self.check(body, &resolved);
+                self.pop_scope();
+                outcome
+            }
             _ => {
                 let actual = self.synth(expr)?;
-                self.unify(&actual, &resolved)
+                self.unify(&actual, &resolved)?;
+                // Not a literal, so nothing converts it here; a raw literal can still
+                // arrive at run time through a generic body, and is converted then.
+                if let Type::Nominal { name, .. } = &resolved {
+                    if self.converts_literals(&resolved)
+                        && !matches!(expr, Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::StrInterp(..))
+                    {
+                        self.coerce_values.insert(expr.id(), name.clone());
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -593,10 +1085,163 @@ impl TypeChecker {
     /// default to — an unresolved numeral still has a method block.
     fn module_named(&self, ty: &Type) -> Option<&'static str> {
         if let Type::TypeVar(v) = ty {
-            // A numeral nothing pinned down defaults to `Dec`.
+            // A numeral nothing pinned down defaults to `Dec`, a string literal to `Str`.
+            if self.quote_vars.contains(v) {
+                return Some("Str");
+            }
             return self.numeral_vars.contains(v).then_some("Dec");
         }
         module_of(ty)
+    }
+
+    /// What a numeric module's method gives back, read off its name.
+    ///
+    /// `Builtin.roc` declares every one of these per width, and loading the `Num`
+    /// member for its signatures costs sixteen milliseconds a run; the names carry
+    /// enough. `F64.pow(2.0, 3.0)` is an F64, `U8.is_even(n)` a Bool, `U8.to_i64(n)`
+    /// an I64. A `_try`, `order_relative_to` or anything unrecognised stays
+    /// unconstrained, exactly as before.
+    /// The one nominal whose backing tag union declares `tag` with `arity` payload
+    /// slots, if exactly one does. `None` when none or several do — a name two types
+    /// share says nothing about which was meant, and only roc's own module resolution
+    /// could tell them apart.
+    fn nominal_declaring_tag(&mut self, tag: &str, arity: usize) -> Option<Type> {
+        let candidates: Vec<Type> = self
+            .declared_types
+            .values()
+            .filter(|decl| matches!(decl, Type::Nominal { .. }))
+            .cloned()
+            .collect();
+        let mut found: Option<Type> = None;
+        for decl in candidates {
+            let expanded = self.expand(&decl, &mut Vec::new());
+            let Type::Nominal { backing, .. } = &expanded else { continue };
+            let Type::TagUnion { tags, .. } = &**backing else { continue };
+            if !tags.iter().any(|(n, payload)| n == tag && payload.len() == arity) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(expanded);
+        }
+        let declared = found?;
+        // FRESH variables per construction, as a `Name.{ … }` literal gets.
+        let mut generics = Vec::new();
+        Self::type_vars_in(&declared, &mut generics);
+        generics.sort_unstable();
+        generics.dedup();
+        Some(if generics.is_empty() { declared } else { self.instantiate(&declared, &generics) })
+    }
+
+    /// A nominal whose backing is a tag union containing every tag in `ty` and which
+    /// declares `method`: the nominal an imported or bare-tag constructor stands for.
+    fn nominal_for_tags(&mut self, ty: &Type, method: &str) -> Option<Type> {
+        let Type::TagUnion { tags, .. } = ty else { return None };
+        let names: Vec<&str> = tags.iter().map(|(n, _)| n.as_str()).collect();
+        let candidates: Vec<Type> = self
+            .declared_types
+            .values()
+            .filter(|decl| matches!(decl, Type::Nominal { .. }))
+            .cloned()
+            .collect();
+        for decl in candidates {
+            let Type::Nominal { ref name, .. } = decl else { continue };
+            let expanded = self.expand(&decl, &mut Vec::new());
+            let backing_tags = match &expanded {
+                Type::Nominal { backing, .. } => match &**backing {
+                    Type::TagUnion { tags, .. } => tags.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            if names.iter().all(|n| backing_tags.iter().any(|b| b == n)) && self.declared(name, method).is_some() {
+                return Some(decl);
+            }
+        }
+        None
+    }
+
+    fn numeric_result(&mut self, declared: &Type, name: &str) -> Option<Type> {
+        if name.starts_with("is_") || name.ends_with("_overflows") {
+            return Some(Type::Bool);
+        }
+        // `n.range_exclusive_to(m)` and its three siblings build a range of the
+        // receiver's numeric type.
+        if matches!(name, "range_exclusive_to" | "range_inclusive_to" | "range_exclusive_from" | "range_inclusive_from") {
+            return Some(Type::Range(Box::new(declared.clone())));
+        }
+        if name == "from_bits" || name == "from_attos" {
+            return Some(declared.clone());
+        }
+        // `to_i8_try`, `round_to_i32_try`, `sqrt_try`, `plus_try`: a `Try` whose `Ok`
+        // is the conversion's target, or the module's own type.
+        if let Some(rest) = name.strip_suffix("_try") {
+            let rest = rest
+                .strip_prefix("round_")
+                .or_else(|| rest.strip_prefix("floor_"))
+                .or_else(|| rest.strip_prefix("ceiling_"))
+                .unwrap_or(rest);
+            let ok = match Self::conversion_type(rest) {
+                Some(target) => target,
+                None if rest.starts_with("to_") || rest.starts_with("from_") => return None,
+                None => declared.clone(),
+            };
+            return Some(Type::TagUnion {
+                tags: vec![("Err".to_string(), vec![self.fresh_var()]), ("Ok".to_string(), vec![ok])],
+                open: true,
+            });
+        }
+        if name.starts_with("from_") || name.starts_with("range_") {
+            return None;
+        }
+        if name == "to_bits" {
+            return Some(if matches!(declared, Type::F32) { Type::U32 } else { Type::U64 });
+        }
+        if name == "to_attos" {
+            return Some(Type::I128);
+        }
+        // `round_to_i128`, `floor_to_i32`: a conversion after a rounding.
+        let bare = name
+            .strip_prefix("round_")
+            .or_else(|| name.strip_prefix("floor_"))
+            .or_else(|| name.strip_prefix("ceiling_"))
+            .unwrap_or(name);
+        if bare.starts_with("to_") {
+            return Self::conversion_type(bare);
+        }
+        match name {
+            "order_relative_to" | "to_hash" | "highest" | "lowest" => None,
+            _ => Some(declared.clone()),
+        }
+    }
+
+    /// The target type of a `to_…` conversion name, `_wrap` or not: `to_u8` is a U8.
+    fn conversion_type(name: &str) -> Option<Type> {
+        let target = name.strip_prefix("to_")?;
+        let target = target.strip_suffix("_wrap").unwrap_or(target);
+        let module = match target {
+            "u8" => "U8", "u16" => "U16", "u32" => "U32", "u64" => "U64", "u128" => "U128",
+            "i8" => "I8", "i16" => "I16", "i32" => "I32", "i64" => "I64", "i128" => "I128",
+            "f32" => "F32", "f64" => "F64", "dec" => "Dec",
+            _ => return None,
+        };
+        type_named(module)
+    }
+
+    /// Give every argument that is still an unpinned numeral the type `ty`.
+    ///
+    /// For a numeric method with no declared signature. An argument that anything else
+    /// already typed is left alone, so a declared `U8` shift count on a `U32` receiver
+    /// stays a `U8`.
+    fn pin_numerals_to(&mut self, ty: &Type, args: &[Type]) {
+        for arg in args {
+            if let Type::TypeVar(v) = self.apply(arg) {
+                if self.numeral_vars.contains(&v) {
+                    let _ = self.unify(ty, arg);
+                }
+            }
+        }
     }
 
     /// The type of `name` read as a sibling of the method being checked.
@@ -614,7 +1259,9 @@ impl TypeChecker {
     fn default_numerals(&self, ty: &Type, numerals: &std::collections::HashSet<u32>) -> Type {
         match ty {
             Type::TypeVar(v) if numerals.contains(v) => Type::Dec,
+            Type::TypeVar(v) if self.quote_vars.contains(v) => Type::Str,
             Type::List(inner) => Type::List(Box::new(self.default_numerals(inner, numerals))),
+            Type::Range(inner) => Type::Range(Box::new(self.default_numerals(inner, numerals))),
             Type::Optional(inner) => {
                 Type::Optional(Box::new(self.default_numerals(inner, numerals)))
             }
@@ -656,6 +1303,61 @@ impl TypeChecker {
     }
 
     /// Tell the checker which record literals were written as a nominal construction.
+    /// A record type, or a nominal over one, as `(fields, open)`.
+    fn record_backing(&self, ty: &Type) -> Option<(Vec<(String, Type)>, bool)> {
+        match ty {
+            Type::Record { fields, open } => Some((fields.clone(), *open)),
+            Type::Nominal { backing, .. } => match &**backing {
+                Type::Record { fields, open } => Some((fields.clone(), *open)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// If `ty` is a record (or nominal over one) that a `{}` may build — every field
+    /// optional or, for a nominal, defaulted — the nominal name (if any) and the
+    /// optional field names to fill with `<missing>` for the anonymous case.
+    fn omittable_record(&self, ty: &Type) -> Option<(Option<&'static str>, Vec<String>)> {
+        let (fields, _) = self.record_backing(ty)?;
+        if fields.is_empty() {
+            return None;
+        }
+        match ty {
+            Type::Nominal { name, .. } => {
+                let ok = fields.iter().all(|(field, t)| {
+                    matches!(t, Type::Optional(_))
+                        || self.defaulted.get(name).is_some_and(|d| d.contains(field))
+                });
+                ok.then(|| (Some(crate::memory::string_pool::intern(name)), Vec::new()))
+            }
+            _ => {
+                let all_optional = fields.iter().all(|(_, t)| matches!(t, Type::Optional(_)));
+                all_optional.then(|| (None, fields.iter().map(|(n, _)| n.clone()).collect()))
+            }
+        }
+    }
+
+    /// Tell the checker which fields of each nominal are defaulted, so a `{}` or
+    /// partial record against it may omit them (they materialize at construction).
+    pub fn declare_defaults(&mut self, defaults: &[(String, Vec<(String, crate::ast::Expr)>)]) {
+        for (name, fields) in defaults {
+            self.defaulted
+                .entry(name.clone())
+                .or_default()
+                .extend(fields.iter().map(|(f, _)| f.clone()));
+        }
+    }
+
+    /// Record/unit literal nodes that build a nominal with omitted defaulted/optional
+    /// fields; see `default_sites`.
+    pub fn default_sites(&self) -> std::collections::HashMap<crate::ast::NodeId, &'static str> {
+        self.default_sites
+            .iter()
+            .map(|(id, name)| (*id, crate::memory::string_pool::intern(name)))
+            .collect()
+    }
+
     pub fn declare_nominal_literals(&mut self, literals: &[(crate::ast::NodeId, Type)]) {
         self.nominal_literals.extend(literals.iter().cloned());
     }
@@ -670,6 +1372,68 @@ impl TypeChecker {
     /// Instantiated fresh at every use, so two calls to `Dict.empty()` do not unify
     /// with each other.
     fn declared(&mut self, module: &str, method: &str) -> Option<Type> {
+        // `Range`'s own constructor and iterator over a THIRD-PARTY numeric type. Given
+        // ahead of the `Range` → `List` alias below so a `Range.custom` config pins its
+        // numbers to the range's element (`Range(Distance)` → `Distance`), which the
+        // `List` alias would leave as an unconstrained default. `iter`/`fold`/`map` for
+        // an integer range still fall through to `List`.
+        if module == "Range" && !self.declared_types.contains_key("Range") {
+            let num = self.fresh_var();
+            let range = Type::Nominal { name: "Range".to_string(), backing: Box::new(num.clone()) };
+            let closed = |tags: Vec<(String, Vec<Type>)>| Type::TagUnion { tags, open: false };
+            let len_hint = closed(vec![
+                ("Known".to_string(), vec![Type::U64]),
+                ("Unknown".to_string(), vec![]),
+            ]);
+            match method {
+                "custom" => {
+                    let config = Type::Record {
+                        fields: vec![
+                            ("lower".to_string(), num.clone()),
+                            ("upper".to_string(), num.clone()),
+                            ("step".to_string(), num.clone()),
+                            ("upper_bound".to_string(), closed(vec![
+                                ("Exclusive".to_string(), vec![]),
+                                ("Inclusive".to_string(), vec![]),
+                            ])),
+                            ("direction".to_string(), closed(vec![
+                                ("From".to_string(), vec![]),
+                                ("To".to_string(), vec![]),
+                            ])),
+                            ("len_if_known".to_string(), len_hint.clone()),
+                        ],
+                        open: false,
+                    };
+                    return Some(Type::Function(Box::new(config), Box::new(range)));
+                }
+                "iter" | "iter_rev" => {
+                    return Some(Type::Function(Box::new(range), Box::new(Type::List(Box::new(num)))));
+                }
+                "size_hint" => {
+                    return Some(Type::Function(Box::new(range), Box::new(len_hint)));
+                }
+                _ => {}
+            }
+        }
+        // An `Iter` is the list it walks, so `Iter.fold(it, 0, f)` is checked against
+        // `List.fold`'s signature — which is what tells `f` its element type. Unless
+        // the program declares an `Iter` of its own, whose methods are its own.
+        let module = if matches!(module, "Iter" | "Range") && !self.declared_types.contains_key(module) {
+            "List"
+        } else {
+            module
+        };
+        // `Numeral`, as `Builtin.roc` declares it for a custom `from_numeral`.
+        if module == "Numeral" {
+            let numeral = self.nominal_named("Numeral");
+            let result = match method {
+                "is_negative" => Type::Bool,
+                "digits_before_pt" | "digits_after_pt" => Type::List(Box::new(Type::U8)),
+                "digits_after_pt_count" => Type::U64,
+                _ => return None,
+            };
+            return Some(Type::Function(Box::new(numeral), Box::new(result)));
+        }
         let qualified = format!("{}.{}", module, method);
         if let Some(ty) = self.lookup(&qualified) {
             return Some(ty);
@@ -726,6 +1490,11 @@ impl TypeChecker {
     /// A receiver with no module — a bare record, a tag union, a variable a `where`
     /// clause covers — is simply absent, and the compiler falls back to what it did
     /// before: the single candidate by name, or a runtime dispatch on the value.
+    /// See the `collect_targets` field.
+    pub fn collect_targets(&self) -> std::collections::HashMap<crate::ast::NodeId, String> {
+        self.collect_targets.clone()
+    }
+
     pub fn dispatch_modules(
         &self,
     ) -> std::collections::HashMap<crate::ast::NodeId, &'static str> {
@@ -761,10 +1530,384 @@ impl TypeChecker {
     }
 
     pub fn dec_literals(&self) -> std::collections::HashSet<crate::ast::NodeId> {
+        self.literals_typed(&Type::Dec)
+    }
+
+    /// See `overflowed_literals`.
+    pub fn declare_overflowed_literals(&mut self, ids: impl IntoIterator<Item = crate::ast::NodeId>) {
+        self.overflowed_literals.extend(ids);
+    }
+
+    /// A top-level CONSTANT that cannot be built without crashing.
+    ///
+    /// roc folds every top-level constant at compile time, so a `crash` in one is
+    /// reported then — used or not. A FUNCTION is not folded (its body runs only when
+    /// called), and the PROGRAM's own value is what the run is for, so its crash is a
+    /// crash. Only an unconditional crash counts: one behind an `if` or a `match` may
+    /// never be reached.
+    pub fn comptime_crash_problems(&self, ast: &Expr, is_program: bool) -> Option<String> {
+        fn unconditional(expr: &Expr) -> bool {
+            match expr {
+                Expr::Crash(..) => true,
+                Expr::Let { value, body, .. } | Expr::VarDecl { value, body, .. } => {
+                    unconditional(value) || unconditional(body)
+                }
+                _ => false,
+            }
+        }
+        // The program's value: the name the trailing expression reads, if any.
+        let mut cursor = ast;
+        while let Expr::Let { body, .. } | Expr::VarDecl { body, .. } = cursor {
+            cursor = body;
+        }
+        // A MODULE's trailing expression is just its last binding — nothing runs it —
+        // so only the program's own answer is exempt.
+        let answer = match cursor {
+            Expr::Ident(name, _) if is_program => Some(*name),
+            _ => None,
+        };
+        let mut cursor = ast;
+        while let Expr::Let { name, value, body, .. } = cursor {
+            // `_` is a bare STATEMENT, not a constant: `{ crash "…"  identity }` runs
+            // the crash, it does not fail to build a definition.
+            if *name != "_"
+                && Some(*name) != answer
+                && !matches!(&**value, Expr::Lambda { .. })
+                && unconditional(value)
+            {
+                return Some(format!(
+                    "`{}` cannot be built: it crashes, and roc evaluates a top-level                      constant at compile time",
+                    name
+                ));
+            }
+            cursor = body;
+        }
+        // The program's ANSWER decided by a constant condition. roc folds it at
+        // compile time and reports the branch that was never taken; with the answer
+        // itself settled that way, the branch is dead code in the finished program
+        // rather than a path some input could reach. Only the answer's own binding
+        // counts: a constant condition anywhere else still runs, and the suite expects
+        // the value it produces.
+        // Only a module's `main`: that is the top-level constant roc folds, so its
+        // untaken branch is dead in the finished program. A binding inside an
+        // expression is an ordinary local — `x = if True { … } else { … }` then `x`
+        // still runs, and the suite expects its value.
+        if let Some(answer) = answer.filter(|name| *name == "main") {
+            let mut cursor = ast;
+            while let Expr::Let { name, value, body, .. } = cursor {
+                if *name == answer {
+                    let dead = match &**value {
+                        Expr::If { condition, .. } => matches!(&**condition, Expr::Bool(..)),
+                        Expr::Match { scrutinee, arms, .. } => {
+                            matches!(&**scrutinee, Expr::Bool(..)) && arms.len() > 1
+                        }
+                        _ => false,
+                    };
+                    if dead {
+                        return Some(format!(
+                            "`{}` is decided at compile time, and the branch not taken is unreachable",
+                            answer
+                        ));
+                    }
+                }
+                cursor = body;
+            }
+        }
+        None
+    }
+
+    /// A builtin that needs to know what it is LOOKING at, handed something whose type
+    /// is still open — `Str.inspect([])`, `List.sum([])`. roc calls that an unresolved
+    /// polymorphic value and refuses it: there is no element type to render or to add,
+    /// and nothing later can supply one because the call is the whole use.
+    ///
+    /// Only at the TOP LEVEL. Inside a lambda the same open type is an ordinary
+    /// parameter — `show = |x| Str.inspect(x)` is a generic function, not a mistake —
+    /// and only the call site says what it holds.
+    fn note_polymorphic_use(&mut self, method: &str, receiver: Option<&Type>, args: &[Type]) {
+        if self.lambda_depth > 0 || !matches!(method, "inspect" | "sum" | "product") {
+            return;
+        }
+        let subject = receiver.cloned().or_else(|| args.first().cloned());
+        let Some(subject) = subject else { return };
+        // A NUMERAL is not open: nothing pinned it, so it is a `Dec`.
+        let open = |ty: &Type, numerals: &std::collections::HashSet<u32>| {
+            matches!(ty, Type::TypeVar(v) if !numerals.contains(v))
+        };
+        let resolved = self.apply(&subject);
+        let unresolved = match (&resolved, method) {
+            (Type::List(element), _) => open(&self.apply(element), &self.numeral_vars),
+            (other, "inspect") => open(other, &self.numeral_vars),
+            _ => false,
+        };
+        if unresolved {
+            self.poly_problems.push(format!(
+                "`{}` needs to know what it is given, and this value's type is still open",
+                method
+            ));
+        }
+    }
+
+    /// The variables of an annotated function's RESULT that its body may not pin.
+    ///
+    /// Only a bare variable, and only one that also appears among the PARAMETERS: a
+    /// result the caller can reach no other way — `Dict.empty() -> Dict(k, v)` — is
+    /// the function's own to build.
+    fn rigid_result(&self, instance: &Type) -> Vec<u32> {
+        if !self.where_methods.is_empty() {
+            return Vec::new();
+        }
+        let mut params = Vec::new();
+        let mut cursor = instance;
+        while let Type::Function(param, result) = cursor {
+            params.push((**param).clone());
+            cursor = result;
+        }
+        let Type::TypeVar(v) = cursor else { return Vec::new() };
+        let mut in_params = Vec::new();
+        for param in &params {
+            Self::type_vars_in(param, &mut in_params);
+        }
+        if in_params.contains(v) { vec![*v] } else { Vec::new() }
+    }
+
+    /// See `note_polymorphic_use`.
+    pub fn polymorphic_problems(&self) -> Option<String> {
+        self.poly_problems.first().cloned()
+    }
+
+    /// A declaration roc refuses: a union naming a tag twice, a record naming a
+    /// field twice.
+    pub fn declaration_problems(&self) -> Option<String> {
+        for (name, ty) in &self.declared_types {
+            let backing = match ty {
+                Type::Nominal { backing, .. } => &**backing,
+                other => other,
+            };
+            let names: Vec<&String> = match backing {
+                Type::TagUnion { tags, .. } => tags.iter().map(|(t, _)| t).collect(),
+                Type::Record { fields, .. } => fields.iter().map(|(f, _)| f).collect(),
+                _ => continue,
+            };
+            let mut seen = std::collections::HashSet::new();
+            for member in names {
+                if !seen.insert(member) {
+                    return Some(format!("`{}` names `{}` twice", name, member));
+                }
+            }
+        }
+        None
+    }
+
+    /// Record literals with optional fields left out, and which; see `missing_fields`.
+    pub fn missing_fields(&self) -> std::collections::HashMap<crate::ast::NodeId, Vec<&'static str>> {
+        self.missing_fields
+            .iter()
+            .map(|(id, names)| {
+                (*id, names.iter().map(|n| &*Box::leak(n.clone().into_boxed_str()) as &'static str).collect())
+            })
+            .collect()
+    }
+
+    /// Every literal that builds a nominal, with the nominal and the conversion:
+    /// `(node, (nominal, "from_quote" | "from_numeral" | "from_interpolation"))`. The
+    /// ones decided while checking, plus every literal inference later resolved to
+    /// such a nominal.
+    pub fn literal_conversions(
+        &self,
+    ) -> std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)> {
+        let mut out: std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)> = self
+            .converted
+            .iter()
+            .map(|(id, (name, method))| (*id, (Self::leak(name), *method)))
+            .collect();
+        let resolved = |ty: &Type| match self.apply(ty) {
+            Type::Nominal { name, .. } => Some(name),
+            _ => None,
+        };
+        for (id, ty) in &self.literals {
+            if let Some(name) = resolved(ty).filter(|n| self.has_method(n, "from_numeral")) {
+                out.entry(*id).or_insert((Self::leak(&name), "from_numeral"));
+            }
+        }
+        for (literals, first, second) in [
+            (&self.str_literals, "from_quote", "from_interpolation"),
+            (&self.interp_literals, "from_interpolation", "from_quote"),
+        ] {
+            for (id, ty) in literals {
+                let Some(name) = resolved(ty) else { continue };
+                let method = [first, second].into_iter().find(|m| self.has_method(&name, m));
+                if let Some(method) = method {
+                    out.entry(*id).or_insert((Self::leak(&name), method));
+                }
+            }
+        }
+        out
+    }
+
+    /// Expressions the compiler converts at run time if a raw literal reaches them;
+    /// see `coerce_values`.
+    pub fn coerce_values(&self) -> std::collections::HashMap<crate::ast::NodeId, &'static str> {
+        self.coerce_values.iter().map(|(id, name)| (*id, Self::leak(name))).collect()
+    }
+
+    /// Lambda parameters the compiler converts at entry; see `coerce_params`.
+    pub fn coerce_params(
+        &self,
+    ) -> std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>> {
+        self.coerce_params
+            .iter()
+            .map(|(id, params)| (*id, params.iter().map(|(i, n)| (*i, Self::leak(n))).collect()))
+            .collect()
+    }
+
+    /// Each `match` whose scrutinee's type mentions a nominal with a literal
+    /// conversion, resolved: a literal pattern there is that conversion and the
+    /// nominal's `is_eq`.
+    /// `for` loop nodes whose iterable is a nominal iterated via its `iter` method.
+    pub fn for_iter_calls(&self) -> std::collections::HashSet<crate::ast::NodeId> {
+        self.for_iter_calls.clone()
+    }
+
+    pub fn match_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
+        self.matches
+            .iter()
+            .map(|(id, ty)| (*id, self.apply(ty)))
+            .filter(|(_, ty)| self.mentions_conversion(ty))
+            .collect()
+    }
+
+    fn mentions_conversion(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Nominal { backing, .. } => self.converts_literals(ty) || self.mentions_conversion(backing),
+            Type::List(inner) | Type::Optional(inner) => self.mentions_conversion(inner),
+            Type::Tuple(items) => items.iter().any(|t| self.mentions_conversion(t)),
+            Type::Record { fields, .. } => fields.iter().any(|(_, t)| self.mentions_conversion(t)),
+            Type::TagUnion { tags, .. } => tags.iter().any(|(_, p)| p.iter().any(|t| self.mentions_conversion(t))),
+            _ => false,
+        }
+    }
+
+    /// A literal that does not fit the type inference gave it: `256` as a `U8`, `1.5`
+    /// as an `I64`, a `Dec` past its bounds. roc refuses these at compile time, and
+    /// so does this, once every type is known.
+    /// A `to_inspect` method must return `Str` — roc refuses one that does not. Run
+    /// after the program is synthesised, so its methods are in scope.
+    pub fn method_problems(&self) -> Option<String> {
+        for scope in &self.env {
+            for (name, ty, _) in scope {
+                if !name.ends_with(".to_inspect") {
+                    continue;
+                }
+                // Peel to the function's result type; a `to_inspect` that gives back
+                // anything but `Str` is a compile problem.
+                let mut current = self.apply(ty);
+                while let Type::Function(_, result) = current {
+                    current = self.apply(&result);
+                }
+                if !matches!(current, Type::Str | Type::TypeVar(_)) {
+                    return Some(format!("`{}` must return Str", name));
+                }
+            }
+        }
+        // A record builder's `map2` COMBINES: `map2 : B(a), B(b), (a, b -> c) -> B(c)`.
+        // Giving back `B(a)` throws the combined value away, and roc refuses the
+        // declaration rather than the use. The test is that the result mentions the
+        // combining function's own result — nothing else can stand for `c`.
+        for (qualified, signature) in self
+            .env
+            .iter()
+            .flatten()
+            .map(|(n, t, _)| (n, t))
+            .chain(self.declared_signatures.iter())
+        {
+            if !qualified.ends_with(".map2") {
+                continue;
+            }
+            let Some((params, result)) = Self::peel_params(signature, 3) else { continue };
+            let mut combined = params[2].clone();
+            while let Type::Function(_, next) = combined {
+                combined = *next;
+            }
+            let Type::TypeVar(produced) = combined else { continue };
+            let mut in_result = Vec::new();
+            Self::type_vars_in(&result, &mut in_result);
+            if !in_result.contains(&produced) {
+                return Some(format!(
+                    "`{}` must give back the builder over what its function produced",
+                    qualified
+                ));
+            }
+        }
+        None
+    }
+
+    pub fn literal_problems(&self) -> Option<String> {
+        let mut typed: std::collections::HashMap<crate::ast::NodeId, Type> = std::collections::HashMap::new();
+        for (id, ty) in &self.literals {
+            typed.insert(*id, self.apply(ty));
+        }
+        for (id, ty) in &self.suffixed {
+            typed.insert(*id, ty.clone());
+        }
+        for (id, (value, fractional)) in &self.literal_values {
+            let Some(ty) = typed.get(id) else { continue };
+            if ty.is_integer() {
+                if *fractional {
+                    return Some(format!("a fractional literal cannot be a {}", ty));
+                }
+                if self.overflowed_literals.contains(id) || !Self::width_fits(ty, *value) {
+                    return Some(format!("{} does not fit in a {}", value, ty));
+                }
+            } else if self.overflowed_literals.contains(id)
+                && matches!(self.defaulted(ty), Type::Dec)
+            {
+                // An unpinned fractional literal defaults to `Dec`; if it overflowed
+                // what a `Dec` holds — `999…999.0`, 39 nines — roc refuses it, so it is
+                // a compile problem here too, even before its type is pinned.
+                return Some("this literal is outside what a Dec can hold".to_string());
+            }
+        }
+        None
+    }
+
+    fn width_fits(ty: &Type, value: i128) -> bool {
+        let (lo, hi): (i128, i128) = match ty {
+            Type::U8 => (0, u8::MAX.into()),
+            Type::U16 => (0, u16::MAX.into()),
+            Type::U32 => (0, u32::MAX.into()),
+            Type::U64 => (0, u64::MAX.into()),
+            // A `U128` past `i128::MAX` is held as the same bit pattern, which reads as
+            // negative here: the parser already checked its magnitude.
+            Type::U128 => return true,
+            Type::I8 => (i8::MIN.into(), i8::MAX.into()),
+            Type::I16 => (i16::MIN.into(), i16::MAX.into()),
+            Type::I32 => (i32::MIN.into(), i32::MAX.into()),
+            Type::I64 => (i64::MIN.into(), i64::MAX.into()),
+            _ => return true,
+        };
+        value >= lo && value <= hi
+    }
+
+    /// The literal nodes typed `F32`, which the compiler rounds to one.
+    pub fn f32_literals(&self) -> std::collections::HashSet<crate::ast::NodeId> {
+        self.literals_typed(&Type::F32)
+    }
+
+    /// The literal nodes typed `U128`, which the compiler emits as an unsigned 128-bit
+    /// value — so a `U128` past `i128::MAX` prints its true magnitude, not a bit
+    /// pattern read back negative.
+    pub fn u128_literals(&self) -> std::collections::HashSet<crate::ast::NodeId> {
+        self.literals_typed(&Type::U128)
+    }
+
+    /// The literal nodes that ended up as `ty`: inferred, or written with the suffix.
+    fn literals_typed(&self, ty: &Type) -> std::collections::HashSet<crate::ast::NodeId> {
         self.literals
             .iter()
-            .filter(|(_, ty)| matches!(self.apply(ty), Type::Dec))
+            .filter(|(_, t)| self.apply(t) == *ty)
             .map(|(id, _)| *id)
+            .chain(self.suffixed.iter().filter(|(_, t)| *t == ty).map(|(id, _)| *id))
             .collect()
     }
 
@@ -793,9 +1936,66 @@ impl TypeChecker {
     pub fn integer_binops(&self) -> std::collections::HashSet<crate::ast::NodeId> {
         self.binops
             .iter()
-            .filter(|(_, ty)| matches!(self.apply(ty), Type::I64))
+            .filter(|(_, ty)| self.apply(ty).is_integer())
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// A `match`'s arms cover every case its scrutinee can be — enforced only when
+    /// the scrutinee's type says what the cases are (a closed union, a `Bool`, or a
+    /// literal type with no catch-all). Shared by the synthesis and checking paths.
+    fn check_exhaustive(&mut self, arms: &[crate::ast::MatchArm], scrutinee_type: &Type) -> Result<(), TypeError> {
+        let resolved = match self.apply(scrutinee_type) {
+            Type::Nominal { backing, .. } => *backing,
+            other => other,
+        };
+        // An `as` pattern covers whatever its inner pattern does, so unwrap it.
+        fn base(p: &Pattern) -> &Pattern {
+            match p { Pattern::As { inner, .. } => base(inner), other => other }
+        }
+        let covers_everything = arms.iter().any(|arm| {
+            arm.guard.is_none()
+                && arm.patterns.iter().any(|p| matches!(base(p), Pattern::Wildcard | Pattern::Binding(_)))
+        });
+        let literal_scrutinee = resolved.is_numeric() || matches!(resolved, Type::Str);
+        let bool_covered = matches!(resolved, Type::Bool)
+            && ["True", "False"].iter().all(|wanted| {
+                arms.iter().any(|arm| {
+                    arm.guard.is_none()
+                        && arm.patterns.iter().any(|p| matches!(p, Pattern::Tag { name, .. } if name == wanted))
+                })
+            });
+        if !covers_everything && (literal_scrutinee || (matches!(resolved, Type::Bool) && !bool_covered)) {
+            return Err(TypeError {
+                message: "This match does not cover all cases".to_string(),
+                expected: resolved.to_string(),
+                actual: format!("{} arm(s)", arms.len()),
+                line: 0, col: 0,
+            });
+        }
+        if let Type::TagUnion { tags, open: false } = &resolved {
+            if !covers_everything {
+                let uncovered: Vec<&str> = tags
+                    .iter()
+                    .filter(|(tag, _)| {
+                        !arms.iter().any(|arm| {
+                            arm.guard.is_none()
+                                && arm.patterns.iter().any(|p| matches!(base(p), Pattern::Tag { name, .. } if name == tag))
+                        })
+                    })
+                    .map(|(tag, _)| tag.as_str())
+                    .collect();
+                if !uncovered.is_empty() && self.lambda_depth > 0 {
+                    return Err(TypeError {
+                        message: format!("This match does not cover all cases; missing: {}", uncovered.join(", ")),
+                        expected: resolved.to_string(),
+                        actual: format!("{} arm(s)", arms.len()),
+                        line: 0, col: 0,
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn synth(&mut self, expr: &Expr) -> Result<Type, TypeError> {
@@ -807,6 +2007,18 @@ impl TypeChecker {
                     .nominal_literals
                     .remove(&expr.id())
                     .expect("checked by the guard");
+                // An IMPORTED nominal named in `exposing` — `import MyTag exposing
+                // [MyTag]` — is attached by the parser with a PLACEHOLDER backing,
+                // because the app's own file never declared it. The checker was given
+                // the real declaration with the module, so use that: without it
+                // `MyTag.Foo({ x: 42 })` checked its payload against a bare variable
+                // and the literal defaulted to `Dec`.
+                let declared = match &declared {
+                    Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(u32::MAX)) => {
+                        self.declared_types.get(name).cloned().unwrap_or_else(|| declared.clone())
+                    }
+                    _ => declared,
+                };
                 // FRESH variables per construction: `Wrapper(a)` is one declaration and
                 // `Wrapper.{ item: "roc" }` and `Wrapper.{ item: 42 }` are two uses of
                 // it, so they must not share the `a`.
@@ -830,15 +2042,59 @@ impl TypeChecker {
                 outcome?;
                 Ok(declared)
             }
+            // `123.MyNum`, `"Roc".Tag`, `"a${b}".Url`: the nominal's conversion of
+            // the literal, typed as what that conversion gives.
+            Expr::Int(n, id) if self.suffixed_nominals.contains_key(id) => {
+                self.literal_values.insert(*id, (*n, false));
+                let ty = self.nominal_named(&self.suffixed_nominals[id]);
+                self.literals.push((*id, ty.clone()));
+                Ok(ty)
+            }
+            Expr::Float(_, exact, id) if self.suffixed_nominals.contains_key(id) => {
+                self.literal_values.insert(*id, (*exact, true));
+                let ty = self.nominal_named(&self.suffixed_nominals[id]);
+                self.literals.push((*id, ty.clone()));
+                Ok(ty)
+            }
+            Expr::Str(_, id) if self.suffixed_nominals.contains_key(id) => {
+                let name = self.suffixed_nominals[id].clone();
+                let ty = self.nominal_named(&name);
+                self.converted.insert(*id, (name, "from_quote"));
+                Ok(ty)
+            }
+            Expr::StrInterp(parts, id) if self.suffixed_nominals.contains_key(id) => {
+                for part in parts {
+                    if let crate::ast::StrPart::Expr(inner) = part {
+                        self.synth(inner)?;
+                    }
+                }
+                let name = self.suffixed_nominals[id].clone();
+                let ty = self.interpolation_result(&name).unwrap_or_else(|| self.nominal_named(&name));
+                self.converted.insert(*id, (name, "from_interpolation"));
+                Ok(ty)
+            }
+            // A string literal is polymorphic where the program declares a
+            // `from_quote`: it may be a `Str` or that nominal, and only its use says.
+            Expr::Str(_, id) if self.quotable => {
+                let var = self.fresh_var();
+                if let Type::TypeVar(v) = var {
+                    self.quote_vars.insert(v);
+                }
+                self.str_literals.push((*id, var.clone()));
+                Ok(var)
+            }
             Expr::Str(_, _) => Ok(Type::Str),
             Expr::Unit(_) => Ok(Type::Unit),
             Expr::Bool(_, _) => Ok(Type::Bool),
             Expr::Range { start, end, .. } => {
-                for bound in [start, end] {
-                    let bound_type = self.synth(bound)?;
-                    self.unify(&bound_type, &Type::I64)?;
-                }
-                Ok(Type::Range)
+                // The bounds share a type — `1..=n` and `1.0..<x` — but it is NOT
+                // forced to `I64`: an unpinned range of literals is a numeral, so
+                // `(1..=3)` iterates `Dec`s as roc does, and `(1.0..<4.0)` a `Dec`
+                // range, and `(1.U8..=3.U8)` a `U8` range.
+                let start_type = self.synth(start)?;
+                let end_type = self.synth(end)?;
+                self.unify(&start_type, &end_type)?;
+                Ok(Type::Range(Box::new(self.apply(&start_type))))
             }
             Expr::Tuple(items, _) => {
                 // Positional, so each element keeps its own type — no joining.
@@ -901,12 +2157,24 @@ impl TypeChecker {
                 // a record WITH these fields, and saying so links their types to
                 // whatever the caller passes: `birthday = |p| { ..p, age: 31 }` then
                 // `birthday(start)` is what tells `31` it is an I64.
-                if known.is_empty() && matches!(self.apply(&base_type), Type::TypeVar(_)) {
+                let base_was_open = known.is_empty() && matches!(self.apply(&base_type), Type::TypeVar(_));
+                if base_was_open {
                     let shape = Type::Record {
                         fields: updated.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
                         open: true,
                     };
+                    for (_, ty) in &updated {
+                        if let Type::TypeVar(v) = self.apply(ty) {
+                            self.committed_vars.insert(v);
+                        }
+                    }
                     let _ = self.unify(&base_type, &shape);
+                    // The result IS the base's row — `{ ..r, a: 2 }` has exactly `r`'s
+                    // fields, with `a` retyped, and the update already unified that in.
+                    // Returning a snapshot instead froze the row at the fields seen so
+                    // far, so a caller's extra field never reached the result and
+                    // `set({ a: 1, b: "x" }).b` had no `b`.
+                    return Ok(base_type);
                 }
 
                 match self.apply(&base_type) {
@@ -950,8 +2218,9 @@ impl TypeChecker {
                 }
                 Ok(Type::List(Box::new(element)))
             }
-            Expr::Match { scrutinee, arms, .. } => {
+            Expr::Match { scrutinee, arms, id } => {
                 let scrutinee_type = self.synth(scrutinee)?;
+                self.matches.push((*id, scrutinee_type.clone()));
 
                 // Every pattern must be able to match the scrutinee, and every arm
                 // body must agree on a type. Tag patterns join into a union the same
@@ -960,6 +2229,12 @@ impl TypeChecker {
                 let mut result: Option<Type> = None;
                 for arm in arms {
                     for pattern in &arm.patterns {
+                        // `{ age: Ok(v) }` against `{ age ?: U8 }`: the sub-pattern
+                        // reads the optional field as `Ok`/`Err`, which `bind_pattern`
+                        // types; a structural unify would demand a `U8` there.
+                        if self.reads_optional_fields(pattern, &scrutinee_type) {
+                            continue;
+                        }
                         let pattern_type = self.pattern_type(pattern)?;
                         self.unify(&scrutinee_type, &pattern_type)?;
                     }
@@ -989,53 +2264,7 @@ impl TypeChecker {
                     });
                 }
 
-                // Exhaustiveness. Only possible now that a closed union can reach here
-                // through an annotation: a scrutinee whose type is an inferred (open)
-                // union carries no list of "all the cases", so nothing can be checked.
-                let resolved = self.apply(&scrutinee_type);
-                // A nominal over a tag union is still exhaustively checkable — the
-                // union is its backing type. roc checks these too.
-                let resolved = match &resolved {
-                    Type::Nominal { backing, .. } => (**backing).clone(),
-                    other => other.clone(),
-                };
-                if let Type::TagUnion { tags, open: false } = &resolved {
-                    let covers_everything = arms.iter().any(|arm| {
-                        arm.guard.is_none()
-                            && arm.patterns.iter().any(|p| {
-                                matches!(p, Pattern::Wildcard | Pattern::Binding(_))
-                            })
-                    });
-
-                    if !covers_everything {
-                        // A guarded arm may not run, so it does not count as coverage.
-                        let uncovered: Vec<&str> = tags
-                            .iter()
-                            .filter(|(tag, _)| {
-                                !arms.iter().any(|arm| {
-                                    arm.guard.is_none()
-                                        && arm.patterns.iter().any(|p| {
-                                            matches!(p, Pattern::Tag { name, .. } if name == tag)
-                                        })
-                                })
-                            })
-                            .map(|(tag, _)| tag.as_str())
-                            .collect();
-
-                        if !uncovered.is_empty() {
-                            return Err(TypeError {
-                                message: format!(
-                                    "This match does not cover all cases; missing: {}",
-                                    uncovered.join(", ")
-                                ),
-                                expected: resolved.to_string(),
-                                actual: format!("{} arm(s)", arms.len()),
-                                line: 0,
-                                col: 0,
-                            });
-                        }
-                    }
-                }
+                self.check_exhaustive(arms, &scrutinee_type)?;
 
                 result.ok_or_else(|| TypeError {
                     message: "A match needs at least one arm".to_string(),
@@ -1058,11 +2287,22 @@ impl TypeChecker {
                 // union of them, not just the first branch's type.
                 self.join(&then_type, &else_type)
             }
-            Expr::For { name, iterable, body, .. } => {
+            Expr::For { name, iterable, body, id } => {
                 let iterable_type = self.synth(iterable)?;
                 let element = match self.apply(&iterable_type) {
-                    // A range yields whole numbers without being a list.
-                    Type::Range => Type::I64,
+                    // A range yields its element type without being a list.
+                    Type::Range(elem) => *elem,
+                    // A nominal with an `iter` method — a custom iterable — is looped
+                    // over its `iter()`, whose element is what the loop binds. The
+                    // compiler inserts the `.iter()` for these nodes.
+                    Type::Nominal { ref name, .. } if self.declared(name, "iter").is_some() => {
+                        self.for_iter_calls.insert(*id);
+                        let iter = self.declared(name, "iter").expect("just checked");
+                        match Self::peel_params(&iter, 1).map(|(_, result)| self.apply(&result)) {
+                            Some(Type::Range(elem)) | Some(Type::List(elem)) => *elem,
+                            _ => self.fresh_var(),
+                        }
+                    }
                     // Still unknown — a parameter whose call site has not been seen.
                     // It is still a LIST of the element, which is what carries a type
                     // from the loop body out to the caller's argument: without the
@@ -1092,7 +2332,14 @@ impl TypeChecker {
                 let condition_type = self.synth(condition)?;
                 self.unify(&condition_type, &Type::Bool)?;
                 self.synth(body)?;
-                Ok(Type::Unit)
+                // `while True { … }` never falls through, so it constrains nothing —
+                // its value is whatever the surrounding code needs, and a `return`
+                // inside is the only exit. A conditional loop yields `{}`.
+                if matches!(&**condition, Expr::Bool(true, _)) {
+                    Ok(self.fresh_var())
+                } else {
+                    Ok(Type::Unit)
+                }
             }
             // `break` never produces a value; it leaves the loop.
             Expr::Break(_) => Ok(self.fresh_var()),
@@ -1121,13 +2368,25 @@ impl TypeChecker {
             }
             Expr::Dispatch { receiver, method, args, id } => {
                 let receiver_type = self.synth(receiver)?;
-                self.dispatches.push((*id, receiver_type.clone()));
 
                 // Dispatch is STATIC: the receiver's type picks the module. If the type
                 // is still an unresolved variable there is nothing to dispatch on, and
                 // roc says so too — "trying to dispatch a method named to_str on an
                 // unresolved type variable".
-                let resolved = self.apply(&receiver_type);
+                let mut resolved = self.apply(&receiver_type);
+                // A bare tag-union receiver whose tags belong to a nominal that
+                // declares this method IS that nominal: an imported constructor,
+                // `CounterMod.Counter(41)`, types as `[Counter(U64)]` here, but its
+                // `Counter` nominal owns `.get`. roc erases the nominal at run time and
+                // the value's shape finds the method; the checker needs the nominal so
+                // the call type-checks and returns the right type.
+                if let Type::TagUnion { .. } = &resolved {
+                    if let Some(nominal) = self.nominal_for_tags(&resolved, method) {
+                        let _ = self.unify(&receiver_type, &nominal);
+                        resolved = self.apply(&nominal);
+                    }
+                }
+                self.dispatches.push((*id, resolved.clone()));
                 // A `where` clause promised this method exists on whatever the caller
                 // supplies, so an unresolved receiver is fine here — roc has already
                 // checked the constraint is satisfied at each call site.
@@ -1136,7 +2395,7 @@ impl TypeChecker {
                 // is a number whose width is not yet fixed, and every numeric width
                 // answers the same method block here.
                 let numeral =
-                    matches!(&resolved, Type::TypeVar(v) if self.numeral_vars.contains(v));
+                    matches!(&resolved, Type::TypeVar(v) if self.numeral_vars.contains(v) || self.quote_vars.contains(v));
                 if matches!(resolved, Type::TypeVar(_)) && !numeral && !promised && self.lambda_depth == 0 {
                     return Err(TypeError {
                         message: format!(
@@ -1149,6 +2408,19 @@ impl TypeChecker {
                         col: 0,
                     });
                 }
+                // A method a `where` clause promised, on a receiver still generic: its
+                // result is whatever the caller's monomorphization makes it, which the
+                // enclosing function's declared return type pins. Answering with the
+                // builtin table instead would guess — `value.get()` would be a `Try`
+                // from `List.get`, not the `U64` the `where item.get : item -> U64`
+                // signature promises. A fresh variable lets the annotation decide.
+                if promised && matches!(resolved, Type::TypeVar(_)) {
+                    // Still synthesise the arguments, so their own literals get typed.
+                    for arg in args {
+                        self.synth(arg)?;
+                    }
+                    return Ok(self.fresh_var());
+                }
 
                 // A TAG UNION has no method block of its own, so only the handful this
                 // interpreter implements for a `Try` will run. roc reports the rest as
@@ -1159,7 +2431,7 @@ impl TypeChecker {
                     && !promised
                     && !matches!(
                         *method,
-                        "is_ok" | "is_err" | "map_ok" | "map_err" | "with_default" | "on_err"
+                        "is_ok" | "is_err" | "map_ok" | "map_err" | "ok_or" | "on_err"
                     )
                     && self.declared("Tags", method).is_none()
                 {
@@ -1205,8 +2477,17 @@ impl TypeChecker {
                             // Except a range, which answers the List methods without
                             // being a List — `(1..=100).iter()` reaches `List.iter`.
                             if let Some(first) = params.first() {
-                                if !matches!(resolved, Type::Range) {
-                                    self.unify(first, &resolved)?;
+                                match &resolved {
+                                    // A range answers the List methods as the `List` of
+                                    // its element, so unify the first parameter against
+                                    // that — otherwise the element type is thrown away
+                                    // and a range of literals defaults to `Dec` even
+                                    // when the method's own signature would pin it.
+                                    Type::Range(elem) => {
+                                        let as_list = Type::List(elem.clone());
+                                        let _ = self.unify(first, &as_list);
+                                    }
+                                    _ => self.unify(first, &resolved)?,
                                 }
                             }
                             for (arg, declared) in args.iter().zip(params.iter().skip(1)) {
@@ -1228,6 +2509,73 @@ impl TypeChecker {
                 let mut arg_types = Vec::with_capacity(args.len());
                 for arg in args {
                     arg_types.push(self.synth(arg)?);
+                }
+                // `x.shl_wrap(1)` on a `U8`: the `1` is the receiver's width, as above.
+                if resolved.is_integer() || resolved.is_fractional() {
+                    self.pin_numerals_to(&resolved, &arg_types);
+                }
+                // A count is a `U64`: `xs.step_by(2)`, `xs.take_first(3)`.
+                if matches!(*method, "step_by" | "take_first" | "take_last" | "drop_first" | "drop_last") {
+                    // `step_by` on a fractional range steps by the element:
+                    // `5.Dec.range_inclusive_from(1).step_by(1.5)`.
+                    let element = self.element_of(Some(&resolved));
+                    let count = if *method == "step_by" && self.apply(&element).is_fractional() {
+                        element
+                    } else {
+                        Type::U64
+                    };
+                    self.pin_numerals_to(&count, &arg_types);
+                }
+                // `value.encode(format)` is `format.encode_<kind>(value)`, which is
+                // literally how `Builtin.roc` defines `encode` on every scalar. Those
+                // members are not loaded, so the format's own signature is what says
+                // what the call gives back — and a chain off it needs that.
+                if *method == "encode" && arg_types.len() == 1 {
+                    if let Some(kind) = self.module_named(&resolved).map(|m| m.to_ascii_lowercase()) {
+                        let fmt = self.apply(&arg_types[0]);
+                        if let Some(owner) = self.module_named(&fmt) {
+                            let named = format!("encode_{}", kind);
+                            if let Some(signature) = self.declared(owner, &named) {
+                                if let Some((params, result)) = Self::peel_params(&signature, 2) {
+                                    let _ = self.unify(&params[0], &fmt);
+                                    let _ = self.unify(&params[1], &resolved);
+                                    return Ok(self.apply(&result));
+                                }
+                            }
+                        }
+                    }
+                }
+                // A method roc has NO declaration for, on a builtin container: not a
+                // gap in this interpreter, a name that does not exist. roc reports
+                // `list.reverse()` (it is `rev`) rather than running it.
+                if self
+                    .module_named(&resolved)
+                    .is_some_and(|m| matches!(m, "List" | "Str" | "Dict" | "Set")
+                        || crate::eval::is_numeric_module(m))
+                    && !crate::builtin::declared_names().contains(*method)
+                    && !self.env.iter().flatten().any(|(n, ..)| {
+                        n.rsplit_once('.').is_some_and(|(_, m)| m == *method)
+                    })
+                {
+                    return Err(TypeError {
+                        message: format!("There is no `{}` method", method),
+                        expected: format!("a method roc declares"),
+                        actual: method.to_string(),
+                        line: 0,
+                        col: 0,
+                    });
+                }
+                // `n.to_u64()` says its own result in its name. The qualified spelling
+                // `Dec.to_u64(n)` reaches `numeric_result`, but method syntax only ever
+                // reached the shared builtin table, which left it unconstrained — so
+                // `0 + n.to_u64()` defaulted the `0` to `Dec` and summed fixed-point.
+                let numeric_receiver = resolved.is_integer()
+                    || resolved.is_fractional()
+                    || matches!(&resolved, Type::TypeVar(v) if self.numeral_vars.contains(v));
+                if numeric_receiver {
+                    if let Some(target) = Self::conversion_type(method) {
+                        return Ok(target);
+                    }
                 }
                 Ok(self.builtin_result(method, Some(&resolved), &arg_types))
             }
@@ -1334,6 +2682,23 @@ impl TypeChecker {
             // A tag literal is a one-tag union. Unifying it with another union
             // merges them, so `if b Red else Green` comes out as [Green, Red].
             Expr::Tag { name, args, .. } => {
+                // An IMPORTED nominal's constructor — `CrateMod.Crate(5)` — reaches
+                // here as a bare tag: the app's parser never saw
+                // `Crate := [Crate(U64)]`, so it could not attach the declaration the
+                // way it does for a nominal declared in this file. The CHECKER has the
+                // imported declarations, and a tag that exactly one nominal declares at
+                // this arity is that nominal's constructor — which is what types the
+                // payload, so `5` is a `U64` and not a defaulted `Dec`.
+                if !args.is_empty() && !matches!(*name, "Ok" | "Err" | "True" | "False") {
+                    if let Some(declared) = self.nominal_declaring_tag(name, args.len()) {
+                        let backing = match &declared {
+                            Type::Nominal { backing, .. } => (**backing).clone(),
+                            other => other.clone(),
+                        };
+                        self.check(expr, &backing)?;
+                        return Ok(declared);
+                    }
+                }
                 let mut payload = Vec::with_capacity(args.len());
                 for arg in args {
                     payload.push(self.synth(arg)?);
@@ -1347,23 +2712,37 @@ impl TypeChecker {
             // have to be checked — skipping them meant a whole class of error inside
             // `${...}` went unreported, including the one that hid broken chained
             // dispatch in this project's own test files.
-            Expr::StrInterp(parts, _) => {
+            Expr::StrInterp(parts, id) => {
                 for part in parts {
                     if let crate::ast::StrPart::Expr(inner) = part {
                         self.synth(inner)?;
                     }
                 }
-                Ok(Type::Str)
+                if !self.quotable {
+                    return Ok(Type::Str);
+                }
+                let var = self.fresh_var();
+                if let Type::TypeVar(v) = var {
+                    self.quote_vars.insert(v);
+                }
+                self.interp_literals.push((*id, var.clone()));
+                Ok(var)
             }
             // A numeral is POLYMORPHIC. `15` is an I64 in `x : I64`, a `Dec` in a
             // `List(Dec)`, and — where nothing says — a FRACTIONAL value: roc prints
             // `15.0` for a bare `x = 15`. Synthesising I64 here made the interpreter
             // disagree with the compiler about its own examples.
             // A SUFFIXED literal already said what it is.
-            Expr::Int(_, id) | Expr::Float(_, _, id) if self.suffixed.contains_key(id) => {
+            Expr::Int(n, id) if self.suffixed.contains_key(id) => {
+                self.literal_values.insert(*id, (*n, false));
                 Ok(self.suffixed[id].clone())
             }
-            Expr::Int(_, id) => {
+            Expr::Float(_, exact, id) if self.suffixed.contains_key(id) => {
+                self.literal_values.insert(*id, (*exact, true));
+                Ok(self.suffixed[id].clone())
+            }
+            Expr::Int(n, id) => {
+                self.literal_values.insert(*id, (*n, false));
                 let var = self.fresh_var();
                 if let Type::TypeVar(v) = var {
                     self.numeral_vars.insert(v);
@@ -1371,8 +2750,23 @@ impl TypeChecker {
                 self.literals.push((*id, var.clone()));
                 Ok(var)
             }
-            Expr::Float(..) => Ok(Type::F64),     // Float literals default to F64
+            // A fractional literal is a numeral too: roc types `0.1 + 0.2` as `Dec`
+            // and prints `0.3`, and only an annotation, a suffix or an `F64` beside
+            // it makes one a float.
+            Expr::Float(_, exact, id) => {
+                self.literal_values.insert(*id, (*exact, true));
+                let var = self.fresh_var();
+                if let Type::TypeVar(v) = var {
+                    self.numeral_vars.insert(v);
+                }
+                self.literals.push((*id, var.clone()));
+                Ok(var)
+            }
             Expr::Ident(name, _) => {
+                // `{ ..r, gone: _ }` unsets an optional field: `_` fits any slot.
+                if *name == "_" {
+                    return Ok(self.fresh_var());
+                }
                 // A name in scope has a known type now.
                 if let Some(ty) = self.lookup(name) {
                     return Ok(self.apply(&ty));
@@ -1405,6 +2799,13 @@ impl TypeChecker {
                 if let Some(declared) = self.declared(module, name) {
                     return Ok(declared);
                 }
+                // `U8.highest`, `F64.pi`, `Dec.lowest`: a VALUE of the module's type,
+                // not a function waiting for arguments.
+                if crate::eval::is_numeric_constant(module, name) {
+                    if let Some(declared) = type_named(module) {
+                        return Ok(declared);
+                    }
+                }
                 // Qualified names are typically functions from builtins
                 // Create a function type that can accept arguments
                 // Input type: fresh var, Output type: fresh var
@@ -1426,16 +2827,34 @@ impl TypeChecker {
                     // `quot = 7.0 / 2.0`, which only showed up once annotations were
                     // actually checked.
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                        // A nominal's own operator method says what its right operand
+                        // is: `Duration.times : Duration, I64 -> Duration`.
+                        if let Type::Nominal { name, .. } = self.apply(&left_type) {
+                            let method = match op {
+                                BinOp::Add => "plus",
+                                BinOp::Sub => "minus",
+                                BinOp::Mul => "times",
+                                _ => "div_by",
+                            };
+                            if let Some(signature) = self.declared(&name, method) {
+                                if let Some((params, result)) = Self::peel_params(&signature, 2) {
+                                    self.unify(&params[0], &left_type)?;
+                                    self.unify(&params[1], &right_type)?;
+                                    return Ok(self.apply(&result));
+                                }
+                            }
+                        }
                         self.unify(&left_type, &right_type)?;
                         Ok(self.apply(&left_type))
                     }
                     // `//` and `%` are integer-only in Roc, which is a constraint on the
                     // OPERANDS as much as a promise about the result: `7 // 2` makes
                     // both literals integers rather than leaving them to default.
+                    // `//` and `%` keep their operands' type too: roc's `10 // 3` on
+                    // unconstrained numerals is a `Dec`, printed `3.0`.
                     BinOp::IntDiv | BinOp::Rem => {
                         self.unify(&left_type, &right_type)?;
-                        let _ = self.unify(&left_type, &Type::I64);
-                        Ok(Type::I64)
+                        Ok(self.apply(&left_type))
                     }
                     // Comparison yields Bool, not an integer — but the two sides are
                     // still the same type, and a numeric literal on the right has no
@@ -1500,33 +2919,54 @@ impl TypeChecker {
             // A qualified builtin call — `List.len(xs)` — resolves its result the same
             // way `xs.len()` does, so the two spellings behave alike when chained.
             Expr::Call { func, args, .. } if matches!(**func, Expr::Qualified { .. }) => {
-                let mut arg_types = Vec::with_capacity(args.len());
-                for arg in args {
-                    arg_types.push(self.synth(arg)?);
-                }
                 if let Expr::Qualified { module, name, .. } = &**func {
-                    // A nominal's method is an ordinary binding, so its own signature
-                    // decides the result — not the builtin table, which would hand back
-                    // an unconstrained variable and break any chaining off it.
+                    // The synthetic crypto modules the parser produces for
+                    // `Crypto.SHA256.*` / `Crypto.BLAKE3.*` — typed here, since they
+                    // are not in any signature table.
+                    if let Some(result) = Self::crypto_result(module, name) {
+                        for arg in args {
+                            self.synth(arg)?;
+                        }
+                        return Ok(result);
+                    }
+                    if crate::eval::simd_kind(module).is_some() {
+                        for arg in args {
+                            self.synth(arg)?;
+                        }
+                        return Ok(self.simd_result(module, name));
+                    }
+                    // A nominal's method (or a `Builtin.roc` member) has a declared
+                    // signature, so its own types decide the result — not the builtin
+                    // table, which would hand back an unconstrained variable.
                     if let Some(signature) = self.declared(module, name) {
                         // `Dict.empty()` takes no arguments and has type `{} -> Dict`:
                         // Roc spells an empty parameter list `()`, which IS the unit
-                        // type, so applying it still peels one arrow. Peeling none
-                        // handed back the function itself, and `Dict.empty().insert(k, v)`
-                        // then had nothing to dispatch on.
-                        let takes_unit = arg_types.is_empty()
+                        // type, so applying it still peels one arrow.
+                        let takes_unit = args.is_empty()
                             && matches!(&signature, Type::Function(param, _) if matches!(**param, Type::Unit));
-                        let arity = if takes_unit { 1 } else { arg_types.len() };
+                        let arity = if takes_unit { 1 } else { args.len() };
                         if let Some((params, result)) = Self::peel_params(&signature, arity) {
-                            // Check the ARGUMENTS against what was declared, not just
-                            // read the result off the end.
+                            // CHECK each argument against its declared parameter, in
+                            // order, so an earlier argument that pins a type variable
+                            // (a list's element) is known before a later one is looked
+                            // at (a lambda over that element). Synthesising every
+                            // argument first — as this used to — typed the lambda's
+                            // parameter as a bare variable and its body defaulted, so
+                            // `List.map(xs, |r| r.?a ?? 10)` folded `Dec`s.
                             if !takes_unit {
-                                for (declared, given) in params.iter().zip(arg_types.iter()) {
-                                    self.unify(declared, given)?;
+                                for (declared, arg) in params.iter().zip(args.iter()) {
+                                    let declared = self.apply(declared);
+                                    self.check(arg, &declared)?;
                                 }
                             }
+                            let applied: Vec<Type> = params.iter().map(|p| self.apply(p)).collect();
+                            self.note_polymorphic_use(name, None, &applied);
                             return Ok(self.apply(&result));
                         }
+                    }
+                    let mut arg_types = Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_types.push(self.synth(arg)?);
                     }
                     // A qualified call NAMES its receiver's type: `I64.to_str(birds)`
                     // says `birds` is an I64, and `Str.concat(a, b)` says `a` is a Str.
@@ -1536,10 +2976,37 @@ impl TypeChecker {
                     // A CONSTRUCTOR is the exception: `I64.from_str(s)` takes a Str and
                     // returns an I64, so its first argument is not the receiver. They
                     // are spelled `from_…` throughout `Builtin.roc`.
+                    // `Box.box(x)` is `x` and `Box.unbox(b)` is `b`: the box is erased.
+                    if *module == "Box" && matches!(*name, "box" | "unbox") {
+                        if let Some(inner) = arg_types.first() {
+                            return Ok(self.apply(inner));
+                        }
+                    }
+                    // `F64.from_bits(n)` takes the bits as a `U64` (`U32` for `F32`),
+                    // and `Dec.from_attos(n)` an `I128`: a bare numeral there is that,
+                    // not the module's type and not a `Dec`.
+                    if let Some(declared) = type_named(module) {
+                        let bits = match (*name, &declared) {
+                            ("from_bits", Type::F32) => Some(Type::U32),
+                            ("from_bits", _) => Some(Type::U64),
+                            ("from_attos", _) => Some(Type::I128),
+                            _ => None,
+                        };
+                        if let Some(bits) = bits {
+                            self.pin_numerals_to(&bits, &arg_types);
+                        }
+                    }
                     if let Some(receiver) = arg_types.first() {
                         if !name.starts_with("from_") {
                             if let Some(declared) = type_named(module) {
                                 let _ = self.unify(&declared, receiver);
+                                // A numeric method's OTHER numerals are the receiver's
+                                // width too: `U8.shl_wrap(200, 1)` shifts by a U8, and
+                                // without this the `1` defaulted to `Dec` and the call
+                                // fell off the width-aware path as unknown.
+                                if declared.is_integer() || declared.is_fractional() {
+                                    self.pin_numerals_to(&declared, &arg_types[1..]);
+                                }
                             }
                         }
                     }
@@ -1547,7 +3014,34 @@ impl TypeChecker {
                     // a `Try(I64, …)`, which is what tells everything downstream of it
                     // that it is working with integers.
                     if let Some(declared) = type_named(module) {
+                        // roc has no `==` on floats: `is_float_eq` says what you mean.
+                        if matches!(declared, Type::F32 | Type::F64) && *name == "is_eq" {
+                            return Err(TypeError {
+                                message: format!("`{}.is_eq` is intentionally unavailable; use `is_float_eq`", module),
+                                expected: "is_float_eq".to_string(),
+                                actual: name.to_string(),
+                                line: 0,
+                                col: 0,
+                            });
+                        }
                         match *name {
+                            "from_numeral" => {
+                                let numeral = self.nominal_named("Numeral");
+                                self.pin_numerals_to(&numeral, &arg_types);
+                                if let Some(arg) = arg_types.first() {
+                                    self.unify(arg, &numeral)?;
+                                }
+                                return Ok(Type::TagUnion {
+                                    tags: vec![
+                                        ("Err".to_string(), vec![Type::TagUnion {
+                                            tags: vec![("InvalidNumeral".to_string(), vec![Type::Str])],
+                                            open: false,
+                                        }]),
+                                        ("Ok".to_string(), vec![declared]),
+                                    ],
+                                    open: false,
+                                });
+                            }
                             "from_str" => {
                                 return Ok(Type::TagUnion {
                                     tags: vec![
@@ -1561,6 +3055,9 @@ impl TypeChecker {
                             // give back in their names.
                             "to_str" => return Ok(Type::Str),
                             _ => {}
+                        }
+                        if let Some(result) = self.numeric_result(&declared, name) {
+                            return Ok(result);
                         }
                     }
 
@@ -1594,6 +3091,18 @@ impl TypeChecker {
                 // behaviour rejected every call to a user-defined function.
                 // ponytail: fix by giving `synth` an environment, alongside phase 18.
                 let mut current_type = self.synth(func)?;
+
+                // `f()` is a call with NO arguments, and a zero-parameter lambda's
+                // type is `{} -> result`. Without peeling that arrow here the call
+                // synthesises to the function itself, so `force_strings(empty())`
+                // unified `{} -> List(a)` with `List(Str)`.
+                if args.is_empty() {
+                    if let Type::Function(param, result) = self.apply(&current_type) {
+                        if matches!(*param, Type::Unit) {
+                            current_type = *result;
+                        }
+                    }
+                }
 
                 for arg in args {
                     // When the callee's type is already known, CHECK the argument
@@ -1690,7 +3199,20 @@ impl TypeChecker {
                         // this, `hanoi` calling itself produced an unresolved type and
                         // anything dispatched on the result failed.
                         self.bind_poly(name, declared.clone(), generics.clone());
-                        self.check(value, &instance)?;
+                        // The declared RESULT, when it is one of the annotation's own
+                        // variables, belongs to the caller: the body must produce it
+                        // from its arguments, not decide what it is. Only while this
+                        // body is checked, and only when no `where` clause is in play —
+                        // `make : Str -> a where [a.from_quote : ...]` really does
+                        // return a `Str`, and `where` is tracked by method name here,
+                        // not per variable.
+                        let rigid = self.rigid_result(&instance);
+                        self.rigid_vars.extend(rigid.iter().copied());
+                        let outcome = self.check(value, &instance);
+                        for v in &rigid {
+                            self.rigid_vars.remove(v);
+                        }
+                        outcome?;
                         self.bind_poly(name, declared.clone(), generics);
                     }
                     // Inferred: generalise, exactly as an annotated binding is. Without
@@ -1712,6 +3234,17 @@ impl TypeChecker {
                         // `unify` marks every variable a numeral's is bound to, either
                         // way round, so membership here is the whole test.
                         generics.retain(|v| !self.numeral_vars.contains(v));
+                        // A body that asks a parameter whether an operation OVERFLOWS
+                        // is asking about a WIDTH: `a.plus_overflows(b)` is a different
+                        // question at `U8` than at `I64`. Generalising leaves each use
+                        // its own copy, and a copy nothing pins defaults to `Dec`,
+                        // which has no such method. roc monomorphises per call site;
+                        // keeping one type makes every use agree instead, which is the
+                        // same answer whenever they share a width — and they must, for
+                        // the program to have a single meaning here.
+                        if width_sensitive(value) {
+                            generics.clear();
+                        }
                         // Walking the environment costs every binding in scope, so
                         // only a binding that still has something to quantify pays it.
                         // Most do not: a monomorphic `let` is the common case, and a
@@ -1741,12 +3274,92 @@ impl TypeChecker {
     ///
     /// ponytail: a partial table, covering the builtins that exist. Anything else is
     /// unconstrained, which costs only a chain off it.
+    /// The result of a SIMD call, given the vector type name and the method. Most
+    /// methods give back the same vector; the lane and bit views give integers.
+    fn simd_result(&mut self, module: &str, method: &str) -> Type {
+        let elem = match module {
+            "U8x16" => Type::U8, "I8x16" => Type::I8,
+            "U16x8" => Type::U16, "I16x8" => Type::I16,
+            "U32x4" => Type::U32, "I32x4" => Type::I32,
+            "U64x2" => Type::U64, "I64x2" => Type::I64,
+            _ => Type::I64,
+        };
+        let vector = Type::Nominal { name: module.to_string(), backing: Box::new(Type::U128) };
+        match method {
+            "get_lane" => elem,
+            "to_u128_bits" => Type::U128,
+            "to_list" => Type::List(Box::new(elem)),
+            "to_inspect" => Type::Str,
+            "is_eq" => Type::Bool,
+            _ => vector,
+        }
+    }
+
+    /// A crypto `Digest`/`Hasher` as a nominal, so `.to_hex()`/`.finish()` dispatch on
+    /// it reaches `builtin_result`.
+    fn crypto_nominal(name: &str) -> Type {
+        Type::Nominal {
+            name: name.to_string(),
+            backing: Box::new(Type::closed_record(vec![("bytes".to_string(), Type::List(Box::new(Type::U8)))])),
+        }
+    }
+
+    /// The result type of a synthetic crypto qualified call, or `None` if `module` is
+    /// not one of them.
+    fn crypto_result(module: &str, method: &str) -> Option<Type> {
+        if !(module.starts_with("Sha256") || module.starts_with("Blake3")) {
+            return None;
+        }
+        let digest = Self::crypto_nominal("CryptoDigest");
+        let try_digest = Type::TagUnion {
+            tags: vec![
+                ("Err".to_string(), vec![Type::TypeVar(u32::MAX)]),
+                ("Ok".to_string(), vec![digest.clone()]),
+            ],
+            open: true,
+        };
+        Some(match method {
+            "hash" | "hash_chunks" | "finish" => digest,
+            "empty" | "write" => Self::crypto_nominal("CryptoHasher"),
+            "to_hex" => Type::Str,
+            "to_bytes" => Type::List(Box::new(Type::U8)),
+            "is_eq" => Type::Bool,
+            "from_hex" | "from_bytes" => try_digest,
+            _ => return None,
+        })
+    }
+
     fn builtin_result(
         &mut self,
         method: &str,
         receiver: Option<&Type>,
         args: &[Type],
     ) -> Type {
+        self.note_polymorphic_use(method, receiver, args);
+        // A SIMD vector answers its methods in method syntax too.
+        if let Some(Type::Nominal { name, .. }) = receiver {
+            if crate::eval::simd_kind(name).is_some() {
+                return self.simd_result(&name.clone(), method);
+            }
+        }
+        // A crypto digest/hasher answers its methods in method syntax too.
+        if let Some(Type::Nominal { name, .. }) = receiver {
+            if name == "CryptoDigest" || name == "CryptoHasher" {
+                if let Some(result) = Self::crypto_result(name, method) {
+                    return result;
+                }
+                // to_hex/to_bytes/is_eq/finish are not keyed on the module here, so map
+                // them directly.
+                match method {
+                    "to_hex" => return Type::Str,
+                    "to_bytes" => return Type::List(Box::new(Type::U8)),
+                    "is_eq" => return Type::Bool,
+                    "finish" => return Self::crypto_nominal("CryptoDigest"),
+                    "write" => return Self::crypto_nominal("CryptoHasher"),
+                    _ => {}
+                }
+            }
+        }
         match method {
             "to_str" | "inspect" => Type::Str,
             // `concat` keeps the RECEIVER's type: `Str.concat` gives a Str, and
@@ -1758,15 +3371,20 @@ impl TypeChecker {
             },
             "is_empty" | "not" => Type::Bool,
             "len" => Type::I64,
+            // `Str.to_utf8` and `Str.iter_utf8` give bytes, so their element is `U8` —
+            // without this a `line.to_utf8()` on an unresolved parameter came back as a
+            // list of an unknown element, and a literal beside it defaulted to `Dec`.
+            "to_utf8" => Type::List(Box::new(Type::U8)),
             // `fold` returns its accumulator — the first argument after the receiver,
             // which a name-only table cannot express.
             "fold" => args.first().cloned().unwrap_or_else(|| self.fresh_var()),
             // `map` keeps the receiver's shape with a new element type.
             "map" => Type::List(Box::new(self.fresh_var())),
             // An iterator is walked with the List methods here, so it is typed as the
-            // List it behaves like. Without this `xs.iter().map(f)` dispatches `map` on
-            // an unconstrained variable, and the module it belongs to is unknowable.
-            "iter" | "iter_rev" => Type::List(Box::new(self.fresh_var())),
+            // List it behaves like — KEEPING the element type, so `(1..=n).iter()`
+            // carries the range's element to whatever consumes it, and a later
+            // `.map(f)` or annotation can still pin it rather than letting it default.
+            "iter" | "iter_rev" | "rev" | "clear" => Type::List(Box::new(self.element_of(receiver))),
             // These give back what they were handed.
             "reverse" | "sort_with" | "drop_first" | "drop_last" | "append" | "prepend" => {
                 receiver.cloned().unwrap_or_else(|| self.fresh_var())
@@ -1788,7 +3406,116 @@ impl TypeChecker {
                 open: true,
             },
             "join_with" | "with_ascii_uppercased" | "with_ascii_lowercased" | "trim" => Type::Str,
+            // The iterator API, over a list or a range: an `Iter` is the list it walks.
+            "step_by" | "keep_if" | "drop_if" | "take_first" | "take_last"
+            | "sublist" | "sort" | "sort_by" | "sort_reversed" | "sort_by_reversed"
+            | "sort_with_reversed" | "drop_at" | "drop_swap" | "append_sublist"
+            | "collect" | "prepended" => self.list_like(receiver),
+            "single" => Type::List(Box::new(receiver.cloned().unwrap_or_else(|| self.fresh_var()))),
+            "with_index" => {
+                let item = self.element_of(receiver);
+                Type::List(Box::new(Type::Tuple(vec![Type::U64, item])))
+            }
+            "sum" => self.element_of(receiver),
+            "any" | "all" | "contains" => Type::Bool,
+            "capacity" => Type::U64,
+            // `a.min(b)` is the NUMERIC two-argument form and gives back a number;
+            // `xs.min()` is the list one and gives back a `Try`. Only the arity tells
+            // them apart, and an unresolved receiver took the list reading — so
+            // `c.x > a.x.min(b.x)` compared a number with a `Result`.
+            "min" | "max" if !args.is_empty() => {
+                let ty = receiver.cloned().unwrap_or_else(|| self.fresh_var());
+                let _ = self.unify(&ty, &args[0]);
+                self.apply(&ty)
+            }
+            // The INDEX of a match is a `U64`, not the element.
+            "find_first_index" | "find_last_index" => {
+                let index = Type::U64;
+                self.try_of(index)
+            }
+            "find_first" | "first" | "last" | "get" | "min" | "max" | "product" => {
+                let item = self.element_of(receiver);
+                self.try_of(item)
+            }
+            "set" | "swap" | "update" | "insert" => {
+                let list = self.list_like(receiver);
+                self.try_of(list)
+            }
+            "split_at" => {
+                let list = self.list_like(receiver);
+                Type::closed_record(vec![("before".to_string(), list.clone()), ("others".to_string(), list)])
+            }
+            "next" if self.is_list_like(receiver) => {
+                let item = self.element_of(receiver);
+                let rest = self.list_like(receiver);
+                Type::TagUnion {
+                    tags: vec![
+                        ("Done".to_string(), vec![]),
+                        (
+                            "One".to_string(),
+                            vec![Type::closed_record(vec![("item".to_string(), item), ("rest".to_string(), rest.clone())])],
+                        ),
+                        ("Skip".to_string(), vec![Type::closed_record(vec![("rest".to_string(), rest)])]),
+                    ],
+                    open: true,
+                }
+            }
+            "size_hint" if self.is_list_like(receiver) => Type::TagUnion {
+                tags: vec![("Known".to_string(), vec![Type::U64]), ("Unknown".to_string(), vec![])],
+                open: true,
+            },
+            // `n.range_exclusive_to(m)` in method syntax builds a range of the
+            // receiver's numeric type.
+            "range_exclusive_to" | "range_inclusive_to" | "range_exclusive_from" | "range_inclusive_from" => {
+                Type::Range(Box::new(receiver.cloned().unwrap_or_else(|| self.fresh_var())))
+            }
+            // Bit shifts, wrapping/saturating arithmetic and negate keep the receiver's
+            // width, so `a.shl_wrap(2).shr_wrap(1)` on a `U32` stays a `U32` and the
+            // second shift has a known receiver.
+            "shl_wrap" | "shr_wrap" | "shr_zf_wrap" | "negate"
+            | "plus_wrap" | "minus_wrap" | "times_wrap"
+            | "plus_saturated" | "minus_saturated" | "times_saturated"
+            | "bitwise_and" | "bitwise_or" | "bitwise_xor" | "bitwise_not"
+                if receiver.is_some_and(|t| self.apply(t).is_integer()) =>
+            {
+                receiver.cloned().unwrap_or_else(|| self.fresh_var())
+            }
+            "fold_with_index" => args.first().cloned().unwrap_or_else(|| self.fresh_var()),
             _ => self.fresh_var(),
+        }
+    }
+
+    /// Could the receiver be a list? A record or a nominal cannot — those answer
+    /// `next` from their own fields and methods.
+    fn is_list_like(&self, receiver: Option<&Type>) -> bool {
+        !matches!(
+            receiver.map(|t| self.apply(t)),
+            Some(Type::Record { .. } | Type::Nominal { .. } | Type::Str | Type::Bool)
+        )
+    }
+
+    /// The receiver as a list: itself if it is one, a list of something for a range.
+    fn list_like(&mut self, receiver: Option<&Type>) -> Type {
+        match receiver.map(|t| self.apply(t)) {
+            Some(list @ Type::List(_)) => list,
+            Some(Type::Range(elem)) => Type::List(elem),
+            _ => Type::List(Box::new(self.fresh_var())),
+        }
+    }
+
+    /// The receiver's element type, where it is known to be a list.
+    fn element_of(&mut self, receiver: Option<&Type>) -> Type {
+        match receiver.map(|t| self.apply(t)) {
+            Some(Type::List(inner)) | Some(Type::Range(inner)) => *inner,
+            _ => self.fresh_var(),
+        }
+    }
+
+    /// `Try(ok, _)`: an open union of `Ok(ok)` and an `Err` of anything.
+    fn try_of(&mut self, ok: Type) -> Type {
+        Type::TagUnion {
+            tags: vec![("Err".to_string(), vec![self.fresh_var()]), ("Ok".to_string(), vec![ok])],
+            open: true,
         }
     }
 
@@ -1802,7 +3529,18 @@ impl TypeChecker {
         match pattern {
             Pattern::Wildcard => {}
             Pattern::Binding(name) => self.bind(name, scrutinee.clone()),
-            Pattern::Int(_) | Pattern::Float(_) | Pattern::Str(_) => {}
+            Pattern::Int(_) | Pattern::Float(..) | Pattern::Str(_) => {}
+            Pattern::StrInterp { segments, .. } => {
+                for (name, _) in segments {
+                    if *name != "_" {
+                        self.bind(name, Type::Str);
+                    }
+                }
+            }
+            Pattern::As { name, inner } => {
+                self.bind(name, scrutinee.clone());
+                self.bind_pattern(inner, scrutinee);
+            }
             Pattern::Tag { name, args } => {
                 let payload = match scrutinee {
                     Type::TagUnion { tags, .. } => tags
@@ -1835,6 +3573,21 @@ impl TypeChecker {
                         _ => None,
                     }
                     .unwrap_or_else(|| self.fresh_var());
+                    // Destructuring an OPTIONAL field gives `Ok(value)` or
+                    // `Err(MissingField)`, never the bare value.
+                    let ty = match ty {
+                        Type::Optional(inner) => Type::TagUnion {
+                            tags: vec![
+                                ("Err".to_string(), vec![Type::TagUnion {
+                                    tags: vec![("MissingField".to_string(), vec![])],
+                                    open: true,
+                                }]),
+                                ("Ok".to_string(), vec![*inner]),
+                            ],
+                            open: true,
+                        },
+                        other => other,
+                    };
                     self.bind_pattern(pattern, &ty);
                 }
 
@@ -1905,9 +3658,24 @@ impl TypeChecker {
     fn pattern_type(&mut self, pattern: &Pattern) -> Result<Type, TypeError> {
         Ok(match pattern {
             Pattern::Wildcard | Pattern::Binding(_) => self.fresh_var(),
-            Pattern::Int(_) => Type::I64,
-            Pattern::Float(_) => Type::F64,
-            Pattern::Str(_) => Type::Str,
+            // A literal pattern is as polymorphic as the literal: a numeral, or a
+            // string that may be a nominal with `from_quote`.
+            Pattern::Int(_) | Pattern::Float(..) => {
+                let var = self.fresh_var();
+                if let Type::TypeVar(v) = var {
+                    self.numeral_vars.insert(v);
+                }
+                var
+            }
+            Pattern::Str(_) if self.quotable => {
+                let var = self.fresh_var();
+                if let Type::TypeVar(v) = var {
+                    self.quote_vars.insert(v);
+                }
+                var
+            }
+            Pattern::Str(_) | Pattern::StrInterp { .. } => Type::Str,
+            Pattern::As { inner, .. } => self.pattern_type(inner)?,
             Pattern::Tag { name, args } => {
                 let mut payload = Vec::with_capacity(args.len());
                 for arg in args {
@@ -2005,6 +3773,20 @@ impl TypeChecker {
             {
                 Ok(())
             }
+            // An optional field HOLDS a value of its inner type — `{ a ?: U8 }` accepts
+            // `{ a: 5 }`. Peeled ahead of the TypeVar arms so an inferred field
+            // variable binds to `U8` rather than to `U8?`, which the numeral guard
+            // below rejects outright ("A number cannot be used as U8?").
+            (Type::Optional(_), Type::TypeVar(v)) | (Type::TypeVar(v), Type::Optional(_))
+                if !self.committed_vars.contains(v) =>
+            {
+                let inner = match (&t1, &t2) {
+                    (Type::Optional(i), _) | (_, Type::Optional(i)) => (**i).clone(),
+                    _ => unreachable!("matched"),
+                };
+                let other = Type::TypeVar(*v);
+                self.unify(&inner, &other)
+            }
             (Type::TypeVar(v), t) | (t, Type::TypeVar(v)) => {
                 // A NUMERAL variable stands for a number whose width is not yet fixed,
                 // not for anything at all. Letting it become a `Bool` or a function is
@@ -2020,10 +3802,46 @@ impl TypeChecker {
                     } else if self.numeral_vars.contains(w) {
                         self.numeral_vars.insert(*v);
                     }
+                    if self.quote_vars.contains(v) {
+                        self.quote_vars.insert(*w);
+                    } else if self.quote_vars.contains(w) {
+                        self.quote_vars.insert(*v);
+                    }
                 }
+                // A RIGID variable is the CALLER's choice, not the body's: in
+                // `get_err : [Ok(a), Err(e)] -> e` the result is whatever `e` the
+                // caller supplied, so an arm answering `""` is wrong however well a
+                // `Str` would fit this one call. Binding to another variable is fine —
+                // that is still "whatever the caller picks".
+                if self.rigid_vars.contains(v) && !matches!(t, Type::TypeVar(_)) {
+                    return Err(TypeError {
+                        message: format!("{} is the caller's to choose, so this cannot answer {}", t1, t),
+                        expected: t1.to_string(),
+                        actual: t2.to_string(),
+                        line: 0,
+                        col: 0,
+                    });
+                }
+                // A string literal is a `Str` or a nominal with `from_quote` (an
+                // interpolated one, `from_interpolation`), and nothing else.
+                if self.quote_vars.contains(v)
+                    && !matches!(t, Type::TypeVar(_) | Type::Str)
+                    && !matches!(t, Type::Nominal { name, .. }
+                        if self.has_method(name, "from_quote") || self.has_method(name, "from_interpolation"))
+                {
+                    return Err(TypeError {
+                        message: format!("A string literal cannot be used as {}", t),
+                        expected: t.to_string(),
+                        actual: "a string".to_string(),
+                        line: 0,
+                        col: 0,
+                    });
+                }
+                // A numeral may also be a nominal with `from_numeral`.
                 if self.numeral_vars.contains(v)
                     && !matches!(t, Type::TypeVar(_))
                     && !t.is_numeric()
+                    && !matches!(t, Type::Nominal { name, .. } if self.has_method(name, "from_numeral"))
                 {
                     return Err(TypeError {
                         message: format!("A number cannot be used as {}", t),
@@ -2077,7 +3895,20 @@ impl TypeChecker {
             // A RANGE satisfies a `List`: it answers the List methods, `for` walks
             // either, and `eval::module_for` calls a range a List too. Keeping them
             // apart would make a function that loops over its argument reject a range.
-            (Type::Range, Type::List(_)) | (Type::List(_), Type::Range) => Ok(()),
+            (Type::Range(a), Type::List(b)) | (Type::List(b), Type::Range(a)) => self.unify(a, b),
+
+            // A `Range(num)` nominal iterates as a list of its element, so it satisfies a
+            // `List` or a `..` range by matching its BACKING against the element — not the
+            // whole list, which the generic nominal-vs-other arm below would wrongly try.
+            // This is what lets `mk : U64 -> Range(U64)` accept `0..<n` and a `for` loop
+            // bind the element, while the nominal identity still routes `Range.custom`.
+            (Type::Nominal { name, backing }, Type::List(elem) | Type::Range(elem))
+            | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing })
+                if name == "Range" =>
+            {
+                let (backing, elem) = ((**backing).clone(), (**elem).clone());
+                self.unify(&backing, &elem)
+            }
 
             // Nominal against anything else: compare the backing type. roc accepts a
             // plain record where a `:=` nominal is expected, so this is deliberate
@@ -2098,12 +3929,10 @@ impl TypeChecker {
             // evaluator ever grows per-width arithmetic.
             (a, b) if a.is_integer() && b.is_integer() => Ok(()),
             (a, b) if a.is_fractional() && b.is_fractional() => Ok(()),
-            // A number LITERAL is polymorphic in roc: `46` is whatever the context
-            // wants, so `[46, 69] |> safe_variance` with `safe_variance : List(Dec)`
-            // is fine. Widths already unify freely for the reason above; the same
-            // reasoning applies across the integer/fractional line, since the
-            // evaluator converts between its two representations on demand.
-            (a, b) if a.is_numeric() && b.is_numeric() => Ok(()),
+            // A `Dec` beside an `I64` is a type error in roc (`1.0.Dec + 2.I64`), and
+            // it is one here: a numeral that could be either is a variable, handled
+            // above, so what reaches this line is two concrete types on opposite
+            // sides of the integer/fractional divide.
             // List unification
             (Type::List(a), Type::List(b)) => self.unify(a, b),
             // Tag-union unification is permissive: the shared tags must agree on
@@ -2199,6 +4028,20 @@ impl TypeChecker {
                 let other = other.clone();
                 self.unify(&inner, &other)
             }
+            // `{}` where a record of only optional fields is expected: the unit IS the
+            // empty record, and every field it lacks may be absent.
+            (Type::Unit, Type::Record { fields, open }) | (Type::Record { fields, open }, Type::Unit)
+                if *open || fields.iter().all(|(_, t)| matches!(t, Type::Optional(_))) =>
+            {
+                Ok(())
+            }
+            // `True` and `False` are the booleans spelled as tags: a `True` pattern
+            // against a `Bool` scrutinee, or a `Bool` where `[True, False]` is wanted.
+            (Type::Bool, Type::TagUnion { tags, .. }) | (Type::TagUnion { tags, .. }, Type::Bool)
+                if tags.iter().all(|(t, p)| matches!(t.as_str(), "True" | "False") && p.is_empty()) =>
+            {
+                Ok(())
+            }
             // Record unification, walked by NAME rather than position, because an
             // optional field may be absent on one side and so the two lists can differ
             // in length. A field missing from one side is only acceptable when the
@@ -2213,8 +4056,10 @@ impl TypeChecker {
                     match b.iter().find(|(n, _)| n == name) {
                         Some((_, tb)) => self.unify(ta, tb)?,
                         // An OPEN record promises only the fields it lists, so the
-                        // other side may lack the rest.
-                        None if *b_open || missing_ok(ta) => {}
+                        // other side may lack the rest. A CLOSED one lists them all,
+                        // and roc refuses a wider value against it — even when the
+                        // extra field is optional, because the layouts differ.
+                        None if *b_open => {}
                         None => {
                             return Err(TypeError {
                                 message: format!("Record is missing field `{}`", name),
@@ -2307,12 +4152,22 @@ fn module_of(ty: &Type) -> Option<&'static str> {
         Type::List(_) => "List",
         // A range answers the List methods — `(1..=n).iter().fold(..)` is the idiom —
         // and `eval::module_for` says the same about the runtime value.
-        Type::Range => "List",
-        // One integer representation and one float, so every width answers to the same
-        // method block — `is_numeric_module` accepts them all on the runtime side.
-        Type::U8 | Type::U16 | Type::U32 | Type::U64 | Type::U128 => "I64",
-        Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::I128 => "I64",
-        Type::F32 | Type::F64 => "F64",
+        Type::Range(_) => "List",
+        // Every integer width is its OWN module: `U8.shl_wrap(200, 1)` is 144 and
+        // `I64.shl_wrap(200, 1)` is 400, and the width is what the module name carries
+        // to `eval::call_numeric`. The runtime value is one `i128` for all of them.
+        Type::U8 => "U8",
+        Type::U16 => "U16",
+        Type::U32 => "U32",
+        Type::U64 => "U64",
+        Type::U128 => "U128",
+        Type::I8 => "I8",
+        Type::I16 => "I16",
+        Type::I32 => "I32",
+        Type::I64 => "I64",
+        Type::I128 => "I128",
+        Type::F32 => "F32",
+        Type::F64 => "F64",
         Type::Dec => "Dec",
         // A tuple has no method block and cannot be a nominal's backing, so naming it
         // here is what says "no user method owns this operator". A RECORD is left
@@ -2349,4 +4204,14 @@ fn type_named(module: &str) -> Option<Type> {
 /// `UserId.(7)`?
 fn expr_id_has_nominal(checker: &TypeChecker, expr: &Expr) -> bool {
     checker.nominal_literals.contains_key(&expr.id())
+}
+
+
+/// Does `expr` ask about a WIDTH — `a.plus_overflows(b)` and its siblings, whose answer
+/// differs per integer width? See the call site in `check_let`.
+fn width_sensitive(expr: &Expr) -> bool {
+    if matches!(expr, Expr::Dispatch { method, .. } if method.ends_with("_overflows")) {
+        return true;
+    }
+    expr.children().into_iter().any(width_sensitive)
 }

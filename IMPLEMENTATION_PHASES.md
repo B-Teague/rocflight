@@ -14,7 +14,11 @@ interpreter must produce identical output on both files** — four runs, one ans
 
 ## Status
 
-A feature is done when **all four outputs are byte-identical**:
+The definition of done has two parts. First, **roc's own eval tests**: rocflight runs
+as a backend of roc's eval harness, and full parity is every one of them passing —
+1,897 of 1,953 do as of 2026-09-18, measured by `tests/check_eval.sh`; Phase 23 below
+is the ledger of what does not. Second, per feature, **all four outputs are
+byte-identical**:
 
 ```
         roc run <sugared>   ═══   roc run <desugared>
@@ -353,9 +357,84 @@ Deliberate, and each one diverges from `roc` only where no golden pair can see i
 
 ---
 
+## Phase 23: roc's eval tests, as a backend
+
+roc's compiler carries its own evaluation tests — `roc-compiler/src/eval/test/`,
+2,299 `TestCase`s on the pinned checkout — and its own runner, which executes each
+through the interpreter, the dev backend and wasm and requires their `Str.inspect`
+strings to agree. rocflight is a fifth backend of that runner (`parallel_runner.zig`,
+`--rocflight <binary>`), so the question "does rocflight agree with roc" is answered by
+roc's harness on roc's tests, with roc's comparison. This is the parity gate; the
+golden pairs and the examples are the feature-by-feature view underneath it.
+
+```bash
+tests/check_eval.sh                # build the runner if needed, run everything
+tests/check_eval.sh --strict       # done means: this is green
+tests/check_eval.sh --filter Dict  # one subsystem
+```
+
+### Where it stands (2026-09-17)
+
+| | |
+|---|---|
+| Tests run | 2,087 (212 are opt-in proof cases the runner excludes by default) |
+| With a backend row | 1,953 — rocflight passed **957**; **1,192** after `EVAL_PARITY_PLAN.md` phases 0 and 1 (integer widths); **1,321** after phase 2 (floats and `Dec`); **1,565** after phase 3 (`Str`, `List`, `Iter`, `Box`); **1,632** after phase 4 (nominal tags); **1,668** after phase 5 (the checker); **1,706** after phase 6 (the parser); **1,736** after phase 7 (dispatch and semantics); **1,769** after phase 8 (numerals, `from_quote`, `from_interpolation`, literal patterns on nominals); **1,782** after phase 9 (a lazy `Iter`, non-integer ranges); **1,786** after phase 10 so far (pipe first-arg, imported nominals, `where`-dispatch); **1,791** after phase 11 so far (`.?` chains, optional-field `if` checking); **1,800** after type-level monomorphization (qualified-call arg checking, `{}`-materializes-defaults); **1,821** after phase 12 (`U128` as a real `u128`, overflow crashes); **1,829** after phase 13 so far (structural `Dict` keys, `Set` dedup); **1,847** after phase 14 (SHA-256, BLAKE3); **1,885** after phase 15 (SIMD vector types); phase 16 refused two more problem tests (`to_inspect` return type, B031), 50 of 71; **1,890** after phase 17 so far (tuple-pattern `var`, `to_utf8` typing, `as`-pattern exhaustiveness, `while True`, long-form `Dec` patterns); **1,894** after phase 18 (nominal identity at run time: first-class builtins in tail position, SIMD-backed nominals, top-level `to_inspect`); **1,897** after phase 19 (parameterized nominals: `Set` element threading, structural container `is_eq`/`to_hash`, `Range` over a third-party type) |
+| Problem tests (must be rejected) | 71 — rocflight rejected 22, and 47 after phase 5 |
+| Hang | 2 originally — `var` reassignment through a tuple pattern shadowed the `var`; fixed in phase 7, none remain |
+
+The 996 misses, by what rocflight said, from a run through a logging wrapper:
+
+| Count | Kind | Largest members |
+|---|---|---|
+| ~600 | `Unknown function` — a builtin that is neither Rust nor a loaded member | `I64.count_*_bits` / `shl_wrap` / `shr_wrap` (~170, and they need the integer WIDTH rocflight erases), `Box.box` (35), `List.iter_rev` / `sort_with` / `capacity` / `step_by`, `F64.from_bits` / `to_bits`, `Str.repeat` / `caseless_ascii_equals` / `drop_prefix`, the whole `Iter` module, `Dec` conversions |
+| 183 | `Type error` — the checker rejects a program roc accepts | see the `Type error` files in a logged run |
+| 125 | Wrong value | `<function>` inspects as `<lambda \|x\|>`; a missing optional field prints as `{ b: 2 }` not `{ a: <missing>, b: 2 }`; `Dec` vs `I64` defaults in tuples; `Str.inspect` of a string in a block answers `"ok"` with quotes where roc answers `ok` |
+| ~30 | Parse error | string patterns with interpolation, `\|` inside lambda params, top-level `..rest` destructuring |
+| ~20 | `Undefined variable` | names bound by patterns rocflight does not support |
+| 11 | ambiguous dispatch | two nominals defining the same method name (`Dict.to_hash`, `Set.to_hash`) |
+
+Two things measured and rejected on the way:
+
+- **Loading the Roc-bodied builtin members** (`Str`, `List`, `Iter` from `Builtin.roc`)
+  for every program made it worse — 923 instead of 957 — because their definitions
+  shadow working Rust builtins with bodies that reach intrinsics rocflight lacks.
+  Widening `needed_by` is not the route; implementing the intrinsics is.
+- **Every test as a `main` in a module** is a compile-time root that roc folds before
+  any backend runs, which is why the runner's `.expr` tests are expressions.
+
+### The plan
+
+`EVAL_PARITY_PLAN.md` is the plan. Its first seven phases (below, for the record)
+are done; it now continues as phases 8 to 17, one per remaining family: numerals
+through `from_numeral`/`from_quote`/`from_interpolation` (35, done: 1,769), a lazy
+`Iter` and non-integer ranges (22, done: 1,782), generic and cross-module dispatch (27), optional and
+defaulted fields (14), 128-bit integers and overflow crashes (22), `Set`/`Dict`
+structural keys and codecs (18), crypto (18), SIMD (39), the 23 problem tests still
+accepted, and a 24-test long tail. Each is checked by its own `--filter`.
+
+The first plan, in the order that turned the most rows green per change:
+
+1. **Integer width at run time.** `Value::Int` is one `i128` for every width, so
+   `U8.count_leading_zero_bits(1)` cannot answer 7. Carry the width (the checker knows
+   it) and the ~170 bit-operation tests plus the wrapping arithmetic follow.
+2. **The missing builtins**, Rust for the intrinsics and `Builtin.roc`'s own bodies
+   where a member's definition runs cleanly on its own: `Box`, `Iter`, the `List` and
+   `Str` long tail, `F64`/`F32` bits, `Dec` conversions.
+3. **Inspect fidelity**: `<function>`, `<missing>` optional fields, and the numeric
+   default inside tuples and lists.
+4. **The checker's over-rejections** — 183 type errors on programs roc compiles — and
+   its under-rejections, the 39 problem tests it runs.
+5. **The parser's gaps**: interpolated string patterns, lambda parameter forms,
+   top-level rest destructuring.
+6. The `while` + tuple-pattern hang.
+
+A row of that table is closed when `tests/check_eval.sh --filter <name>` passes for
+every test in it, not when the builtin exists.
+
 ## Order
 
-Every phase through 22 is implemented: 98 golden pairs pass under `--strict`, 439 Rust
+Phase 23 is open, and it is the one that matters: every gap it lists is a program roc
+runs and rocflight does not. Every phase through 22 is implemented: 98 golden pairs pass under `--strict`, 439 Rust
 tests pass, and 12 of the 19 comparable language examples match `roc` byte for byte.
 What remains is listed as Known ceilings above, plus the seven subsystems named in
 `tests/check_examples.sh`.

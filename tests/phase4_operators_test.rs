@@ -196,7 +196,7 @@ mod phase4_tests {
     // Logical operators
     #[test]
     fn test_eval_logical_and_true() {
-        let mut parser = Parser::new("1 && 1");
+        let mut parser = Parser::new("True and True");
         let expr = parser.parse_expr().unwrap();
         let result = rocflight::vm::eval(&expr).unwrap();
         match result {
@@ -209,7 +209,7 @@ mod phase4_tests {
 
     #[test]
     fn test_eval_logical_and_false() {
-        let mut parser = Parser::new("1 && 0");
+        let mut parser = Parser::new("True and False");
         let expr = parser.parse_expr().unwrap();
         let result = rocflight::vm::eval(&expr).unwrap();
         match result {
@@ -222,7 +222,7 @@ mod phase4_tests {
 
     #[test]
     fn test_eval_logical_or_true() {
-        let mut parser = Parser::new("0 || 1");
+        let mut parser = Parser::new("False or True");
         let expr = parser.parse_expr().unwrap();
         let result = rocflight::vm::eval(&expr).unwrap();
         match result {
@@ -235,7 +235,7 @@ mod phase4_tests {
 
     #[test]
     fn test_eval_logical_or_false() {
-        let mut parser = Parser::new("0 || 0");
+        let mut parser = Parser::new("False or False");
         let expr = parser.parse_expr().unwrap();
         let result = rocflight::vm::eval(&expr).unwrap();
         match result {
@@ -359,7 +359,7 @@ mod phase4_tests {
 
     #[test]
     fn test_type_check_logical() {
-        let mut parser = Parser::new("1 && 0");
+        let mut parser = Parser::new("True and False");
         let expr = parser.parse_expr().unwrap();
         let mut type_checker = TypeChecker::new();
         let result = type_checker.synth(&expr);

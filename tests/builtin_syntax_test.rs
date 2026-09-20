@@ -291,6 +291,20 @@ fn run_with(src: &str, builtins: &[&str]) -> Result<String, String> {
         dec_literals: checker.dec_literals(),
         fractional_literals: checker.fractional_literals(),
         parse_targets: checker.json_parse_targets(),
+        collect_targets: checker.collect_targets(),
+        f32_literals: checker.f32_literals(),
+        u128_literals: checker.u128_literals(),
+        default_sites: checker.default_sites(),
+        nominal_defaults: Default::default(),
+        missing_fields: checker.missing_fields(),
+        run_expects: false,
+        conversions: checker.literal_conversions(),
+        numeral_texts: Default::default(),
+        coerce_values: checker.coerce_values(),
+        coerce_params: checker.coerce_params(),
+        zero_sized_capacity: checker.zero_sized_capacity(),
+        match_types: checker.match_types(),
+        for_iter_calls: checker.for_iter_calls(),
         nominals: loaded
             .iter()
             .flat_map(|l| l.nominals.iter().cloned())
@@ -475,12 +489,16 @@ fn the_numeric_width_operations_respect_their_width() {
     assert_eq!(call("U8", "to_i8_wrap", vec![255]), "-1");
     assert_eq!(call("U32", "bitwise_and", vec![0xF0, 0x3C]), "48");
 
-    // `highest` saturates to what an i64 can hold, because that IS the ceiling here.
-    // Wrapping `U64.highest` to -1 made Builtin.roc's `if b > U64.highest - a` fire on
-    // every insert and crash with "Dict capacity overflow".
+    // `highest` is the width's own bound: the value is an i128, so `U64.highest` is
+    // held in full. (It used to saturate to i64::MAX, when the value was an i64.)
     assert_eq!(call("U32", "highest", vec![]), "4294967295");
-    assert_eq!(call("U64", "highest", vec![]), i64::MAX.to_string());
+    assert_eq!(call("U64", "highest", vec![]), u64::MAX.to_string());
     assert_eq!(call("I8", "lowest", vec![]), "-128");
+    // The bit counts and the checked conversions read the width the same way.
+    assert_eq!(call("U8", "count_leading_zero_bits", vec![1]), "7");
+    assert_eq!(call("I8", "mod_by", vec![-7, 3]), "2");
+    assert_eq!(call("U8", "to_i8_try", vec![200]), "Err(OutOfRange)");
+    assert_eq!(call("U8", "plus_wrap", vec![255, 1]), "0");
 }
 
 #[test]

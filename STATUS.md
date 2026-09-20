@@ -1,5 +1,9 @@
 # Roc Interpreter - Project Status
 
+> **2026-09-17:** the live status is the table at the top of `README.md`, and the
+> parity measure is roc's own eval suite with rocflight as a backend of roc's harness:
+> `tests/check_eval.sh`, 1,936 of 1,953 passing, plan in `EVAL_PARITY_PLAN.md`. What follows is the Phase 6 snapshot and is kept for history.
+
 **Last Updated:** 2026-09-12  
 **Project Status:** ✅ Phase 6 Parser/Desugarer Complete, Critical Bug Fixed  
 **Code Quality:** 9.3/10 (Professional, production-grade)  

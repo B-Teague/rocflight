@@ -241,6 +241,7 @@ pub extern "C" fn roc_main(args: RocList) -> i32 {
             Value::Int(code) => code as i32,
             // A numeral the checker could not pin to I32 is still a whole number here.
             Value::Float(code) => code as i32,
+            Value::F32(code) => code as i32,
             Value::Dec(code) => (code / 1_000_000_000_000_000_000) as i32,
             other => crashed(&format!("the platform's entry point returned {}, not an I32", other)),
         },
