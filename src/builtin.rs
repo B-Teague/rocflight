@@ -222,7 +222,12 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
     if selected.is_empty() {
         return Ok(Vec::new());
     }
+    // Per-member timing, when `ROCFLIGHT_TIME` asks for it. Which member's parse costs
+    // what is the whole question this phase of `OPTIMIZATION_PLAN.md` is about, and the
+    // first `members_where` also pays for `index`'s one scan of all 700kB.
+    let mut step = std::time::Instant::now();
     let mut sliced = members_where(|name| selected.contains(&name));
+    crate::tick("slice + index", &mut step);
     // What the OTHER members say, which is all the low-level section is loaded for.
     let referenced: String =
         sliced.iter().filter(|m| m.name != "(low level)").map(|m| m.source.as_str()).collect();
@@ -235,12 +240,14 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
         let mut member = sliced.remove(at);
         if member.name == "(low level)" && !referenced.is_empty() {
             member.source = reachable(&member.source, &referenced);
+            crate::tick("  (low level) reachable", &mut step);
         }
         let desugared = Desugarer::new(member.source)
             .desugar()
             .map_err(|e| format!("builtin `{}`: {}", name, e))?;
         let mut parser = Parser::new(&desugared);
         let ast = parser.parse_expr().map_err(|e| format!("builtin `{}`: {}", name, e))?;
+        crate::tick(format_args!("  {} parse", name), &mut step);
         let intrinsics = parser
             .intrinsics()
             .iter()
@@ -350,8 +357,13 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     if let Some(found) = cache.lock().expect("signature cache").get(module) {
         return found;
     }
+    // Timed because this RE-PARSES a member `load` may already have parsed — the
+    // measured 0.4ms of a `Dict` program and 1.4ms of a program that merely calls
+    // `.map`. See `OPTIMIZATION_PLAN.md`, phase 1.3.
+    let mut step = std::time::Instant::now();
     let parsed: &'static [(&'static str, crate::types::Type)] =
         Box::leak(parse_signatures(module));
+    crate::tick(format_args!("signatures_for({})", module), &mut step);
     cache.lock().expect("signature cache").insert(module.to_string(), parsed);
     parsed
 }

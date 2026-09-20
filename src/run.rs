@@ -58,6 +58,8 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // `roc test` times the whole invocation, compile included, not just the expects.
     let started = Instant::now();
 
+    // Phase timing, when `ROCFLIGHT_TIME` asks for it: see `crate::tick`.
+    let mut phase = Instant::now();
     // Step 1: Load and desugar file.
     //
     // The source is read and parsed on every run. Nothing is cached between runs, so
@@ -77,12 +79,14 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         eprintln!("=== END DESUGARED CODE ===\n");
     }
 
+    crate::tick("desugar", &mut phase);
     // Step 2: Parse desugared code (includes AST building)
     let mut parser = Parser::named(filename, &desugared);
     let (ast, app_entry_point) = {
         let expr = parser.parse_expr()?;
         (expr, parser.app_entry_point())
     };
+    crate::tick("parse", &mut phase);
     // Every node so far is the app's; modules parsed from here on are not.
     let app_nodes = crate::ast::node_count();
 
@@ -129,6 +133,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // only be a way to run a program against a runtime that is not the real one.
     let builtins = crate::builtin::load(&needed)?;
 
+    crate::tick("builtin::load", &mut phase);
     // Step 2c: Local modules — `import Hello exposing [hello]`.
     //
     // Each is an ordinary .roc beside the importer. Its top level is evaluated into
@@ -187,6 +192,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         platform_loaded.push(loaded);
     }
 
+    crate::tick("modules + platform", &mut phase);
     // Step 3: Type check
     let mut type_checker = TypeChecker::new();
     // Declarations first, so a name used before it is declared — or declared in a
@@ -283,6 +289,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         return Ok(None);
     }
 
+    crate::tick("type check", &mut phase);
     let ingested: Vec<(&'static str, String)> = parser
         .ingests()
         .iter()
@@ -392,8 +399,10 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         intrinsics: builtins.iter().flat_map(|b| b.intrinsics.iter().copied()).collect(),
         test_mode,
     };
+    crate::tick("build the unit", &mut phase);
     let program = std::rc::Rc::new(crate::vm::compile_unit(&unit)?);
 
+    crate::tick("compile", &mut phase);
     // Step 5: run the top level, then the app's entry point if it declared one.
     //
     // Top-level `expect`s are compiled in only under `test`; an ordinary run skips
@@ -404,6 +413,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     } else {
         (crate::vm::run_with_args(&program, args)?, None)
     };
+    crate::tick("run", &mut phase);
     Ok(Some(Ran { value, is_app: app_entry_point.is_some(), inspected, elapsed: started.elapsed() }))
 }
 

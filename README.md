@@ -271,9 +271,11 @@ evaluates a pure call with literal arguments at compile time — `go(0, 0)` and
 as a 14ms floor. And the programs use roc's own names: `Try.ok_or`, not the invented
 `with_default`, and `List.from_iter` rather than treating an iterator as a list.
 
-`OPTIMIZATION_PLAN.md` has the full method: every phase with its measurements, the
-targets that were missed and by how much, three optimizations that were measured and
-**rejected**, two gate corrections, and the four things the compiler refuses on purpose.
+`OPTIMIZATION_PLAN.md` is the plan for what is left, and it is not the VM: on a short
+program the VM is 1-4% of the time and the rest is the front end re-deriving facts
+about `Builtin.roc`, a file that ships inside the binary. It carries the measurements,
+the phases in the order they are worth doing, and what is deliberately not being done.
+Set `ROCFLIGHT_TIME=1` on any run to see the phases for yourself.
 
 ---
 
@@ -293,7 +295,7 @@ tests/bench/     benchmark programs and the saved baseline
 |---|---|
 | `IMPLEMENTATION_PHASES.md` | all 22 phases, what each exposed, and the known ceilings |
 | `PHASE_IMPLEMENTATION_GUIDE.md` | the golden-pair rule and how to add a feature |
-| `OPTIMIZATION_PLAN.md` | performance method, results, and the register-VM plan |
+| `OPTIMIZATION_PLAN.md` | where the time goes, measured, and the phased plan for it |
 | `TESTING_STRATEGY.md` | how the gates fit together, the eval harness first |
 | `EVAL_PARITY_PLAN.md` | the phased road to all of roc's eval tests, 957 → 1,953, every phase measured; finished 2026-09-19 |
 | `BUILTIN_PLAN.md` | how the vendored `Builtin.roc` is read, loaded and bounded |
