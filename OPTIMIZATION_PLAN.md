@@ -201,7 +201,12 @@ ROCFLIGHT_TIME=1 ./target/release/rocflight eval main.roc
 [time]                      run    0.076ms      <- the VM, 2% of the program
 ```
 
-`crate::timing()` and `crate::tick()` in `src/lib.rs` are the whole of it: `timing`
+A second probe earned its place while Phase 4.1 was being diagnosed:
+`ROCFLIGHT_CODE=1` dumps every compiled chunk's opcodes and constants — the bytecode
+counterpart of the existing `--show-ast`. It is what showed that 4.1's stated cause was
+not the cause, so it stayed.
+
+`crate::timing()` and `crate::tick()` in `src/lib.rs` are the whole of the timing side: `timing`
 reads the variable once into a `OnceLock`, `tick` prints the DELTA since the previous
 boundary and resets the clock. Nine call sites in `run::run_file`, three in
 `builtin.rs` (the slice, the low-level pruning, each member's parse) and one on
@@ -424,23 +429,66 @@ and a literal lambda is already inlined into them.
 
 Ordered by measured evidence, strongest first.
 
-### 4.1 — `BinInt` is not firing where it should — measured 3×
+### 4.1 — the 3× was never `BinInt` — **done, −31%**
 
-`for _x in 1..=2000000 { t = t + 1 }` is 508–572ms; the same loop with a variable
-operand is 104–174ms, and both print the same answer. Same shape, same result, 3× the
-time — so the specialised opcode is missing the literal-operand node.
+The claim was that `t = t + 1` misses the specialised integer opcode, because that loop
+ran at 508–572ms where the same loop with a variable operand ran at 104–174ms, same
+answer. **It does not miss it.** Both loops emit `BinInt { op: Add, width: 192 }`. What
+differs is the constant pool:
 
-Start at `TypeChecker::integer_binops`, which keeps a binop node only when
-`self.apply(ty).is_integer()`. Find out whether the node's type is genuinely
-unresolved, whether the accumulator's `var` type never unifies with the binop's, or
-whether the literal defaults fractional and the operation really is `Dec` arithmetic.
-**Confirm the mechanism before changing anything** — the fix differs completely between
-those three, and a wrong guess here makes numbers wrong rather than slow.
+```
+t + x:  consts [Int(0), Int(1),   Int(3),   …]
+t + 1:  consts [Int(0), Dec(1.0), Dec(3.0), …]
+```
 
-### 4.2 — `Dec` arithmetic is ~155ns an operation
+The loop variable in the second version is `_x`, unused, so nothing constrains the
+range's element type and its numerals default to fractional — roc's own rule, and the
+right answer. But a `Dec` range is not a `Value::Range`: `MakeRange` gives a
+`Value::Iter(Lazy::Range)`, and that is walked a lazy step at a time. The 3× was the
+iterator, not the arithmetic.
 
-A 2M-element fold with a `Dec` accumulator is 310ms against 92ms for `I64`: ~110ns of
-`Dec` overhead per add. `apply_binop` reaches `Dec` only after an `Int` probe, a
+`Lazy::Range::step` was paying, per element:
+
+- **six `apply_binop` dispatches**, two of which recomputed `descending` — a property of
+  the step value that cannot change while the range is walked — by subtracting the step
+  from itself to get a zero of its own kind and then comparing against it;
+- **a fresh `Rc<Lazy>`** of about 168 bytes for the rest, because `step` was pure by
+  construction: "never mutating in place, exactly as roc's does".
+
+Both are gone. `negative(step)` reads the sign directly (−17%), and `step` takes its
+`Rc` **by value** and advances a list or a range in place through `Rc::make_mut` (−20%
+more), so walking n elements allocates once instead of n times. `make_mut` is
+copy-on-write, so a caller that kept its own handle still gets a fresh rest and observes
+nothing — the purity that mattered is preserved, only the allocation is not. The two
+variants' old arms were **deleted** rather than left as a second implementation:
+`step_wrapped` holds the wrapping iterators, which still rebuild themselves, and `step`
+hands anything else straight to it.
+
+| | before | after |
+|---|---|---|
+| `Dec` range, 2M elements | 347ms | **241ms** |
+| `F64` range, 2M elements | 290ms | **192ms** |
+| `iter_range` benchmark | 316ms | **222ms**, and peak RSS 5.1 → 4.3 MB |
+| integer range, 2M elements | 103ms | 104ms — untouched, as intended |
+
+Where the rest of it goes, measured rather than assumed: an `F64` range, whose
+arithmetic is one of `apply_binop`'s fast paths, is within 25% of the `Dec` one, while an
+integer range is 2.3× faster than either. So the residual is the lazy machinery — three
+operator dispatches and a `Value` clone per element — and 4.2 is worth only about 25ns of
+it here.
+
+**Still open, and now the cheapest thing in this section:** the wrapping iterators. A
+`map` over a `filter` over a list rebuilds three `Rc`s per element. The same
+`Rc::make_mut` trick applies — each wrapper mutates its own `inner` in place — but it
+needs `step` to thread ownership down through the layers, which the nested arms currently
+cannot because they only hold `&Rc`.
+
+### 4.2 — `Dec` arithmetic
+
+A 2M-element fold with a `Dec` accumulator is 310ms against 92ms for `I64`. Note that
+4.1 showed most of a `Dec` loop's cost was the iterator rather than the arithmetic —
+against an `F64` range the `Dec` one is only 25ns an element slower, over three
+operations — so the number to beat here is closer to 8ns an operation than 110ns. `apply_binop` reaches `Dec` only after an `Int` probe, a
 two-arm `U128` probe, `as_dec` on both operands and a `dec_binop` returning
 `Option<Result<…>>`. `Dec` is not exotic in Roc — it is what an unconstrained
 fractional literal becomes — so it deserves the same treatment `BinInt` gave integers:
@@ -555,27 +603,40 @@ Worth one afternoon, after everything above:
 ## Order, and why
 
 1. ~~**Phase 0**~~ — done. Without it every later phase is an opinion, and it is what
-   corrected two of this list's own claims.
+   corrected three of this list's own claims.
 2. ~~**Phase 1**~~ — 1.1, 1.2 and 1.3a done: a `Dict` program 27% faster end to end, a
    `.map` program 38%. 1.3b and 1.4 measured and left undone, with reasons above. It was
    billed as halving the eval suite and moved it 5%; see
    [What that costs the suite](#what-that-costs-the-suite) for why that projection was
    wrong.
-3. **Phase 4.1 and 4.2**, because a confirmed 3× on `t + 1` is embarrassing and the fix
-   is local. The biggest ratio left in the document.
-4. **Phase 3**, the parser: 1.4µs a line of ordinary source and 2.7µs a line of
+3. ~~**Phase 4.1**~~ — done, and it was not what it said: the 3× was a `Dec` range being
+   walked as a lazy iterator, six operator dispatches and an allocation per element, not
+   a missing `BinInt`. `Dec` and `F64` ranges are ~31% faster and `iter_range` went
+   316ms → 222ms. **Confirming the mechanism first is what stopped a fix for a bug that
+   does not exist.**
+4. **The lazy wrapping iterators** (see 4.1): a `map` over a `filter` over a list still
+   rebuilds three `Rc`s an element, and the same `make_mut` that fixed the range applies
+   once `step` can thread ownership through the layers. Cheapest item left.
+5. **Phase 3**, the parser: 1.4µs a line of ordinary source and 2.7µs a line of
    annotations, which is 59% of what is left of a `Dict` program *and* the floor under
    every module a user imports. Start with the two cheap experiments, not the lexer.
-5. **Phase 5**, one method per commit — speed *and* a bound removed.
-6. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
-7. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
+6. **Phase 5**, one method per commit — speed *and* a bound removed.
+7. **Phase 4.2**, `Dec` arithmetic — smaller than it looked before 4.1 measured it.
+8. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
+9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
    discipline to keep it fresh, which Phase 3 does not.
-8. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
+10. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
    `/bin/true`, which is 0.7s of the suite's 13.0s.
 
 Every phase, the same gates, and the eval suite at 1953 of 1953. A phase that cannot
 hold that number does not land, however good its benchmark looks.
 
-And one method note, earned twice in Phase 1: **anything under a millisecond is measured
-as a median of 15–25 runs, never a single one.** Two of Phase 1's projections came from
-single readings of a cold page cache and were out by 3–4×.
+Two method notes, both earned the hard way in this document:
+
+- **Anything under a millisecond is a median of 15–25 runs, never a single one.** Two of
+  Phase 1's projections came from single readings of a cold page cache and were out by
+  3–4×.
+- **Confirm the mechanism before writing the fix.** Three entries here — Phase 1.3b,
+  Phase 2's build-script plan and Phase 4.1's whole diagnosis — were wrong about *why*
+  while being right that something was slow. Each was caught by dumping what the code
+  actually does, and each would otherwise have been a day spent on the wrong thing.

@@ -1369,8 +1369,17 @@ impl Vm {
                     };
                     // A lazy iterator carries its own state, not an index: step it,
                     // skipping past `Skip`s, and write the rest back for next time.
-                    if let Value::Iter(lazy) = &regs[base + iter as usize] {
-                        let mut current = lazy.clone();
+                    //
+                    // The iterator is TAKEN out of its register rather than cloned, so
+                    // that `Lazy::step` is its only owner and can advance it in place —
+                    // otherwise a loop over a non-integer range allocates a rest per
+                    // element. The register is rewritten on both paths below, so it
+                    // never stays `Unit`.
+                    if matches!(&regs[base + iter as usize], Value::Iter(_)) {
+                        let taken = std::mem::replace(&mut regs[base + iter as usize], Value::Unit);
+                        let Value::Iter(mut current) = taken else {
+                            return Err(EvalError { message: "vm: iterator vanished".to_string() });
+                        };
                         let stepped = loop {
                             match current.step().map_err(|e| locate_error(&program, chunk_id, ip, e))? {
                                 crate::eval::lazy::Step::Done => break None,
@@ -1379,7 +1388,13 @@ impl Vm {
                             }
                         };
                         match stepped {
-                            None => ip = to as usize,
+                            None => {
+                                // `Done` consumed the iterator, and an iterator that is
+                                // done is an empty one.
+                                regs[base + iter as usize] =
+                                    Value::Iter(crate::eval::lazy::exhausted());
+                                ip = to as usize;
+                            }
                             Some((item, rest)) => {
                                 regs[base + dst as usize] = item;
                                 regs[base + iter as usize] = Value::Iter(rest);

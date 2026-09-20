@@ -403,6 +403,15 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     let program = std::rc::Rc::new(crate::vm::compile_unit(&unit)?);
 
     crate::tick("compile", &mut phase);
+    if std::env::var_os("ROCFLIGHT_CODE").is_some() {
+        for (i, chunk) in program.chunks.iter().enumerate() {
+            eprintln!("--- chunk {} `{}` arity {} regs {}", i, chunk.name, chunk.arity, chunk.n_regs);
+            for (pc, op) in chunk.code.iter().enumerate() {
+                eprintln!("  {:>3}  {:?}", pc, op);
+            }
+            if !chunk.consts.is_empty() { eprintln!("  consts {:?}", chunk.consts); }
+        }
+    }
     // Step 5: run the top level, then the app's entry point if it declared one.
     //
     // Top-level `expect`s are compiled in only under `test`; an ordinary run skips

@@ -58,6 +58,15 @@ fn rc(l: Lazy) -> Rc<Lazy> {
     Rc::new(l)
 }
 
+/// An iterator with nothing left in it.
+///
+/// A walked-out list is exactly that, so this is the shape every exhausted iterator
+/// takes: a range that cannot advance without overflowing its width becomes one, and so
+/// does the register a `for` loop leaves behind when it finishes.
+pub fn exhausted() -> Rc<Lazy> {
+    rc(Lazy::List(Rc::new(Vec::new()), 0))
+}
+
 /// Any value seen as a lazy iterator: a list or range is wrapped, an `Iter` is itself.
 pub fn of(value: Value) -> Option<Rc<Lazy>> {
     match value {
@@ -77,22 +86,51 @@ fn truthy(v: Value) -> bool {
     matches!(v, Value::Bool(true))
 }
 
+/// Is this number below zero?
+///
+/// `Lazy::Range` asks it of its step on EVERY element, and it used to ask through
+/// `apply_binop` twice — a subtraction to make a zero of the step's own kind, because
+/// `Dec` against `Int` is not a comparison `apply_binop` makes, and then a `<` against
+/// it. Two full operator dispatches per element to re-answer a property of a value that
+/// does not change while the range is walked. The kinds are exactly the ones a range's
+/// step can be, and anything else keeps the old answer of `false`.
+fn negative(step: &Value) -> bool {
+    match step {
+        Value::Int(n) | Value::Dec(n) => *n < 0,
+        Value::Float(f) => *f < 0.0,
+        Value::F32(f) => *f < 0.0,
+        _ => false,
+    }
+}
+
 impl Lazy {
-    pub fn step(self: &Rc<Self>) -> Result<Step, EvalError> {
-        match &**self {
-            Lazy::List(items, at) => Ok(match items.get(*at) {
-                Some(v) => Step::One(v.clone(), rc(Lazy::List(items.clone(), at + 1))),
-                None => Step::Done,
-            }),
-            Lazy::Range { at, end, step, inclusive } => {
-                // A negative step walks DOWN to `end`: a reversed range
-                // (`5.range_exclusive_from(1)`) is one.
-                // Compared against a zero of the step's own kind: `Dec` against `Int` is
-                // not a comparison `apply_binop` makes.
-                let descending = apply_binop(BinOp::Sub, step, step)
-                    .and_then(|zero| apply_binop(BinOp::Lt, step, &zero))
-                    .map(truthy)
-                    .unwrap_or(false);
+    /// One step: the item, and the iterator that remains.
+    ///
+    /// Takes the `Rc` by VALUE so that the two iterators a loop walks element by
+    /// element — a list, and a range of anything but integers — can advance in place
+    /// when nothing else holds them. `Rc::get_mut` succeeds only at a refcount of one,
+    /// so that is Rust's copy-on-write rather than a mutation anyone can observe: a
+    /// caller who kept its own handle still gets a fresh rest, exactly as before.
+    ///
+    /// It matters because the rest used to be a fresh allocation per element, and a
+    /// `Dec` range of two million of them is two million of those. Walking one now
+    /// allocates once. Every other variant keeps the pure path below, which is where
+    /// the semantics live — this is only the fast lane in front of it.
+    pub fn step(mut self: Rc<Self>) -> Result<Step, EvalError> {
+        // `Some(item)` advanced, `None` is exhausted, and falling through means this is
+        // not one of the two. The answer is computed inside the borrow and acted on
+        // outside it, because `Step::One` moves the `Rc` that the borrow came from.
+        let advanced: Option<Value> = match Rc::make_mut(&mut self) {
+            Lazy::List(items, at) => match items.get(*at).cloned() {
+                Some(item) => {
+                    *at += 1;
+                    Some(item)
+                }
+                None => None,
+            },
+            mine @ Lazy::Range { .. } => {
+                let Lazy::Range { at, end, step: by, inclusive } = mine else { unreachable!() };
+                let descending = negative(by);
                 let op = match (*inclusive, descending) {
                     (true, false) => BinOp::Le,
                     (false, false) => BinOp::Lt,
@@ -100,26 +138,43 @@ impl Lazy {
                     (false, true) => BinOp::Gt,
                 };
                 if truthy(apply_binop(op, at, end)?) {
+                    let item = at.clone();
                     // Advancing past the last element can overflow the width (an
-                    // inclusive range ending at the maximum) — that must stop the
-                    // iterator, not crash, so a failed step becomes an exhausted rest.
-                    // A step that wraps (`I128.highest..=I128.highest`, where the add
-                    // wraps rather than fails) is the same: `next` did not advance.
-                    let advanced = |next: &Value| {
-                        let past = if descending { BinOp::Lt } else { BinOp::Gt };
-                        apply_binop(past, next, at).map(truthy).unwrap_or(false)
-                    };
-                    let rest = match apply_binop(BinOp::Add, at, step) {
-                        Ok(next) if advanced(&next) => {
-                            rc(Lazy::Range { at: next, end: end.clone(), step: step.clone(), inclusive: *inclusive })
+                    // inclusive range ending at the maximum). That must stop the
+                    // iterator rather than crash, and a step that wraps without
+                    // advancing is the same case, so both become exhausted.
+                    let past = if descending { BinOp::Lt } else { BinOp::Gt };
+                    match apply_binop(BinOp::Add, at, by) {
+                        Ok(next) if apply_binop(past, &next, at).map(truthy).unwrap_or(false) => {
+                            *at = next;
                         }
-                        _ => rc(Lazy::List(std::rc::Rc::new(Vec::new()), 0)),
-                    };
-                    Ok(Step::One(at.clone(), rest))
+                        _ => *mine = Lazy::List(Rc::new(Vec::new()), 0),
+                    }
+                    Some(item)
                 } else {
-                    Ok(Step::Done)
+                    None
                 }
             }
+            // Every other variant is a wrapper whose own step is the general path.
+            _ => return Self::step_wrapped(&self),
+        };
+        return Ok(match advanced {
+            Some(item) => Step::One(item, self),
+            None => Step::Done,
+        });
+    }
+
+    /// The wrapping iterators: each defers to its inner one and rebuilds itself.
+    ///
+    /// A list and a range are not here — `step` advances those in place. These allocate
+    /// a rest per element and always did; a `map` over a `filter` is three of them deep,
+    /// which is the next thing to look at if an iterator chain shows up hot.
+    fn step_wrapped(self: &Rc<Self>) -> Result<Step, EvalError> {
+        match &**self {
+            // `step` answers these without ever coming here. Handing them back to it
+            // rather than panicking costs nothing and terminates either way, because
+            // that path does not call this one.
+            Lazy::List(..) | Lazy::Range { .. } => Rc::clone(self).step(),
             Lazy::Custom { state, adv, hint } => {
                 match call_function(adv.clone(), vec![state.clone()])? {
                     Value::Tag("Ok", payload) => match payload.first() {
@@ -137,7 +192,7 @@ impl Lazy {
                     _ => Ok(Step::Done),
                 }
             }
-            Lazy::Filter { inner, pred, keep } => match inner.step()? {
+            Lazy::Filter { inner, pred, keep } => match Rc::clone(inner).step()? {
                 Step::Done => Ok(Step::Done),
                 Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Filter { inner: rest, pred: pred.clone(), keep: *keep }))),
                 Step::One(item, rest) => {
@@ -149,7 +204,7 @@ impl Lazy {
                     }
                 }
             },
-            Lazy::Map { inner, f } => match inner.step()? {
+            Lazy::Map { inner, f } => match Rc::clone(inner).step()? {
                 Step::Done => Ok(Step::Done),
                 Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Map { inner: rest, f: f.clone() }))),
                 Step::One(item, rest) => Ok(Step::One(
@@ -157,7 +212,7 @@ impl Lazy {
                     rc(Lazy::Map { inner: rest, f: f.clone() }),
                 )),
             },
-            Lazy::WithIndex { inner, i } => match inner.step()? {
+            Lazy::WithIndex { inner, i } => match Rc::clone(inner).step()? {
                 Step::Done => Ok(Step::Done),
                 Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::WithIndex { inner: rest, i: *i }))),
                 Step::One(item, rest) => Ok(Step::One(
@@ -165,7 +220,7 @@ impl Lazy {
                     rc(Lazy::WithIndex { inner: rest, i: i + 1 }),
                 )),
             },
-            Lazy::StepBy { inner, step, skip } => match inner.step()? {
+            Lazy::StepBy { inner, step, skip } => match Rc::clone(inner).step()? {
                 Step::Done => Ok(Step::Done),
                 Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::StepBy { inner: rest, step: *step, skip: *skip }))),
                 Step::One(item, rest) => {
@@ -176,8 +231,8 @@ impl Lazy {
                     }
                 }
             },
-            Lazy::Concat { first, second } => match first.step()? {
-                Step::Done => second.step(),
+            Lazy::Concat { first, second } => match Rc::clone(first).step()? {
+                Step::Done => Rc::clone(second).step(),
                 Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Concat { first: rest, second: second.clone() }))),
                 Step::One(item, rest) => Ok(Step::One(item, rc(Lazy::Concat { first: rest, second: second.clone() }))),
             },
@@ -185,7 +240,7 @@ impl Lazy {
                 if *n == 0 {
                     return Ok(Step::Done);
                 }
-                match inner.step()? {
+                match Rc::clone(inner).step()? {
                     Step::Done => Ok(Step::Done),
                     Step::Skip(rest) => Ok(Step::Skip(rc(Lazy::Take { inner: rest, n: *n }))),
                     Step::One(item, rest) => Ok(Step::One(item, rc(Lazy::Take { inner: rest, n: n - 1 }))),
@@ -369,7 +424,7 @@ pub fn step_range(iter: &Rc<Lazy>, wanted: &Value) -> Result<Value, EvalError> {
 /// `Iter.next`: one step. roc's `next` reports `Skip` as it is — it does not skip
 /// ahead — so a single step is the whole of it.
 fn next(iter: &Rc<Lazy>) -> Result<Value, EvalError> {
-    Ok(match iter.step()? {
+    Ok(match Rc::clone(iter).step()? {
         Step::Done => Value::tag("Done", vec![]),
         Step::Skip(rest) => Value::tag("Skip", vec![Value::Record(vec![("rest", rest_value(rest))])]),
         Step::One(item, rest) => {
