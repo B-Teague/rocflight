@@ -241,7 +241,7 @@ fn low_level_ops_run() {
     );
     // `Hasher :: { state : U64 }`, and the digest IS the state.
     assert_eq!(
-        call("hasher_finish", vec![Value::Record(vec![("state", Value::Int(42))])]).to_string(),
+        call("hasher_finish", vec![Value::record(vec![("state", Value::Int(42))])]).to_string(),
         "42"
     );
 
@@ -505,7 +505,7 @@ fn the_numeric_width_operations_respect_their_width() {
 fn equal_values_hash_alike() {
     use rocflight::eval::{call_builtin_values, Value};
     let hash = |value: Value| {
-        let empty = Value::Record(vec![("state", Value::Int(0))]);
+        let empty = Value::record(vec![("state", Value::Int(0))]);
         let written = call_builtin_values("Str", "to_hash", vec![value, empty]).expect("hashed");
         call_builtin_values("LowLevel", "hasher_finish", vec![written])
             .expect("finished")

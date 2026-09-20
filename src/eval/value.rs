@@ -60,7 +60,17 @@ pub enum Value {
     /// holds one of these at `a`. Reads as `Err(MissingField)`, inspects as `<missing>`.
     Missing,
     /// Record value. Fields keep insertion order; `Str.inspect` sorts a copy.
-    Record(Vec<(&'static str, Value)>),
+    ///
+    /// Behind an `Rc` for the reason `List` is, and it took until Phase 7 to notice
+    /// that the reason applied here too: a `Value` is cloned on every register move,
+    /// every argument and every return, and a `Vec` clone copies every field. Passing
+    /// a record to a function was therefore linear in its WIDTH — a 16-field record
+    /// cost 87% more than a 2-field one to do identical work.
+    ///
+    /// Build one with `Value::record`. `UpdateRecord` mutates through `Rc::make_mut`,
+    /// so a record nothing else holds would be updated in place — which does not
+    /// happen yet, for the reason written at that opcode.
+    Record(std::rc::Rc<Vec<(&'static str, Value)>>),
     /// Boolean.
     Bool(bool),
     /// A list.
@@ -75,7 +85,10 @@ pub enum Value {
     /// copies only if something else still holds the list.
     List(std::rc::Rc<Vec<Value>>),
     /// Tuple value. Fixed length, elements may differ in type.
-    Tuple(Vec<Value>),
+    ///
+    /// Behind an `Rc` for the same reason `Record` is — see there. Build one with
+    /// `Value::tuple`.
+    Tuple(std::rc::Rc<Vec<Value>>),
     /// A range of integers, `start` to `end`, `end` included only if `inclusive`.
     ///
     /// Deliberately NOT a list: roc keeps ranges opaque, so building one as a list
@@ -110,6 +123,16 @@ impl Value {
     /// A list value. Wraps the elements so call sites stay readable.
     pub fn list(items: Vec<Value>) -> Value {
         Value::List(std::rc::Rc::new(items))
+    }
+
+    /// A record value. Wraps the fields so call sites stay readable.
+    pub fn record(fields: Vec<(&'static str, Value)>) -> Value {
+        Value::Record(std::rc::Rc::new(fields))
+    }
+
+    /// A tuple value. Wraps the elements so call sites stay readable.
+    pub fn tuple(items: Vec<Value>) -> Value {
+        Value::Tuple(std::rc::Rc::new(items))
     }
 
     /// The elements of `List` or a `Tuple`, for the operations that treat them alike.

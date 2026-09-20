@@ -51,7 +51,7 @@ fn numeral(negative: bool, whole: &str, fraction: &str) -> Value {
     };
     Value::tag(
         "Literal",
-        vec![Value::Record(vec![
+        vec![Value::record(vec![
             ("is_negative", Value::Bool(negative)),
             ("digits_before_pt", bytes(whole)),
             ("digits_after_pt", bytes(fraction)),
@@ -200,7 +200,7 @@ pub fn from_interpolation(args: &[Value]) -> Option<Value> {
     let mut text = first.to_string();
     for pair in args.get(1)?.sequence()? {
         if let Value::Tuple(items) = pair {
-            for item in items {
+            for item in items.iter() {
                 if let Value::Str(s) = item {
                     text.push_str(s);
                 }

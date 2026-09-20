@@ -862,6 +862,213 @@ Worth one afternoon, after everything above:
 
 ---
 
+## Phase 7 — the allocations that are left — **7.1 done, −13.9% to −55%**
+
+`Value::List` was put behind an `Rc` because a list is cloned on every register move,
+every argument and every return, and a `Vec` clone copies every element. That argument
+was never applied to the other two container arms. `Record` and `Tuple` still hold an
+inline `Vec`, so they still pay it.
+
+Measured 2026-09-20, release build, this machine, min of 11 runs, 200,000 iterations
+each. Every program is the same shape — build one value, pass it to a function in a
+loop, read one thing out of it — so the only variable is what the value is:
+
+```roc
+app [main!] {}
+get = |p| p.x            # or: p, p.0, List.len(p)
+main! = |_args| {
+	p = { x: 1, y: 2 }   # or the 16-field / 2- and 16-element variants
+	var s = 0
+	for _i in 0..<200000 { s = s + get(p) }
+	echo!(I64.to_str(s))
+	Ok({})
+}
+```
+
+| what is passed | 2 wide | 16 wide | per pass, over the control |
+|---|---|---|---|
+| `I64` (control) | 25.4ms | — | 0 |
+| `List` (already `Rc`) | 61.3ms | 61.9ms | **flat** |
+| `Record` | 33.4ms | 62.2ms | 40ns → 184ns |
+| `Tuple` | 36.5ms | 62.4ms | 55ns → 184ns |
+
+The list row is the control that matters: it is 36ms above the `I64` baseline because
+it calls two builtins per iteration, and it does **not move** between 2 elements and
+16. The record and tuple rows are flat in nothing — **+87%** and **+71%** for the same
+work on a wider value, about **10ns per field per pass**. That is a `malloc` and a
+memcpy of the field vector on every `Move`, every argument and every return, which
+Phase 4.3 already established is the most executed opcode there is.
+
+### 7.1 — `Record` and `Tuple` behind an `Rc` — **done**
+
+`Value::Record(Vec<(&'static str, Value)>)` and `Value::Tuple(Vec<Value>)` are now
+`Rc<Vec<…>>`, built through `Value::record` / `Value::tuple` as `List` is built through
+`Value::list`. `Value` is unchanged at 48 bytes — `Simd` and `Range` were already
+setting that — and `value_stays_narrow` still holds.
+
+It was 31 compile errors and every one of them was a *construction* site. Nothing that
+only **reads** a record or a tuple changed at all, because `Rc` derefs through to the
+`Vec`: `fields.iter()`, `items.len()`, `fields.iter().find(…)` and `sequence()` are all
+untouched. That is why a change spread over 89 sites in six files came to 46 lines.
+
+Interleaved A/B against a copied pre-change binary, median of 11 (21 for the two that
+came back flat). Interleaved because this machine drifts ~7% over a few minutes, which
+is larger than half these effects:
+
+| benchmark | before | after | |
+|---|---|---|---|
+| `records` | 10.86ms | 9.34ms | **−13.9%** |
+| `closure_in_loop` | 10.47ms | 9.21ms | −12.0% |
+| `loop` | 8.73ms | 8.17ms | −6.4% |
+| `iter_range` | 219.0ms | 209.0ms | −4.6% |
+| `calls`, `closure_capture`, `list_ops`, `matching`, `strings` | | | −3% each |
+| `list_pass`, `matching_tail`, `records_tail` | | | −1% to −2% |
+
+Nothing regressed. `records_tail` read +1.4% at 11 runs and −1.0% at 21, which is the
+noise floor and not an effect.
+
+And on the probes from the head of this phase, which is where the mechanism shows:
+
+| passed to a function | before | after |
+|---|---|---|
+| 2-field record | 32.3ms | 27.0ms (**−16.5%**) |
+| 16-field record | 59.8ms | 26.8ms (**−55.2%**) |
+| 16-tuple | 60.9ms | 29.0ms (**−52.3%**) |
+
+A record and a tuple are now **flat in their width**, exactly as a list has been since
+round 1: 26.98ms at 2 fields against 26.81ms at 16. That is the whole of the finding,
+and the ~13% on `records` is what it is worth on a benchmark that only ever passes a
+2-field one.
+
+**`Rc::make_mut` in `UpdateRecord` does not fire, and that is not a bug in the op.**
+The plan above claimed `{ ..p, x: … }` over a `var` would become allocation-free. It
+does not, and it took a bytecode dump to see why: the compiler never emits an
+`UpdateRecord` whose `dst` is its `obj` — across the whole benchmark suite and all 99
+golden programs it is `dst: 1, obj: 0` or `dst: 2, obj: 0`, never the same register — so
+the source is still live when the op runs and the refcount is already 2. A `dst == obj`
+fast path was written, measured to be dead code, and deleted. Worse, liveness alone
+would not fix it: in `p = step(p)` the *caller's* binding holds a second handle across
+the whole call. Making this fire is ownership analysis, which is 7.5. The `make_mut` is
+kept because it is the correct shape and costs exactly what the copy it replaced cost.
+
+### 7.2 — tag payloads: one allocation instead of two, and none for a bare tag
+
+`Value::Tag(&'static str, Rc<Vec<Value>>)` is a pointer to an `Rc` box that holds a
+`Vec` that points at a second heap buffer. Two allocations per tag, for a payload that
+is never mutated after construction.
+
+| | time | over the control |
+|---|---|---|
+| construct `None`, match it | 35.0ms | 47ns per iteration |
+| construct `Some(x)`, match it | 43.0ms | 87ns per iteration |
+
+Two things fall out of that 40ns gap, and both are small, local and unambiguous:
+
+- **`Rc<[Value]>` instead of `Rc<Vec<Value>>`.** `MakeTag` already builds its payload
+  from an exact-size iterator over the register window, and `Rc<[T]>` collected from an
+  exact-size iterator allocates **once**. (Note the trap: `Rc::from(some_vec)` does
+  *not* save the allocation — it allocates the box and memcpies. The win is only there
+  if the payload is never a `Vec` in the first place, so `Value::tag` has to take the
+  iterator, not a built `Vec`.) Every `Ok`/`Err` in the program is one of these.
+- **A shared empty payload for a bare tag.** `Value::tag("None", vec![])` is
+  `Rc::new(Vec::new())` — `Vec::new` allocates nothing but `Rc::new` allocates the box,
+  so a tag with no payload still costs a `malloc`. One `thread_local` empty
+  `Rc<[Value]>`, cloned, makes it a refcount bump. `Bool` is its own variant so this is
+  not about `True`/`False`; it is about `None`, `Dot`, `MissingField` and every other
+  bare tag — and `MissingField` in particular is constructed on the *success* path of
+  an optional-field read.
+
+`Closure::captures` is deliberately **not** on this list: it is an inline `Vec` inside a
+struct that is already behind an `Rc`, so it is already one allocation per closure and
+a refcount bump per clone.
+
+### 7.3 — builtin arguments: a `Vec` per call, from a register file that already has them
+
+`CallBuiltin`, `CallHost`, and `Call`/`TailCall` on a builtin held as a value all do:
+
+```rust
+let args = collect(regs, base + b as usize, argc);   // Vec<Value>, one malloc
+crate::eval::call_builtin_values(module, func, args)
+```
+
+The arguments are already contiguous in the register file. The `Vec` exists only because
+`call_builtin_values` takes ownership of one. A builtin call measured ~65ns over a
+plain call in a first cut, which is the whole dispatch and not just the allocation, so
+**the share belonging to the `Vec` is not yet measured** — and this document's own rule
+is that the mechanism gets confirmed before the fix gets written. The probe is a
+counting global allocator behind a `cfg`, or `heaptrack` on `tests/bench/list_ops.roc`.
+
+If it pays, the shape is `&mut [Value]` — the register window itself, with builtins
+taking what they need out of it — and no new type and no new dependency. It is not a
+small diff: `eval/mod.rs` is 4,294 lines and nearly every builtin destructures an owned
+`Vec`. Do 7.1 and 7.2 first; they are a tenth of the work for a measured win.
+
+**No `SmallVec`.** Putting a two-element argument list on the stack is a real idea and a
+new dependency for it is not: the register file is already the stack-shaped place these
+values live, so the honest version of "stack instead of heap" here is to stop copying
+them out of it.
+
+### 7.4 — the one-liners
+
+- `Chunk::params` and `Closure::params` are `Rc<Vec<&'static str>>` — two allocations
+  and two indirections for something built once at compile time and read only to print
+  `<lambda |x, y|>`. `Rc<[&'static str]>` is one. Worth the ten minutes it takes, worth
+  no more than that.
+- `MakeRecord` `.clone()`s each field out of its register where `collect` would
+  `mem::replace` it. For a field holding a record or a list, that is a deep copy or a
+  refcount bump that nothing needed. Check first that the source registers are really
+  dead after the op — `collect` is used by `MakeTuple` and `MakeTag` right beside it, so
+  the compiler probably already guarantees it.
+
+### 7.5 — the uniqueness this phase did not buy
+
+`Rc` made a record CHEAP to share. It did not make it cheap to *update*, because
+nothing in this interpreter ever knows it holds the only handle. `Op::Move` clones,
+`Op::CallFn` leaves the caller's copy in place, and a global keeps its handle across the
+call that reads it — so `Rc::make_mut` in `UpdateRecord`, `ListPush` and `Lazy::advance`
+all hit a refcount of 2 and copy.
+
+roc solves this with ownership: a value at its last use is given away, not lent. The
+interpreter's version would be a **last-use take** — the compiler marks the reads it can
+prove are final, and those ops `mem::replace` the register instead of cloning it. The
+machinery is already here: Phase 4.3's `wrote_directly` proves the same class of fact
+about a destination, `branches()` already lists what breaks straight-line reasoning, and
+`Op::IterNext` already takes its iterator out of its register for exactly this reason.
+
+It is the largest remaining item in this document and it is also the one most likely to
+be quietly wrong, so it wants its own phase, its own bytecode dumps and the eval suite
+on every step. Measure first: a counting allocator will say how many of a program's
+allocations are `make_mut` copies before anyone decides it is worth the risk.
+
+### Measured and rejected
+
+- **`Box<Expr>` → `Rc<Expr>` in the AST.** `Rc` pays for itself only where something is
+  *shared or cloned*, and nothing clones the AST: one `grep` for a clone of an `Expr`
+  across the whole crate finds a single site, `compile.rs:1754`, which builds a
+  desugaring's callee once. `Lambda` already holds `Rc<Expr>` because a closure value
+  genuinely does share its body. Every other `Box<Expr>` is a unique child of a unique
+  parent, and `Rc` would add a refcount to each one and save nothing. The AST's real
+  cost is the **number** of small allocations, not their kind — see
+  [Not attempted: AST node allocation](#not-attempted-ast-node-allocation), which is an
+  arena question and is still the right framing.
+- **`Box<Type>` → `Rc<Type>` in the checker.** This one *looks* compelling:
+  `checker.rs` has 135 `.clone()` sites, thirteen of them the literal
+  `(**backing).clone()` / `(**inner).clone()` deep copy of a type tree, and
+  `Type::Record { fields: Vec<(String, Type)> }` allocates a `String` per field per
+  clone. Then the probe answers the question: `ROCFLIGHT_TIME=1` on a trivial program
+  reads **0.048ms for the whole type check**. Phases 1 and 3 took the front end from
+  3.5ms to ~0.17ms end to end, and the checker is now a rounding error. There is no
+  phase here, only a tidier data structure, and this document does not trade a 4,277-line
+  refactor for tidiness. Re-open it only if something makes the checker hot again.
+- **An inline small-string for `Value::Str`.** `Value` has 32 usable payload bytes after
+  `i128` alignment, so a short string could live inline and every short concatenation
+  and interpolation would stop allocating. It is also a second representation of a
+  string threaded through every `Str.*` builtin in `eval/mod.rs`, and `Rc<str>` already
+  makes the *clone* free — only the *construction* allocates. Measure `tests/bench/strings.roc`
+  against a counting allocator before anyone writes a line of it.
+
+---
+
 ## Not doing
 
 - **A JIT.** The measured problem is a front end re-parsing a constant, not a slow inner
@@ -918,7 +1125,18 @@ Worth one afternoon, after everything above:
    perturbing the `DispatchMethod` arm cost `records` 6.5% through code layout alone.
 9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
    discipline to keep it fresh, which Phase 3 does not.
-10. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
+10. ~~**Phase 7.1**~~ — done: `Record` and `Tuple` behind an `Rc`, so passing either to
+   a function is flat in its width instead of linear. `records` −13.9%,
+   `closure_in_loop` −12.0%, a 16-field record −55.2%, nothing regressed, 46 lines
+   changed. **Its own claim about `Rc::make_mut` was wrong** — the compiler never emits
+   `dst == obj`, so the in-place update never fires; the dead fast path was measured and
+   deleted, and the real fix moved to 7.5.
+11. **Phase 7.2**, tag payloads — the same shape as 7.1, a tenth of the size.
+12. **Phase 7.5**, last-use take. The largest number left and the easiest to get subtly
+   wrong; it is what makes `make_mut` mean anything anywhere.
+13. **Phase 7.3**, builtin argument vectors, only after 7.2 and only if the
+   counting allocator says the `Vec` and not the dispatch is the cost.
+14. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
    `/bin/true`, which is 0.7s of the suite's 13.0s.
 
 Every phase, the same gates, and the eval suite at 1953 of 1953. A phase that cannot

@@ -1088,7 +1088,7 @@ impl Vm {
                 }
                 Op::MakeTuple { dst, base: b, n } => {
                     let items = collect(regs, base + b as usize, n);
-                    regs[base + dst as usize] = Value::Tuple(items);
+                    regs[base + dst as usize] = Value::tuple(items);
                 }
                 Op::ListPush { list, src } => {
                     let item = std::mem::replace(&mut regs[base + src as usize], Value::Unit);
@@ -1112,17 +1112,23 @@ impl Vm {
                     for i in 0..n as usize {
                         fields.push((names[name as usize + i], regs[base + b as usize + i].clone()));
                     }
-                    regs[base + dst as usize] = Value::Record(fields);
+                    regs[base + dst as usize] = Value::record(fields);
                 }
                 Op::UpdateRecord { dst, obj, name, base: b, n } => {
-                    let mut fields = match &regs[base + obj as usize] {
-                        Value::Record(fields) => fields.clone(),
-                        other => {
-                            return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                message: format!("Cannot update `{}`: it is not a record", other),
-                            }))
-                        }
+                    // `make_mut` and not a plain copy, so that a record nothing else
+                    // holds is updated IN PLACE. That does not fire yet and the reason
+                    // is not this op: the source register is still live here, and in
+                    // `p = { ..p, x: 1 }` the caller's own binding holds a second
+                    // handle across the call as well. Making it fire needs ownership
+                    // analysis, which is Phase 7.5 — until then this costs exactly what
+                    // the copy it replaced cost.
+                    let mut record = regs[base + obj as usize].clone();
+                    let Value::Record(shared) = &mut record else {
+                        return Err(locate_error(&program, chunk_id, ip, EvalError {
+                            message: format!("Cannot update `{}`: it is not a record", record),
+                        }))
                     };
+                    let fields = Rc::make_mut(shared);
                     let names = &program.chunks[chunk_id as usize].names;
                     for i in 0..n as usize {
                         let field = names[name as usize + i];
@@ -1135,7 +1141,7 @@ impl Vm {
                             }
                         }
                     }
-                    regs[base + dst as usize] = Value::Record(fields);
+                    regs[base + dst as usize] = record;
                 }
                 Op::GetField { dst, obj, name } => {
                     let field = program.chunks[chunk_id as usize].names[name as usize];
@@ -1317,7 +1323,7 @@ impl Vm {
                     let names = &program.chunks[chunk_id as usize].names;
                     let named = &names[name as usize..name as usize + n as usize];
                     let value = match &regs[base + obj as usize] {
-                        Value::Record(fields) => Value::Record(
+                        Value::Record(fields) => Value::record(
                             fields
                                 .iter()
                                 .filter(|(f, _)| !named.contains(f))

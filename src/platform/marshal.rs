@@ -253,9 +253,9 @@ pub fn read_value(bytes: &[u8], layout: &Layout, heap: &dyn Heap) -> Result<Valu
                 .map(|f| Ok((intern(&f.name), read_field(bytes, f, heap)?)))
                 .collect::<Result<_, String>>()?;
             read.sort_by(|a, b| a.0.cmp(b.0));
-            Value::Record(read)
+            Value::record(read)
         }
-        Shape::Tuple(fields) => Value::Tuple(read_positional(bytes, fields, heap)?),
+        Shape::Tuple(fields) => Value::tuple(read_positional(bytes, fields, heap)?),
         Shape::TagUnion { tags, disc_offset, disc_size } => {
             let index = read_disc(bytes, *disc_offset as usize, *disc_size);
             let variant = tags.get(index).ok_or_else(|| format!("discriminant {} is out of range", index))?;
@@ -585,7 +585,7 @@ mod tests {
             ("stderr_bytes".into(), list(Type::U8)),
             ("stdout_bytes".into(), list(Type::U8)),
         ]);
-        let value = Value::Record(vec![
+        let value = Value::record(vec![
             ("exit_code", Value::Int(7)),
             ("stderr_bytes", Value::list(vec![])),
             ("stdout_bytes", Value::list(vec![Value::Int(72), Value::Int(105)])),
@@ -593,7 +593,7 @@ mod tests {
         let bytes = round_trip(value, &ty);
         assert_eq!(&bytes[48..52], &7i32.to_le_bytes(), "the I32 sits after the two lists");
         round_trip(
-            Value::Tuple(vec![Value::Int(1), Value::Int(2), str_value("three")]),
+            Value::tuple(vec![Value::Int(1), Value::Int(2), str_value("three")]),
             &Type::Tuple(vec![Type::U8, Type::I64, Type::Str]),
         );
     }
@@ -668,7 +668,7 @@ mod tests {
         assert!(write_value(&Value::tag("Nope", vec![]), &lay(&io_err()), &mut heap, &mut bytes[..32]).is_err());
         assert!(write_value(&Value::tag("Other", vec![]), &lay(&io_err()), &mut heap, &mut bytes[..32]).is_err());
         let record = lay(&Type::closed_record(vec![("x".into(), Type::I64)]));
-        assert!(write_value(&Value::Record(vec![]), &record, &mut heap, &mut bytes[..8]).is_err());
+        assert!(write_value(&Value::record(vec![]), &record, &mut heap, &mut bytes[..8]).is_err());
         assert_eq!(heap.live(), 0);
     }
 }

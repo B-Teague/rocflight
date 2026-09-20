@@ -313,7 +313,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                 Value::tag("Done", vec![])
             } else {
                 let item = items.remove(0);
-                Value::tag("One", vec![Value::Record(vec![("item", item), ("rest", Value::list(items))])])
+                Value::tag("One", vec![Value::record(vec![("item", item), ("rest", Value::list(items))])])
             })
         }
         // `Iter.custom(state, hint, step)`: run the step until it says `NoMore`. Eager,
@@ -328,7 +328,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             expect(1, args.len())?;
             let items = elements(args[0].clone(), name)?;
             Ok(Value::list(
-                items.enumerate().map(|(i, v)| Value::Tuple(vec![Value::Int(i as i128), v])).collect(),
+                items.enumerate().map(|(i, v)| Value::tuple(vec![Value::Int(i as i128), v])).collect(),
             ))
         }
         "fold_with_index" => {
@@ -527,7 +527,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let mut items = as_list(&mut args[0])?;
             let at = as_index(&args[1]).unwrap_or(0).min(items.len());
             let others = items.split_off(at);
-            Ok(Value::Record(vec![("before", Value::list(items)), ("others", Value::list(others))]))
+            Ok(Value::record(vec![("before", Value::list(items)), ("others", Value::list(others))]))
         }
         "join" => {
             expect(1, args.len())?;
@@ -574,7 +574,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                     let prev = std::mem::replace(&mut items[index], args[2].clone());
                     return Ok(Value::tag(
                         "Ok",
-                        vec![Value::Record(vec![("list", Value::list(items)), ("prev", prev)])],
+                        vec![Value::record(vec![("list", Value::list(items)), ("prev", prev)])],
                     ));
                 }
             }
@@ -856,7 +856,7 @@ fn call_str_more(name: &str, args: &[Value]) -> Option<Result<Value, EvalError>>
             match haystack.rfind(needle) {
                 Some(at) => Ok(Value::tag(
                     "Ok",
-                    vec![Value::Record(vec![
+                    vec![Value::record(vec![
                         ("before", str_value(haystack[..at].to_string())),
                         ("after", str_value(haystack[at + needle.len()..].to_string())),
                     ])],
@@ -1219,7 +1219,7 @@ fn hasher_write(hasher: &Value, bytes: &[u8]) -> Result<Value, EvalError> {
     let state = state.ok_or_else(|| EvalError {
         message: format!("a Hasher is a record with a `state`, got {}", hasher),
     })?;
-    Ok(Value::Record(vec![("state", Value::Int(hash_mix(state, bytes) as i128))]))
+    Ok(Value::record(vec![("state", Value::Int(hash_mix(state, bytes) as i128))]))
 }
 
 /// The bytes a value contributes to a hash.
@@ -1235,7 +1235,7 @@ fn hash_bytes(value: &Value) -> Option<Vec<u8>> {
     // entries, never the whole container, so this terminates.
     if matches!(value, Value::Tag(..) | Value::Record(_)) {
         if let Some((_, func)) = crate::vm::best_method("to_hash", value) {
-            let fresh = Value::Record(vec![("state", Value::Int(0xcbf2_9ce4_8422_2325_u64 as i128))]);
+            let fresh = Value::record(vec![("state", Value::Int(0xcbf2_9ce4_8422_2325_u64 as i128))]);
             if let Ok(Value::Record(fields)) = call_function(func, vec![value.clone(), fresh]) {
                 if let Some((_, Value::Int(state))) = fields.iter().find(|(n, _)| *n == "state") {
                     return Some((*state as u64).to_le_bytes().to_vec());
@@ -1519,7 +1519,7 @@ pub fn call_crypto(module: &str, method: &str, args: &[Value]) -> Option<Result<
             Ok(if bytes.len() == 32 {
                 Value::tag("Ok", vec![make_digest(bytes)])
             } else {
-                Value::tag("Err", vec![Value::tag("WrongLength", vec![Value::Record(vec![
+                Value::tag("Err", vec![Value::tag("WrongLength", vec![Value::record(vec![
                     ("expected", Value::Int(32)),
                     ("actual", Value::Int(bytes.len() as i128)),
                 ])])])
@@ -1530,14 +1530,14 @@ pub fn call_crypto(module: &str, method: &str, args: &[Value]) -> Option<Result<
             // 64 hex digits for a 32-byte digest; a wrong count is `WrongLength`, an
             // out-of-range digit is `InvalidHex` with its index and byte value.
             if text.len() != 64 {
-                return Some(Ok(Value::tag("Err", vec![Value::tag("WrongLength", vec![Value::Record(vec![
+                return Some(Ok(Value::tag("Err", vec![Value::tag("WrongLength", vec![Value::record(vec![
                     ("expected", Value::Int(64)),
                     ("actual", Value::Int(text.len() as i128)),
                 ])])])));
             }
             for (i, b) in text.bytes().enumerate() {
                 if !(b as char).is_ascii_hexdigit() {
-                    return Some(Ok(Value::tag("Err", vec![Value::tag("InvalidHex", vec![Value::Record(vec![
+                    return Some(Ok(Value::tag("Err", vec![Value::tag("InvalidHex", vec![Value::record(vec![
                         ("index", Value::Int(i as i128)),
                         ("byte", Value::Int(i128::from(b))),
                     ])])])));
@@ -2391,7 +2391,7 @@ fn call_low_level(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let mut items = list(&mut args[0])?;
             let slot = items.get_mut(i).ok_or_else(|| wrong("an index within the list"))?;
             let prev = std::mem::replace(slot, args[2].clone());
-            Ok(Value::Record(vec![("list", Value::list(items)), ("prev", prev)]))
+            Ok(Value::record(vec![("list", Value::list(items)), ("prev", prev)]))
         }
         // Capacity is a hint about allocation, which is not observable through the API.
         "list_with_capacity" | "u8_list_with_capacity" => Ok(Value::list(Vec::new())),
@@ -2754,7 +2754,7 @@ pub fn call_builtin_values(
             Ok(match text.find(needle) {
                 Some(i) => Value::tag(
                     "Ok",
-                    vec![Value::Record(vec![
+                    vec![Value::record(vec![
                         ("before", str_value(text[..i].to_string())),
                         (
                             "after",
@@ -3741,7 +3741,7 @@ fn json_parse_piece(read: &str, state: Option<&Value>) -> Result<Value, EvalErro
     Ok(match value {
         Some(value) => Value::tag(
             "Ok",
-            vec![Value::Record(vec![
+            vec![Value::record(vec![
                 ("rest", str_value(text[cursor.at..].to_string())),
                 ("value", value),
             ])],
@@ -3811,7 +3811,7 @@ fn call_json(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
                 Err(e) => Err(e),
                 Ok(Some(value)) => Ok(Value::tag(
                     "Ok",
-                    vec![Value::Record(vec![
+                    vec![Value::record(vec![
                         ("rest", str_value(text[cursor.at..].to_string())),
                         ("value", value),
                     ])],
@@ -3925,7 +3925,7 @@ fn json_read_as(
             cursor.space();
             if cursor.bytes.get(cursor.at) == Some(&b'}') {
                 cursor.at += 1;
-                return Ok(Some(Value::Record(fields)));
+                return Ok(Some(Value::record(fields)));
             }
             loop {
                 cursor.space();
@@ -3947,7 +3947,7 @@ fn json_read_as(
                     Some(b',') => cursor.at += 1,
                     Some(b'}') => {
                         cursor.at += 1;
-                        return Ok(Some(Value::Record(fields)));
+                        return Ok(Some(Value::record(fields)));
                     }
                     _ => return Ok(None),
                 }
@@ -4057,7 +4057,7 @@ fn json_encode(value: &Value) -> Result<String, EvalError> {
         }
         Value::Record(fields) => {
             let mut parts = Vec::with_capacity(fields.len());
-            for (name, v) in fields {
+            for (name, v) in fields.iter() {
                 parts.push(format!("{}:{}", crate::eval::value::quoted(name), json_encode(v)?));
             }
             format!("{{{}}}", parts.join(","))
@@ -4241,7 +4241,7 @@ impl JsonCursor<'_> {
         self.space();
         if self.bytes.get(self.at) == Some(&b'}') {
             self.at += 1;
-            return Some(Value::Record(fields));
+            return Some(Value::record(fields));
         }
         loop {
             self.space();
@@ -4263,7 +4263,7 @@ impl JsonCursor<'_> {
                     self.at += 1;
                     // Sorted, as `Str.inspect` shows every record.
                     fields.sort_by(|a, b| a.0.cmp(b.0));
-                    return Some(Value::Record(fields));
+                    return Some(Value::record(fields));
                 }
                 _ => return None,
             }

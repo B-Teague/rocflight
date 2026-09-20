@@ -242,7 +242,7 @@ impl Lazy {
                 Made::Skip => Ok(Made::Skip),
                 Made::One => {
                     let item = std::mem::replace(out, Value::Unit);
-                    *out = Value::Tuple(vec![Value::Int(i128::from(*i)), item]);
+                    *out = Value::tuple(vec![Value::Int(i128::from(*i)), item]);
                     *i += 1;
                     Ok(Made::One)
                 }
@@ -464,9 +464,9 @@ pub fn step_range(iter: &Rc<Lazy>, wanted: &Value) -> Result<Value, EvalError> {
 fn next(iter: &Rc<Lazy>) -> Result<Value, EvalError> {
     Ok(match Rc::clone(iter).step()? {
         Step::Done => Value::tag("Done", vec![]),
-        Step::Skip(rest) => Value::tag("Skip", vec![Value::Record(vec![("rest", rest_value(rest))])]),
+        Step::Skip(rest) => Value::tag("Skip", vec![Value::record(vec![("rest", rest_value(rest))])]),
         Step::One(item, rest) => {
-            Value::tag("One", vec![Value::Record(vec![("item", item), ("rest", rest_value(rest))])])
+            Value::tag("One", vec![Value::record(vec![("item", item), ("rest", rest_value(rest))])])
         }
     })
 }

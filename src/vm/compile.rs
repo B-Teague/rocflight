@@ -3288,7 +3288,7 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
                 fields
                     .iter()
                     .map(|(name, field)| {
-                        Value::Tuple(vec![
+                        Value::tuple(vec![
                             crate::eval::str_value(name.clone()),
                             type_descriptor(field),
                         ])
