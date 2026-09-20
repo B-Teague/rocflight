@@ -43,7 +43,7 @@ pub fn members() -> Vec<Member> {
 /// is 23,555 lines, and that showed up as two milliseconds and 700kB on every run of
 /// every program.
 pub fn members_where(wanted: impl Fn(&str) -> bool) -> Vec<Member> {
-    index()
+    MEMBERS
         .iter()
         .filter(|slice| wanted(slice.name))
         .map(|slice| {
@@ -68,66 +68,15 @@ struct Slice {
     in_nominal: bool,
 }
 
-/// Every member's byte range, found ONCE per process.
-///
-/// A run asks for members three times — the load, then a signature table per typed
-/// module the checker meets — and each ask used to walk all 23,555 lines again, at
-/// nearly half a millisecond a walk.
-fn index() -> &'static [Slice] {
-    static INDEX: std::sync::OnceLock<Vec<Slice>> = std::sync::OnceLock::new();
-    INDEX.get_or_init(|| {
-        let mut slices: Vec<Slice> = Vec::new();
-        let mut in_nominal = false;
-        let mut offset = 0;
-        for line in SOURCE.split_inclusive('\n') {
-            let start = offset;
-            offset += line.len();
-            let line = line.strip_suffix('\n').unwrap_or(line);
-            if let Some(name) = member_name(line) {
-                in_nominal = true;
-                if let Some(last) = slices.last_mut() {
-                    last.end = start;
-                }
-                // The header line is part of the member: it is the declaration.
-                slices.push(Slice { name, start, end: offset, in_nominal });
-            } else if in_nominal && line == "}" {
-                // The `Builtin :: [].{ … }` nominal closes here. Everything after it is a
-                // TOP-LEVEL section — 292 declarations, of which the ones with no body are
-                // the low-level ops the real compiler injects (`list_get_unsafe`,
-                // `hasher_finish`, `dict_seed`). They are a member of nothing, so they get
-                // their own slice, and they are already at column 0.
-                in_nominal = false;
-                if let Some(last) = slices.last_mut() {
-                    last.end = start;
-                }
-                slices.push(Slice { name: "(low level)", start: offset, end: offset, in_nominal });
-            } else if let Some(last) = slices.last_mut() {
-                last.end = offset;
-            }
-        }
-        slices
-    })
-}
-
-/// `\tName :: …` or `\tName(a, b) :: …`, and nothing deeper.
-fn member_name(line: &str) -> Option<&'static str> {
-    let rest = line.strip_prefix('\t')?;
-    if rest.starts_with('\t') {
-        return None;
-    }
-    let declared = rest.split(" :: ").next().filter(|d| *d != rest)?;
-    let name = match declared.find('(') {
-        Some(i) if declared.ends_with(')') => &declared[..i],
-        _ => declared,
-    };
-    let mut chars = name.chars();
-    if !chars.next().is_some_and(char::is_uppercase) || !chars.all(|c| c.is_alphanumeric() || c == '_')
-    {
-        return None;
-    }
-    // The member names come from a `const` source, so they outlive the program.
-    Some(Box::leak(name.to_string().into_boxed_str()))
-}
+// Every member's byte range — `MEMBERS`, a table computed by `build.rs`.
+//
+// This was a scan of all 23,555 lines behind a `OnceLock`, and once per process was
+// still 0.9ms of every program that names a `Dict`. `Builtin.roc` is a constant
+// compiled into the binary, so where its members begin and end is a constant too:
+// `build.rs::member_index` writes the table out and this includes it. The scanner, and
+// `member_name` with it, moved there. `tests/check_builtin.sh --strict` is the gate,
+// because a skewed offset makes a member fail to parse.
+include!(concat!(env!("OUT_DIR"), "/builtin_index.rs"));
 
 /// What reading one member told us.
 pub struct Read {
@@ -228,9 +177,9 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
     let mut step = std::time::Instant::now();
     let mut sliced = members_where(|name| selected.contains(&name));
     crate::tick("slice + index", &mut step);
-    // What the OTHER members say, which is all the low-level section is loaded for.
-    let referenced: String =
-        sliced.iter().filter(|m| m.name != "(low level)").map(|m| m.source.as_str()).collect();
+    // Whether any OTHER member is loaded, which is all the low-level section is cut
+    // down for: on its own, every declaration of it is wanted.
+    let alone = sliced.iter().all(|m| m.name == "(low level)");
     let mut loaded = Vec::new();
     for name in selected {
         let at = sliced
@@ -238,8 +187,8 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
             .position(|m| m.name == *name)
             .ok_or_else(|| format!("no builtin member named `{}`", name))?;
         let mut member = sliced.remove(at);
-        if member.name == "(low level)" && !referenced.is_empty() {
-            member.source = reachable(&member.source, &referenced);
+        if member.name == "(low level)" && !alone {
+            member.source = reachable(&member.source, selected);
             crate::tick("  (low level) reachable", &mut step);
         }
         let desugared = Desugarer::new(member.source)
@@ -261,59 +210,42 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
     Ok(loaded)
 }
 
-/// The low-level section cut down to what `from` reaches.
+/// The low-level section cut down to what the other loaded members reach.
 ///
-/// `Dict` and `Set` use 48 of its 317 declarations, and parsing the other 269 was
-/// three milliseconds of every program that names a `Dict`. A declaration is kept when
-/// its name appears in `from` or in a kept declaration's text, closed over; the walk
-/// is by word, so a name in a comment keeps its declaration too, which costs a parse
-/// and never an answer. Capitalised declarations (a type alias) are always kept.
-fn reachable(source: &str, from: &str) -> String {
-    // A block is a column-0 declaration and every line under it, up to the next.
-    let mut blocks: Vec<(&str, usize, usize)> = Vec::new();
-    let mut offset = 0;
+/// `Dict` and `Set` use 48 of its 317 declarations, and parsing the other 269 was three
+/// milliseconds of every program that names a `Dict`. WHICH 48 used to be worked out
+/// here, by closing over the text word by word with a `String` per word — 0.75ms of
+/// every such program, over 2,300 lines that never change. `build.rs::low_level_reach`
+/// answers it per member now (`LOW_LEVEL_REACH`) and this unions the lists of whatever
+/// is loaded; the union is exact because reaching is monotone, so the closure of two
+/// members' words is the closure of each.
+///
+/// What is left is the block split, one pass over the lines. A block is a column-0
+/// declaration and every line under it; an unnamed one — a blank line, a comment, a
+/// capitalised type alias — is always kept.
+fn reachable(source: &str, selected: &[&str]) -> String {
+    let keep: std::collections::HashSet<&str> = LOW_LEVEL_REACH
+        .iter()
+        .filter(|(member, _)| selected.contains(member))
+        .flat_map(|(_, names)| names.iter().copied())
+        .collect();
+    let mut out = String::with_capacity(source.len() / 4);
+    // The name of the block being read, and whether it is being kept.
+    let mut keeping = true;
     for line in source.split_inclusive('\n') {
-        let start = offset;
-        offset += line.len();
-        let starts_block = line.starts_with(|c: char| c.is_alphabetic() || c == '_');
-        if starts_block || blocks.is_empty() {
+        if line.starts_with(|c: char| c.is_alphabetic() || c == '_') {
             let name = line
                 .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '!'))
                 .next()
                 .filter(|n| n.starts_with(|c: char| c.is_lowercase() || c == '_'))
                 .unwrap_or("");
-            if blocks.last().is_some_and(|(n, _, _)| *n == name && !name.is_empty()) {
-                // The body under its own annotation: one block.
-            } else {
-                blocks.push((name, start, start));
-            }
+            keeping = name.is_empty() || keep.contains(name);
         }
-        blocks.last_mut().expect("a block").2 = offset;
-    }
-    let words = |text: &str| {
-        text.split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '!'))
-            .filter(|w| !w.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    let by_name: std::collections::HashMap<&str, (usize, usize)> = blocks
-        .iter()
-        .filter(|(name, _, _)| !name.is_empty())
-        .map(|&(name, start, end)| (name, (start, end)))
-        .collect();
-    let mut keep: std::collections::HashSet<&str> = std::collections::HashSet::new();
-    let mut pending: Vec<String> = words(from);
-    while let Some(word) = pending.pop() {
-        let Some((&name, &(start, end))) = by_name.get_key_value(word.as_str()) else { continue };
-        if keep.insert(name) {
-            pending.extend(words(&source[start..end]));
+        if keeping {
+            out.push_str(line);
         }
     }
-    blocks
-        .iter()
-        .filter(|(name, _, _)| name.is_empty() || keep.contains(name))
-        .map(|&(_, start, end)| &source[start..end])
-        .collect()
+    out
 }
 
 /// The members whose signatures the checker reads. NOT all of them, on a measurement.
