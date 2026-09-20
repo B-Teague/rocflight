@@ -288,6 +288,14 @@ pub enum Op {
     TestRecord { obj: Reg, to: u32 },
     /// A list, of exactly `n` elements, or at least `n` when `exact` is false.
     TestList { obj: Reg, n: u16, exact: bool, to: u32 },
+    /// Jump to `to` unless `cond` holds exactly `Bool(want)`.
+    ///
+    /// Deliberately NOT `JumpFalse`, which errors on anything that is not a `Bool`.
+    /// The predicate of a compiled `keep_if`, `any` or `all` has to answer the way the
+    /// builtin does, and the builtin asks `matches!(value, Bool(b) if b == want)` — so a
+    /// non-`Bool` is simply not a match there, never a message. Compiling the predicate
+    /// to `JumpFalse` would have invented an error the interpreter does not have.
+    TestBool { cond: Reg, want: bool, to: u32 },
     /// No arm matched `obj`. Always an error; roc's own exhaustiveness check is what
     /// normally makes this unreachable.
     NoMatch { obj: Reg },
@@ -1268,6 +1276,11 @@ impl Vm {
                             || (!exact && items.len() >= n as usize) => {}
                     _ => ip = to as usize,
                 },
+                Op::TestBool { cond, want, to } => {
+                    if !matches!(&regs[base + cond as usize], Value::Bool(b) if *b == want) {
+                        ip = to as usize;
+                    }
+                }
                 Op::NoMatch { obj } => {
                     return Err(locate_error(&program, chunk_id, ip, EvalError {
                         message: format!("No match arm matched {}", regs[base + obj as usize]),

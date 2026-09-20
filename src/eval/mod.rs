@@ -212,7 +212,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             name,
             "len" | "is_empty" | "map" | "fold" | "keep_if" | "drop_if" | "fold_try" | "from_iter"
                 | "contains" | "iter" | "any" | "all" | "sum" | "find_first" | "size_hint"
-                | "fold_with_index" | "with_index" | "step_by" | "collect"
+                | "fold_with_index" | "with_index" | "step_by" | "collect" | "count_if"
         )
     {
         let items: Vec<Value> = elements(args[0].clone(), name)?.collect();
@@ -352,6 +352,22 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                 }
             }
             Ok(Value::Bool(!want))
+        }
+        // Not previously implemented at all — `List.count_if` was an unknown function,
+        // and `Builtin.roc` declares it at `List(a), (a -> Bool) -> U64`. It is here so
+        // that the compiled loop in `Compiler::list_loop` is an optimization and not the
+        // only way to reach it.
+        "count_if" => {
+            expect(2, args.len())?;
+            let items = elements(args[0].clone(), name)?;
+            let func = args[1].clone();
+            let mut count = 0i128;
+            for item in items {
+                if matches!(call_function(func.clone(), vec![item])?, Value::Bool(true)) {
+                    count += 1;
+                }
+            }
+            Ok(Value::Int(count))
         }
         "find_first" => {
             expect(2, args.len())?;
@@ -2640,15 +2656,26 @@ pub fn call_builtin_values(
         let mut args = args;
         // A lazy iterator — or a method that must stay lazy (an unbounded source, a
         // filter that emits `Skip`, an unknown length) — is driven by `lazy`, not
-        // materialized. `keep_if`/`drop_if`/`with_index`/`step_by` are `Iter`-typed in
-        // roc, so they always go lazy; a plain `List.map`/`fold` stays eager below.
+        // materialized. A plain `List.map`/`fold` stays eager below.
         let on_iter = matches!(args.first(), Some(Value::Iter(_)));
         let on_lazy_source = on_iter || matches!(args.first(), Some(Value::Range { .. }));
         let lazy_method =
             // Anything on a lazy iterator is lazy.
             on_iter
-            // `keep_if`/`drop_if`/`with_index` are `Iter`-only in roc — no `List`
-            // version — so they always produce a lazy iterator, even off a list.
+            // `with_index` is `Iter`-only in roc — `Builtin.roc` declares it at
+            // `Iter(a) -> Iter((U64, a))` and nowhere else — so it always produces a
+            // lazy iterator, even off a list.
+            //
+            // `keep_if`/`drop_if` are here for a worse reason: `Builtin.roc` declares
+            // BOTH `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, and roc
+            // inspects `[1, 2, 3].keep_if(p)` as `[2, 3]` but
+            // `[1, 2, 3].iter().keep_if(p)` as `<opaque>`. Nothing here can tell those
+            // apart, because `.iter()` on a list IS the list at run time — so this path
+            // answers the lazy one for both, and the COMPILER answers the eager one
+            // wherever the checker knows the receiver is a `List` (`Compiler::list_loop`).
+            // What is left divergent is a receiver whose module the checker cannot name,
+            // such as an unannotated `|xs| xs.keep_if(p)`: roc gives a list there and
+            // this gives an iterator. Fixing it needs an `Iter` that is its own value.
             || matches!(name, "keep_if" | "drop_if" | "with_index")
             // `concat` and `size_hint` are shared with `List`: lazy only for a range
             // or an iterator, so `List.concat` of two lists stays an eager list.

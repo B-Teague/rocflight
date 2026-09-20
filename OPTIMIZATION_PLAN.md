@@ -640,33 +640,77 @@ scheduled.
 
 ---
 
-## Phase 5 — lower the remaining callback builtins
+## Phase 5 — lower the remaining callback builtins — **four done, one refused**
 
-`fold` and `map` compile into in-frame loops. Twenty-six other `call_function` sites in
-`src/eval/mod.rs` do not: `each`, `filter`, `keep_if`, `drop_if`, `any`, `all`, `find`,
-`walk`, `walk_until`, `keep_oks`, `sort_by`, `sort_with`, `update_at`. Each of those
-re-enters the VM per element through `call_closure` — a fresh register file, an argument
-`Vec` and a **Rust** frame apiece.
+`fold` and `map` compiled into in-frame loops; the rest re-entered the VM per element
+through `call_closure` — a fresh register file, an argument `Vec` and a **Rust** frame
+apiece. Four more are compiled now.
 
-Two payoffs, one of them not about speed at all:
+| over 2M elements | before | after |
+|---|---|---|
+| `all` | 221ms | **118ms** |
+| `find_first` | 230ms | **106ms** |
 
-- the same per-element win `fold` and `map` got (199ms → 90ms on `iter_range`);
-- **the Rust stack bound goes away.** `call_closure` is the one place where "calls do
-  not recurse in Rust" stops holding, so `map` inside `map` inside `map` is bounded by
-  the Rust stack with no Roc-level diagnostic. Lowering these removes the last such
-  bound.
+`Compiler::list_loop` took a `fold: bool`; it now takes a `Shape`, and what each element
+does with the callback's answer is `finish_element`. The new opcode is `TestBool`, which
+jumps unless a register holds exactly `Bool(want)` — deliberately **not** `JumpFalse`,
+which errors on anything that is not a `Bool`. The builtins ask
+`matches!(value, Bool(b) if b == want)`, so a non-`Bool` predicate is simply not a match
+there, never a message, and compiling to `JumpFalse` would have invented an error the
+interpreter does not have.
 
-`Compiler::list_loop` is the pattern to extend, and its gates are the interesting part:
-the receiver's module must be `List`/`Iter` per the checker, no roc-defined method may
-answer the name, and a literal lambda is inlined only when `escapes()` finds no
-`return`, `break` or `Assign`. Each new method needs the same care —
-`filter`/`keep_if`'s predicate is `Bool`-typed and a non-`Bool` must still produce the
-message it produces today, and `sort_with`'s comparator cannot be inlined into a loop at
-all.
+### What is safe to lower, and why
 
-Do them **one method per commit**, with the eval gate on each. This is the phase most
-likely to change an error message by accident, and an error message is what 1,953 tests
-compare.
+`any`, `all`, `count_if` and `find_first` are declared on `List` alone in `Builtin.roc`
+and each answers a plain **value** — a `Bool`, a `U64`, a `Try`. That is the property
+that matters: the answer does not depend on whether the receiver was a `List` or an
+`Iter`, so the loop can stand in for the builtin whatever the checker believes about the
+receiver.
+
+`count_if` was not implemented at all — `List.count_if` was an unknown function, though
+`Builtin.roc` declares it — so the Rust builtin was written too. A method should not
+exist only in the compiler: the lowering is an optimization, not the only way to reach it.
+
+### Refused: `keep_if` / `drop_if`
+
+Tried, measured at 414ms → 153ms, and reverted. It also *fixed* four cases where
+rocflight disagreed with roc — `[1, 2, 3].keep_if(p)` answered a lazy `Iter` and
+inspected as `<opaque>` where roc gives `[2, 3]` — which made it tempting. But
+`Builtin.roc` declares **both** `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`,
+and the second is lazy, so a compiled loop may only stand in for the List one. Checked
+against the real `roc` binary:
+
+```
+Str.inspect((1..=5).iter().keep_if(|x| x > 3))
+  roc  <opaque>      before  <opaque>      lowered  [4.0, 5.0]
+```
+
+There is no sound guard for it. `dispatch_modules` is not one — the checker calls
+`(1..=5).iter()` a `List`, which is what produced that line. Nothing syntactic is one
+either, because `xs = (1..=n).iter()` and then `xs.keep_if(p)` has a bare name as its
+receiver. Trading a correct `Iter` case for a correct `List` case is not progress, so
+neither was taken: `dispatch_builtin` still answers the lazy one for both, and says so.
+
+### The divergence underneath, which is not an optimization problem
+
+`.iter()` on a list **is** the list at run time, so nothing after the checker can tell
+`xs.keep_if(p)` from `xs.iter().keep_if(p)`. That is also why
+`Str.inspect([1, 2, 3].iter().map(f))` answers `[2.0, 4.0, 6.0]` where roc answers
+`<opaque>` — a pre-existing divergence this phase did not introduce and did not fix.
+Both need an `Iter` that is its own value rather than a borrowed name for a list, which
+is a representation change and belongs in a correctness plan, not this one.
+
+### Still open
+
+The remaining `call_function` sites are `walk`, `walk_until`, `fold_try`,
+`fold_with_index`, `find_first_index`, `keep_oks`, `update_at`, `sort_by`, `sort_with`
+and the `Try` methods. `sort_with` cannot be a loop at all. The value-returning ones
+follow the pattern above; anything that answers a **container** needs the `Iter` question
+settled first.
+
+Lowering these also removes the last place where "calls do not recurse in Rust" stops
+holding — `call_closure` nests a Rust frame, so `map` inside `map` inside `map` is still
+bounded by the Rust stack with no Roc-level diagnostic.
 
 ---
 
@@ -728,7 +772,11 @@ Worth one afternoon, after everything above:
    everywhere), a 400-char copy per annotation line. The plan's own first item was
    refused on arithmetic. What is left is the lexer, which is its own piece of work —
    see the phase.
-6. **Phase 5**, one method per commit — speed *and* a bound removed.
+6. ~~**Phase 5**~~ — `any`, `all`, `count_if` and `find_first` compiled into in-frame
+   loops (`all` −47%, `find_first` −54%), and `count_if` implemented at all for the first
+   time. `keep_if`/`drop_if` refused: it would have traded one roc divergence for
+   another. The rest of the callback builtins, and the Rust-stack bound they carry,
+   remain.
 7. **Phase 4.2**, `Dec` arithmetic — smaller than it looked before 4.1 measured it.
 8. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
 9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the

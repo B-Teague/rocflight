@@ -641,6 +641,25 @@ struct Compiler {
     intrinsics: std::collections::HashSet<&'static str>,
 }
 
+/// Which one-callback list method a compiled loop is.
+///
+/// They share a skeleton — take the next element, run the callback on it, do something
+/// with the answer — and differ only in that last step, which is `finish_element`.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+    /// `xs.fold(init, f)`: the answer is the accumulator.
+    Fold,
+    /// `xs.map(f)`: the answer is a list of what the callback returned.
+    Map,
+    /// `xs.any(p)` (true) or `xs.all(p)` (false): the first element the predicate
+    /// answers `want` for settles it.
+    Decide(bool),
+    /// `xs.count_if(p)`: how many elements the predicate agreed with.
+    Count,
+    /// `xs.find_first(p)`: `Ok(item)` for the first agreement, else `Err(NotFound)`.
+    Find,
+}
+
 impl Compiler {
     /// The function being compiled.
     fn st(&mut self) -> &mut FnState {
@@ -703,6 +722,7 @@ impl Compiler {
             | Op::TestTuple { to, .. }
             | Op::TestRecord { to, .. }
             | Op::TestList { to, .. }
+            | Op::TestBool { to, .. }
             | Op::GetFieldOr { to, .. }
             | Op::IterNext { to, .. } => *to = target,
             other => unreachable!("patched a {:?}, which is not a jump", other),
@@ -1267,7 +1287,8 @@ impl Compiler {
         locals.truncate(keep);
     }
 
-    /// `xs.fold(init, f)` and `xs.map(f)` as a loop in THIS frame.
+    /// `xs.fold(init, f)`, `xs.map(f)`, `xs.keep_if(p)` and friends as a loop in THIS
+    /// frame.
     ///
     /// The builtin versions re-enter the VM from Rust once per element — a fresh
     /// machine, an argument `Vec` and a Rust frame each time — which was the whole of
@@ -1283,17 +1304,50 @@ impl Compiler {
         method: &str,
         receiver: &Expr,
         args: &[Expr],
+        module: &str,
     ) -> Result<Option<Reg>, String> {
-        let fold = match (method, args.len()) {
-            ("fold", 2) => true,
-            ("map", 1) => false,
+        let shape = match (method, args.len()) {
+            ("fold", 2) => Shape::Fold,
+            ("map", 1) => Shape::Map,
+            // `keep` vs `drop`, and `any` vs `all`, differ only in which answer from the
+            // predicate is the interesting one.
+            //
+            ("any", 1) => Shape::Decide(true),
+            ("all", 1) => Shape::Decide(false),
+            ("count_if", 1) => Shape::Count,
+            ("find_first", 1) => Shape::Find,
             _ => return Ok(None),
         };
-        // The accumulator, or the list being built. Allocated first, so it sits below
-        // everything the loop uses and survives the temporaries being freed.
+        // Every shape above answers a plain VALUE — a list of results, an accumulator, a
+        // `Bool`, a count, a `Try`. That is what makes them safe to compile whatever the
+        // checker thinks the receiver's module is.
+        //
+        // `keep_if`/`drop_if` are NOT here, and were tried: `Builtin.roc` declares both
+        // `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the second lazy, so a
+        // compiled loop may only stand in for the List one. There is no sound way to tell
+        // them apart here. `dispatch_modules` is not it — the checker calls
+        // `(1..=5).iter()` a `List`, so lowering on that made
+        // `Str.inspect((1..=5).iter().keep_if(p))` answer `[4.0, 5.0]` where roc answers
+        // `<opaque>`; and nothing syntactic is it either, because `xs = (1..=n).iter()`
+        // then `xs.keep_if(p)` has a bare name as its receiver. See `dispatch_builtin`,
+        // which answers the lazy one for both and says what is still divergent.
+        let _ = module;
+        let fold = matches!(shape, Shape::Fold);
+        // The accumulator, the list being built, or the answer. Allocated first, so it
+        // sits below everything the loop uses and survives the temporaries being freed.
         let dst = self.alloc()?;
-        if !fold {
-            self.emit(Op::MakeList { dst, base: dst, n: 0 });
+        // The answer if the loop runs out, for every shape that has one: `any` of nothing
+        // is `False` and `all` of nothing is `True`, nothing matches nothing, and a count
+        // of nothing is zero. An element that settles it overwrites this and leaves.
+        match shape {
+            Shape::Map => self.emit(Op::MakeList { dst, base: dst, n: 0 }),
+            Shape::Decide(want) => self.constant(dst, Value::Bool(!want))?,
+            Shape::Count => self.constant(dst, Value::Int(0))?,
+            Shape::Find => self.constant(
+                dst,
+                Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
+            )?,
+            Shape::Fold => {}
         }
         let iter = self.expr(receiver)?;
         self.reserve(iter)?;
@@ -1335,9 +1389,24 @@ impl Compiler {
         let idx = self.alloc()?;
         self.constant(idx, Value::Int(0))?;
         let item = self.alloc()?;
+        // A shape that adds to its answer needs the `1` in a register, and one that
+        // builds a tag needs a slot to put the payload in. Allocated before the loop so
+        // the constant is loaded once.
+        let spare = match shape {
+            Shape::Count => {
+                let one = self.alloc()?;
+                self.constant(one, Value::Int(1))?;
+                one
+            }
+            Shape::Find => self.alloc()?,
+            _ => 0,
+        };
 
         let top = self.here();
         self.emit(Op::IterNext { dst: item, iter, idx, to: u32::MAX });
+        // Where an `any`/`all` goes when an element settles the answer: patched to the
+        // loop's exit once that is known, the same place `IterNext` jumps to.
+        let mut decided: Option<u32> = None;
         // The callback's arguments go in consecutive registers, where `Call` expects
         // them; its frame then starts there.
         let base = self.st().next_reg;
@@ -1350,22 +1419,7 @@ impl Compiler {
             }
             let out = self.expr(&body)?;
             self.st().locals.truncate(locals_before);
-            if fold {
-                if out != dst {
-                    self.emit(Op::Move { dst, src: out });
-                }
-            } else {
-                // `ListPush` takes its element out of the register. A body that is
-                // just a name answers with that name's own register, which must stay.
-                let src = if out < base {
-                    let copy = self.alloc()?;
-                    self.emit(Op::Move { dst: copy, src: out });
-                    copy
-                } else {
-                    out
-                };
-                self.emit(Op::ListPush { list: dst, src });
-            }
+            decided = self.finish_element(shape, dst, item, out, base, top, spare)?;
         } else if fold {
             self.reserve(base + 1)?;
             self.emit(Op::Move { dst: base, src: dst });
@@ -1377,12 +1431,81 @@ impl Compiler {
             // The result lands where the argument was: the callee's frame is dead by
             // then, and it is pushed straight onto the list.
             self.emit(Op::Call { dst: base, func, base, argc: 1 });
-            self.emit(Op::ListPush { list: dst, src: base });
+            decided = self.finish_element(shape, dst, item, base, base, top, spare)?;
         }
         self.emit(Op::Jump { to: top });
         self.patch_to_here(top);
+        if let Some(at) = decided {
+            self.patch_to_here(at);
+        }
         self.st().next_reg = dst + 1;
         Ok(Some(dst))
+    }
+
+    /// What one element does with `out`, the value the callback answered.
+    ///
+    /// `Some(at)` is a jump out of the loop that still needs its target: only an
+    /// `any`/`all` has one, and only the caller knows where the loop ends.
+    fn finish_element(
+        &mut self,
+        shape: Shape,
+        dst: Reg,
+        item: Reg,
+        out: Reg,
+        base: Reg,
+        top: u32,
+        spare: Reg,
+    ) -> Result<Option<u32>, String> {
+        match shape {
+            Shape::Fold => {
+                if out != dst {
+                    self.emit(Op::Move { dst, src: out });
+                }
+                Ok(None)
+            }
+            Shape::Map => {
+                // `ListPush` takes its element out of the register. A body that is just
+                // a name answers with that name's own register, which must stay.
+                let src = if out < base {
+                    let copy = self.alloc()?;
+                    self.emit(Op::Move { dst: copy, src: out });
+                    copy
+                } else {
+                    out
+                };
+                self.emit(Op::ListPush { list: dst, src });
+                Ok(None)
+            }
+            // The first element the predicate agrees with settles it: write the answer
+            // and leave. Anything else — including a value that is not a `Bool` — goes
+            // round again, which is what the builtin does.
+            Shape::Decide(want) => {
+                self.emit(Op::TestBool { cond: out, want, to: top });
+                self.constant(dst, Value::Bool(want))?;
+                let at = self.here();
+                self.emit(Op::Jump { to: u32::MAX });
+                Ok(Some(at))
+            }
+            // Every agreement adds one; nothing leaves early. `width: 0` because the
+            // count has no declared integer width to overflow.
+            Shape::Count => {
+                self.emit(Op::TestBool { cond: out, want: true, to: top });
+                self.emit(Op::BinInt { dst, a: dst, b: spare, op: crate::ast::BinOp::Add, width: 0 });
+                Ok(None)
+            }
+            // `Ok(item)` and out. `MakeTag` wants its payload in consecutive registers,
+            // so the item is copied into the spare slot first — copied and not moved,
+            // because `dst` is built from it and the loop would otherwise push `Unit`.
+            Shape::Find => {
+                self.emit(Op::TestBool { cond: out, want: true, to: top });
+                let name = self.name_idx("Ok")?;
+                self.emit(Op::Move { dst: spare, src: item });
+                self.emit(Op::MakeTag { dst, name, base: spare, n: 1 });
+                let at = self.here();
+                self.emit(Op::Jump { to: u32::MAX });
+                Ok(Some(at))
+            }
+        }
     }
 
     /// Bind `name` to `value` in a fresh register, and push it as a local.
@@ -2389,7 +2512,7 @@ impl Compiler {
                 // written first, and compiles to the same loop.
                 if *module == "List" {
                     if let Some((receiver, rest)) = args.split_first() {
-                        if let Some(dst) = self.list_loop(name, receiver, rest)? {
+                        if let Some(dst) = self.list_loop(name, receiver, rest, module)? {
                             return Ok(Some(dst));
                         }
                     }
@@ -2563,10 +2686,13 @@ impl Compiler {
         // A list's `fold` or `map`, with nothing roc-defined answering to it: a loop
         // in this frame rather than a builtin that re-enters the VM per element.
         // `Iter` is what `.iter()` is declared to give; at run time it is the list.
-        if candidates.is_empty()
-            && matches!(self.dispatch_modules.get(&node), Some(&"List" | &"Iter"))
+        if let Some(module) = self
+            .dispatch_modules
+            .get(&node)
+            .copied()
+            .filter(|m| candidates.is_empty() && matches!(*m, "List" | "Iter"))
         {
-            if let Some(dst) = self.list_loop(method, receiver, args)? {
+            if let Some(dst) = self.list_loop(method, receiver, args, module)? {
                 return Ok(dst);
             }
         }
