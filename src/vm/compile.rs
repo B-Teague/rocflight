@@ -536,7 +536,7 @@ impl FnState {
         }
     }
 
-    fn finish(self, chunk: ChunkId, arity: u16) -> Chunk {
+    fn finish(mut self, chunk: ChunkId, arity: u16) -> Chunk {
         // One span per instruction, or an error's location is somebody else's. A
         // `code.push` that skipped `emit` is exactly how that goes wrong, and it did.
         debug_assert_eq!(
@@ -547,6 +547,10 @@ impl FnState {
             self.code.len(),
             self.spans.len()
         );
+        // The last read of a register may take the value out of it instead of cloning
+        // it; `liveness` is what proves which reads those are. Done here, on finished
+        // code, because it needs the whole chunk's control flow.
+        super::liveness::mark_takes(&mut self.code, self.max_reg);
         Chunk {
             code: self.code,
             spans: self.spans,
@@ -2095,7 +2099,7 @@ impl Compiler {
                 let (base, n) = self.values(&values)?;
                 self.st().next_reg = save;
                 let dst = self.alloc()?;
-                self.emit(Op::UpdateRecord { dst, obj, name, base, n });
+                self.emit(Op::UpdateRecord { dst, obj, name, base, n, take: false });
                 Ok(dst)
             }
 

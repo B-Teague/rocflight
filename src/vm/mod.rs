@@ -22,6 +22,7 @@
 //!    the idiomatic functional loop stops being a depth risk at all.
 
 pub mod compile;
+mod liveness;
 
 pub use compile::{compile, compile_unit};
 
@@ -191,6 +192,12 @@ pub enum Op {
     LoadK { dst: Reg, k: u32 },
     /// `dst = src`
     Move { dst: Reg, src: Reg },
+    /// `dst = src`, and `src` is left empty — the last read of a value takes it
+    /// instead of cloning it, so a record or a list nothing else holds can then be
+    /// changed in place. `vm::liveness` is what proves the read is the last one, and
+    /// a separate opcode rather than a flag keeps the branch out of `Move`, which is
+    /// the most executed instruction there is.
+    MoveTake { dst: Reg, src: Reg },
     /// `dst = globals[idx]`
     LoadGlob { dst: Reg, idx: u32 },
     /// `globals[idx] = src`
@@ -263,7 +270,9 @@ pub enum Op {
     ///
     /// A new record; roc has no mutation. Updating a field the record does not have is
     /// an error, which is why this is not just a sequence of stores.
-    UpdateRecord { dst: Reg, obj: Reg, name: u16, base: Reg, n: u16 },
+    /// `take` says `obj`'s register is dead after this instruction, so the record is
+    /// moved out of it rather than cloned and `Rc::make_mut` mutates it in place.
+    UpdateRecord { dst: Reg, obj: Reg, name: u16, base: Reg, n: u16, take: bool },
     /// `dst = regs[obj].field`, the field name from `names`.
     GetField { dst: Reg, obj: Reg, name: u16 },
     /// `dst = Ok(regs[obj].field)`, or `Err(MissingField)` when it is absent.
@@ -843,6 +852,10 @@ impl Vm {
                 Op::Move { dst, src } => {
                     regs[base + dst as usize] = regs[base + src as usize].clone();
                 }
+                Op::MoveTake { dst, src } => {
+                    let value = std::mem::replace(&mut regs[base + src as usize], Value::Unit);
+                    regs[base + dst as usize] = value;
+                }
                 Op::LoadGlob { dst, idx } => {
                     let value = globals.borrow()[idx as usize].clone().ok_or_else(|| EvalError {
                         message: "Used before it was defined".to_string(),
@@ -1139,15 +1152,16 @@ impl Vm {
                     }
                     regs[base + dst as usize] = Value::record(fields);
                 }
-                Op::UpdateRecord { dst, obj, name, base: b, n } => {
-                    // `make_mut` and not a plain copy, so that a record nothing else
-                    // holds is updated IN PLACE. That does not fire yet and the reason
-                    // is not this op: the source register is still live here, and in
-                    // `p = { ..p, x: 1 }` the caller's own binding holds a second
-                    // handle across the call as well. Making it fire needs ownership
-                    // analysis, which is Phase 7.5 — until then this costs exactly what
-                    // the copy it replaced cost.
-                    let mut record = regs[base + obj as usize].clone();
+                Op::UpdateRecord { dst, obj, name, base: b, n, take } => {
+                    // `take` is `vm::liveness` saying nothing reads `obj` after this,
+                    // so the record moves out of its register and `Rc::make_mut` below
+                    // mutates it IN PLACE — no allocation, which is what roc's own
+                    // uniqueness buys and what `{ ..p, x: 1 }` over a `var` needs.
+                    let mut record = if take {
+                        std::mem::replace(&mut regs[base + obj as usize], Value::Unit)
+                    } else {
+                        regs[base + obj as usize].clone()
+                    };
                     let Value::Record(shared) = &mut record else {
                         return Err(locate_error(&program, chunk_id, ip, EvalError {
                             message: format!("Cannot update `{}`: it is not a record", record),
