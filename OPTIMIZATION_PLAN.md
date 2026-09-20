@@ -124,9 +124,25 @@ And the `map` program never loads a member at all: its entire 1.4ms of "type che
 | **rocflight** (out of process) | **6.8ms** | **5.5ms** | **11.0ms** | **13.7s** |
 | roc wasm | 23.9ms | 22.1ms | 36.3ms | 46.7s |
 
-The median eval test costs 5.5ms; a trivial one costs 0.85ms. The ~4.6ms in between is
-front-end work on a constant. Phases 1 and 2 are aimed squarely at it, and if they land
-rocflight becomes the fastest backend in roc's own harness.
+The median eval test costs 5.5ms; a trivial one costs 0.85ms. **The first version of
+this plan read the 4.6ms in between as front-end work on a constant, and that was
+wrong** — Phase 1 measured it. Two things the table does not show:
+
+- Only about 300 lines across the ~2,100 test sources mention `Dict`, `Set`, `Try`,
+  `Box` or `Stream`, so the overwhelming majority of eval tests **load no builtin
+  member at all**. The 3.5ms breakdown above is the `Dict` case, and the `Dict` case is
+  rare here.
+- The harness gives each rocflight test its own scratch directory, writes `main.roc`
+  into it, forks, execs, reads the answer and deletes the tree — 12 of those in
+  parallel. A trivial program's own latency is 0.85ms alone and 1.33ms under the same
+  12-way load; the rest of the median 5.5ms is the harness and the operating system,
+  which roc's in-process backends never pay.
+
+So this table is **not** the measure of rocflight's front end, and Phase 1 moved it by
+5% rather than halving it (13.7s → 13.0s, mean 6.8 → 6.4ms, median 5.5 → 5.1ms). What
+Phase 1 did move is the programs the breakdown above is actually about: a `Dict` program
+is 27% faster end to end and a `.map` program 38%. Take the suite as the correctness
+gate it is, and read speed off single programs.
 
 One outlier worth chasing separately: `issue 9796: multiple parser expects with forward
 alias both finalize` takes **1297ms** in rocflight against 4.4ms in roc's interpreter.
@@ -205,120 +221,164 @@ diagnosis.
 
 ---
 
-## Phase 1 — stop re-deriving constants at run time
+## Phase 1 — stop re-deriving constants at run time — **1.1, 1.2, 1.3a done**
 
-`Builtin.roc` is `include_str!`'d. Its member boundaries, its low-level dependency
-graph and its type signatures are **functions of a constant**, and `build.rs` already
-exists. Every one of them is currently computed from scratch in every process.
+`Builtin.roc` is `include_str!`'d. Its member boundaries and its low-level dependency
+graph are **functions of a constant**, and `build.rs` already existed. Both were being
+recomputed in every process; they are computed once, at build time, now.
 
-Biggest measured payoff of anything in this document, and the lowest risk in it: the
-output is byte-identical by construction, so the eval gate is a formality rather than a
-worry.
+What it bought, wall clock, median of 150 runs:
 
-### 1.1 — `builtin::index` moves to build time — saves ~915µs
-
-`index()` is a `OnceLock` that scans all 700kB of `SOURCE` to find each member's byte
-range. Once per process is still once per process, and it is 915µs of every program
-that names a `Dict`.
-
-Generate the table in `build.rs`: `static MEMBERS: &[(&str, usize, usize, bool)]`, in a
-file `include!`d by `builtin.rs`. The run-time `index()` becomes a slice.
-
-Keep the scanner — move it into `build.rs` and have a test assert the generated table
-equals what it produces, so a re-sync of `Builtin.roc` cannot silently skew the offsets.
-
-### 1.2 — `builtin::reachable` moves to build time — saves ~836µs
-
-`reachable()` prunes the low-level section to what the loaded members mention, by a
-word-set closure that allocates a `String` **per word** over ~3,200 lines. 836µs.
-
-The closure's inputs are the member texts, which are constants, and the answer depends
-only on *which members are loaded* — a set of at most a dozen. Precompute the low-level
-block ranges per member in `build.rs` and union them at run time. A dozen ranges to
-union is nanoseconds.
-
-If the build-time version proves awkward, the cheap fallback is to fix the allocation
-(`Vec<&str>` work-list, borrowing from `SOURCE`) — worth perhaps half of it. Prefer the
-build-time table; the input is a constant, so run-time work here is waste by definition.
-
-### 1.3 — `signatures_for` stops re-parsing — saves 0.4–1.4ms
-
-Two separate wastes under one name:
-
-- **When the member is loaded** (`Dict`, 394µs): `builtin::load` already parsed it and
-  `Loaded.signatures` already holds every `Type.method` annotation. Thread it to the
-  checker instead of parsing the text again. This was already on the table as "~0.9ms
-  per Dict program" and nothing else in this document is cheaper to do.
-- **When it is not loaded** (`List`, 1362µs; `Str` similarly): a three-element `.map`
-  pays 1.4ms to type-parse 1,676 lines. Generate the signature tables for
-  `TYPED_MEMBERS` in `build.rs` too. A signature is a `types::Type`, which is an
-  ordinary Rust value — the generated file constructs them directly, no parser
-  involved.
-
-Doing the second half also removes the reason `TYPED_MEMBERS` is a list of four instead
-of all ten: the comment says `Str` and `List` are excluded "for cost, not correctness",
-and at build time there is no cost. **Widening it changes inference**, so widen it in a
-separate commit with its own gate run.
-
-### 1.4 — `needed_by` stops guessing — saves 0–3.5ms depending on the program
-
-`needed_by` is four substring tests over the source. `source.contains("Dict")` loads
-`Dict`, `Set` *and* the low-level section — 3.5ms — for a program that merely mentions
-the word in a comment or an annotation. `contains("Try")` loads `Box`, and `Try` appears
-in a great many eval tests' annotations.
-
-After 1.1 the member index is a build-time table, which makes a precise answer cheap:
-collect the qualified names the parsed AST actually references and load the members that
-define them. The parse has already happened by then, so this is a walk over an AST that
-is in cache, not another scan of the source.
-
-Keep the closure — `Set(item) :: Dict(item, {})` genuinely needs `Dict` — but close over
-what is *referenced*, not over what is *spelled somewhere in the file*.
-
-### Targets
-
-| program | now | after Phase 1 |
+| program | before | after |
 |---|---|---|
-| `1 + 2` | 173µs | ~170µs (nothing to win) |
-| 3-element `.map` | 1502µs | ~150µs |
-| `Dict` insert/get | 4529µs | ~1800µs |
-| eval suite, rocflight total | 13.7s | ~7s |
+| `1 + 2` | 852µs | 849µs — nothing to win, and nothing lost |
+| `"hello".len()` | — | 1079µs |
+| 3-element `.map` | 2366µs | **1460µs** (−38%) |
+| `Dict` insert/get | 5329µs | **3876µs** (−27%) |
 
-Labelled as targets. They land when `tests/bench.sh` and the suite's own performance
-summary agree, and not before.
+And in-process, on the `Dict` program: `slice + index` 0.93 → 0.17ms, `reachable`
+0.80 → 0.13ms, `signatures_for(Dict)` 0.40 → 0.36ms, `builtin::load` 3.41 → 2.03ms.
+
+### 1.1 — the member index moves to build time — **done, −0.76ms**
+
+`index()` was a `OnceLock` scanning all 700kB of `SOURCE` for each member's byte range.
+Once per process was still 0.93ms of every program that names a `Dict`.
+`build.rs::scan` does it now and writes `MEMBERS` out as a static table that
+`builtin.rs` includes; `member_name` went with it, and with it the `Box::leak` per
+member name — the names are string literals in the generated file.
+
+`tests/check_builtin.sh --strict` is the gate rather than a table-equality test: a
+skewed offset makes a member fail to parse, and that script reports parse results member
+by member.
+
+### 1.2 — the reachability closure moves to build time — **done, −0.67ms**
+
+`reachable()` cut the low-level section down to what the other loaded members mention,
+by closing over the text word by word and allocating a `String` per word, over 2,305
+lines, in every process. `build.rs::low_level_reach` answers it per member now
+(`LOW_LEVEL_REACH`); the run-time half unions the lists of whatever is loaded and splits
+the blocks in one pass.
+
+The union is exact because reaching is monotone: the closure of two members' words is
+the union of each member's closure. That is the same property the old code relied on
+when `Dict` and `Set` arrived together.
+
+Evidence it kept the same declarations, which is what a faster wrong answer would have
+broken: the pruned section still parses to 454 lines at the same 0.66ms, and
+`check_builtin.sh` still reports 164 definitions and 153 intrinsics for it.
+
+### 1.3 — `signatures_for` — **half done, −0.07ms; the other half is not sound**
+
+`signatures_for(module)` is what the checker asks for a builtin's declared type, and it
+parsed on first use. Broken down with the Phase 0 probe (median of 25), for `List`:
+
+```
+members_where + annotations_only ->  137 lines   0.118ms
+desugar                                          0.006ms
+parse                                            0.368ms   <- 2.7µs a line
+filter + normalise                               0.042ms
+signatures_for(List)                             0.572ms
+```
+
+**1.3a, done.** `annotations_only` now reads the member's lines straight off `SOURCE`
+(`member_lines`) instead of having `members_where` build all 1,676 as a `String` so that
+1,539 could be thrown away, and the `Module.` prefix the signature filter compares is
+formatted once instead of once per signature — `Num` declares 828 of them. `List`
+0.639 → 0.572ms, `Dict` 0.403 → 0.355ms.
+
+That is a tenth of what the first draft of this plan projected, because the 0.25ms it
+attributed to `members_where` was a single-shot reading of a cold page cache. **Medians,
+not single runs, for anything under a millisecond.**
+
+**1.3b, not done, and not as written.** The plan said to generate the signature tables
+in `build.rs`. That cannot work: a signature is a `types::Type` produced by *this
+crate's* type parser, and a build script cannot call the crate it is building. The
+options left are a checked-in generated file with a regeneration step, or reusing what
+`builtin::load` already parsed — and the second is **provably wrong for `Set`**:
+`Set(item) :: Dict(item, {})`, so `Set`'s signatures only carry their element type if
+`Dict`'s declaration was in scope while they were parsed, which is exactly why
+`parse_signatures` prepends `Dict`'s annotations. `load` parses each member with its own
+`Parser`, so its `Set` signatures are the degraded ones. It would be sound for `Dict`
+alone, for 0.36ms on `Dict` programs, at the price of a side channel between `load` and
+`signatures_for`. Left for whoever needs that 0.36ms.
+
+The real cost here is the **0.37ms to parse 137 annotation lines**, at 2.7µs a line
+against ~1.4µs for ordinary source. That is Phase 3's number, not Phase 1's.
+
+### 1.4 — `needed_by` — **measured, not worth it**
+
+`needed_by` is four substring tests: `source.contains("Dict")` loads `Dict`, `Set` and
+the low-level section, 2.0ms, even for a program that merely mentions the word.
+
+Narrowing it precisely needs the parsed AST — which qualified names the program actually
+references — and that is real machinery. The cheap version, whole-word matching on
+non-comment lines, was measured against every `.roc` in the repo: it changes the answer
+for **one** file, `tests/roc/14_nominal/field_optional.roc`, where `Try` appears only in
+a comment, worth 0.35ms once. And across roc's ~2,100 eval test sources only about 300
+lines mention any trigger word at all, so there is no aggregate there either.
+
+Left undone deliberately. Revisit if a real program shows up paying 2ms for a word in a
+comment.
+
+### Measured and rejected
+
+- **Stripping comments before the reachability closure.** A name that appears only in a
+  doc comment cannot be called by anything, so following it keeps a declaration no code
+  reaches — and `Builtin.roc`'s doc comments are full of `## expect Dict.insert(…)`.
+  Since 1.2 runs at build time this was free to try, and it changes nothing: `Dict`
+  reaches 48 low-level declarations and `Set` 41, with or without the filter. Every name
+  mentioned in a comment is also used in code. Reverted.
+
+### What Phase 1 leaves
+
+On the `Dict` program, of ~2.9ms in-process:
+
+```
+the three member parses        1.70ms   <- 59%, and Phase 2 or 3 owns it
+signatures_for(Dict)           0.36ms   <- 1.3b, if the side channel is worth it
+compile to bytecode            0.35ms
+slice + reachable              0.30ms
+run                            0.07ms
+```
+
+The front end is still the program, but what is left of it is **parsing Roc source**,
+not re-deriving tables. That is the hand-off to Phase 2 and Phase 3.
 
 ---
 
 ## Phase 2 — parse `Builtin.roc` once, not once per process
 
-What Phase 1 leaves on a `Dict` program is ~1.6ms of parsing three members and ~360µs
-of compiling them. Same observation as Phase 1 — the input is a constant — but the
-output is an AST with node identity, interned `&'static str` and source offsets, so
-this one is real work rather than a table.
+Phase 1 leaves 1.70ms of parsing three members and 0.35ms of compiling them on a `Dict`
+program — 59% and 12% of what is left. Same observation as Phase 1, the input is a
+constant, but the output is an AST with node identity, interned `&'static str` and source
+offsets, so this one is real work rather than a table.
 
-Three ways, in increasing cost. **Measure 2a on one member before committing to
-anything.**
+**And it cannot be done in `build.rs`.** Phase 1.3b found the reason the hard way: a
+build script cannot call the crate it is building, so nothing that needs rocflight's own
+parser or `types::Type` can run there. Every option below therefore needs a *checked-in*
+artifact produced by a tool that links the crate — `cargo run --bin <gen>` — plus a test
+that regenerates it and compares, so a re-sync of `Builtin.roc` cannot leave the artifact
+stale. That shape is the real cost of this phase, not the loading code.
 
-- **2a — generate Rust that builds the AST.** `build.rs` emits constructor code per
-  member. Fastest possible load (no parsing, no deserializing), but it inflates compile
-  time and the generated file is large. Try it on `Set` (230 lines) alone and measure
-  both the load win and the `cargo build` cost before going further.
-- **2b — serialize a compact AST and deserialize on demand.** Smaller build impact, and
-  the loader can be lazy per member. Costs a serializer, a deserializer and a format
-  that has to stay in step with `ast::Expr` — the most code of the three.
+- **2a — a generated Rust file that builds the AST.** Fastest possible load: no parsing,
+  no deserializing. Inflates `cargo build`, and the file is large. Try it on `Set` (230
+  lines) alone and measure both the load win and the build cost before going further.
+- **2b — a serialized AST, deserialized per member on demand.** Smaller build impact and
+  lazy per member. Costs a serializer, a deserializer and a format that has to stay in
+  step with `ast::Expr` — the most code of the three.
 - **2c — cache the compiled `Program` under `.rocflight/`, keyed by the hash of
-  `Builtin.roc` and the member set.** Least code, but every process still pays a
-  deserialize, and it puts correctness on a cache-invalidation rule. Last resort.
+  `Builtin.roc` and the member set.** Least code, needs no generation step, but every
+  process still pays a deserialize and correctness rests on a cache-invalidation rule.
 
-The awkward part either way: `NodeId` carries a source offset for error locations, and a
-build-time AST has no offset into the *user's* file. That is fine — a runtime error
-inside `Dict.insert` should point at the vendored source, which is what it does today —
-but it has to be deliberate, because `ast::locate` silently returns `None` and the
-error just loses its location.
+Awkward either way: `NodeId` carries a source offset for error locations, and a
+pre-built AST has no offset into the *user's* file. That is fine — a runtime error inside
+`Dict.insert` should point at the vendored source, which is what it does today — but it
+has to be deliberate, because `ast::locate` silently returns `None` and the error just
+loses its location.
 
-**Only attempt this after Phase 1.** Phase 1 may take a `Dict` program to ~1.8ms, at
-which point the remaining 1.6ms may be better spent on Phase 3, which helps user code
-too. Decide with the numbers, not now.
+**Prefer Phase 3 first.** Phase 3 attacks the same 1.70ms through the parser, helps every
+module a user imports and every annotation they write, and needs no generated artifact or
+regeneration discipline. Come back here only if the parser work stalls.
 
 ---
 
@@ -494,16 +554,28 @@ Worth one afternoon, after everything above:
 
 ## Order, and why
 
-1. ~~**Phase 0**~~ — done. Without it every later phase is an opinion.
-2. **Phase 1**, the largest measured win in the document and the safest — its output is
-   identical by construction. Halves the eval suite.
+1. ~~**Phase 0**~~ — done. Without it every later phase is an opinion, and it is what
+   corrected two of this list's own claims.
+2. ~~**Phase 1**~~ — 1.1, 1.2 and 1.3a done: a `Dict` program 27% faster end to end, a
+   `.map` program 38%. 1.3b and 1.4 measured and left undone, with reasons above. It was
+   billed as halving the eval suite and moved it 5%; see
+   [What that costs the suite](#what-that-costs-the-suite) for why that projection was
+   wrong.
 3. **Phase 4.1 and 4.2**, because a confirmed 3× on `t + 1` is embarrassing and the fix
-   is local.
-4. **Phase 5**, one method per commit — speed *and* a bound removed.
-5. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
-6. **Phase 2 or Phase 3**, whichever the post-Phase-1 numbers say is bigger. Not both
-   at once.
-7. **Phase 6**, or never.
+   is local. The biggest ratio left in the document.
+4. **Phase 3**, the parser: 1.4µs a line of ordinary source and 2.7µs a line of
+   annotations, which is 59% of what is left of a `Dict` program *and* the floor under
+   every module a user imports. Start with the two cheap experiments, not the lexer.
+5. **Phase 5**, one method per commit — speed *and* a bound removed.
+6. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
+7. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
+   discipline to keep it fresh, which Phase 3 does not.
+8. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
+   `/bin/true`, which is 0.7s of the suite's 13.0s.
 
-Every phase, the same four gates, and the eval suite at 1953 of 1953. A phase that
-cannot hold that number does not land, however good its benchmark looks.
+Every phase, the same gates, and the eval suite at 1953 of 1953. A phase that cannot
+hold that number does not land, however good its benchmark looks.
+
+And one method note, earned twice in Phase 1: **anything under a millisecond is measured
+as a median of 15–25 runs, never a single one.** Two of Phase 1's projections came from
+single readings of a cold page cache and were out by 3–4×.

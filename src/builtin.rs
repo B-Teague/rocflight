@@ -255,22 +255,22 @@ fn reachable(source: &str, selected: &[&str]) -> String {
 /// dispatch `insert` on an unresolved type". Reading their signatures costs nothing:
 /// a program that never mentions a `Dict` never parses one.
 ///
-/// `Str` and `List` are left out for cost, not correctness. Neither moved a single
-/// gate — `builtin_result` already gives their common methods real types — while `Str`
-/// took the `strings` benchmark from 5ms to 7ms and `List` is 1,676 lines and cost 5ms
-/// of every run against a 3ms baseline. The parse buys a long tail nothing yet asks
-/// for.
+/// `Str` and `List` were left out at first for cost, not correctness, and were later
+/// let in: the annotation parse is what a program that calls `.map` or `.len` pays for
+/// a real type. It is the single largest cost of a program that touches nothing else —
+/// 0.57ms for `List`, 0.22ms for `Str` — and `annotations_only` plus the lazy cache
+/// below is what keeps it to that. See `OPTIMIZATION_PLAN.md` phase 1.3.
 ///
-/// All ten parsing members are verified to seed cleanly, 98 golden pairs and 12
-/// examples with any combination of them, so widening this is one edit whenever that
-/// long tail is worth the parse.
+/// All ten parsing members are verified to seed cleanly, with the golden pairs and the
+/// examples green on any combination of them, so widening this is one edit whenever the
+/// long tail beyond these four is worth its parse.
 const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List"];
 
 /// The `Type.method` signatures for one module, parsed on FIRST USE and kept.
 ///
-/// Lazily, because seeding them all up front cost every program the parse of 1,490
-/// lines — three milliseconds on a three-millisecond benchmark. A program that never
-/// mentions a `Dict` never pays for `Dict`.
+/// Lazily, because seeding all four up front costs every program a parse it may not
+/// need: a program that never mentions a `Dict` never pays for `Dict`, and one that
+/// only concatenates strings pays 0.22ms for `Str` and nothing for `List`'s 0.57ms.
 ///
 /// The module name is the member name here, which holds for everything in
 /// `TYPED_MEMBERS`. It does not in general — `Json` lives in `Encoding` and `Try` in
@@ -301,17 +301,21 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
 }
 
 fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
-    let Some(member) = members_where(|name| name == module).pop() else { return Box::new([]) };
+    let Some(slice) = MEMBERS.iter().find(|s| s.name == module) else { return Box::new([]) };
     // `Set(item) :: Dict(item, {})` — so `Set`'s own signatures only carry their
     // element type if `Dict` is a known parameterised nominal while they are parsed.
     // Alone, `Dict(item, {})` degrades to a placeholder and `item` is dropped, which is
     // why `Set.from_list([...U64]).to_list()` came back a list of unconstrained numbers.
     // Parse `Dict`'s declaration first, then keep only `Set`'s own signatures.
     let source = if module == "Set" {
-        let dict = members_where(|name| name == "Dict").pop().map(|m| m.source).unwrap_or_default();
-        format!("{}\n{}", annotations_only(&dict), annotations_only(&member.source))
+        let dict = MEMBERS
+            .iter()
+            .find(|s| s.name == "Dict")
+            .map(|d| annotations_only(member_lines(d)))
+            .unwrap_or_default();
+        format!("{}\n{}", dict, annotations_only(member_lines(slice)))
     } else {
-        annotations_only(&member.source)
+        annotations_only(member_lines(slice))
     };
     let Ok(desugared) = Desugarer::new(source).desugar() else {
         return Box::new([]);
@@ -320,12 +324,25 @@ fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
     if parser.parse_expr().is_err() {
         return Box::new([]);
     }
+    // One `Module.` prefix, not one per signature: `Num` declares 828 of them.
+    let prefix = format!("{}.", module);
     parser
         .signatures()
         .iter()
-        .filter(|(name, _)| name.starts_with(&format!("{}.", module)))
+        .filter(|(name, _)| name.starts_with(&prefix))
         .map(|(name, ty)| (*name, normalise(ty)))
         .collect()
+}
+
+/// One member's lines, as a top-level declaration: de-indented, straight off `SOURCE`.
+///
+/// `members_where` would do this too, but it builds the whole member as a `String`
+/// first, and `annotations_only` then throws 92% of it away — 0.25ms to slice `List`'s
+/// 1,676 lines so that 137 of them could be kept. Same lines, no copy.
+fn member_lines(slice: &Slice) -> impl Iterator<Item = &'static str> + '_ {
+    SOURCE[slice.start..slice.end]
+        .lines()
+        .map(move |line| if slice.in_nominal { line.strip_prefix('\t').unwrap_or(line) } else { line })
 }
 
 /// The member with its function BODIES removed.
@@ -334,10 +351,10 @@ fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
 /// are a small fraction — parsing the rest cost five milliseconds of every run that
 /// touched a list. A body starts at `name = ` and runs until something at its own
 /// indent or shallower appears.
-fn annotations_only(source: &str) -> String {
-    let mut kept = String::with_capacity(source.len() / 4);
+fn annotations_only<'a>(lines: impl Iterator<Item = &'a str>) -> String {
+    let mut kept = String::new();
     let mut body_indent: Option<usize> = None;
-    for line in source.lines() {
+    for line in lines {
         let indent = line.len() - line.trim_start().len();
         if let Some(started) = body_indent {
             // A blank line does not end a body, nor does the closer that ends the
