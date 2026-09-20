@@ -668,21 +668,63 @@ it looked, because a fifth to a quarter of the writes are gone. Measure again be
 shrinking `Value` — the histogram is ten lines and worth rebuilding whenever this section
 is reopened.
 
-### 4.4 — `DispatchMethod` resolves from scratch on every call
+### 4.4 — `DispatchMethod`'s table lookup — **measured and rejected**
 
-The opcode does a `module_for`, a `HashMap` lookup, and on a miss a scan of
-`methods_by_name` with `NominalShape::is_exactly` per candidate, a depth computation and
-a `holds_kinds` pass — per call, at a call site whose answer almost never changes. A
-one-entry inline cache on the instruction (last receiver shape → chunk, invalidated by
-nothing, because the program is immutable) is the standard fix and is contained.
+The claim was that resolving a method per call is expensive: a `module_for`, a `HashMap`
+lookup on a `(&str, &str)` key, and on a miss a scan of `methods_by_name` with a shape
+check per candidate. An inline cache was "the standard fix".
 
-### 4.5 — `GetField` compares field names
+Counted first. `DispatchMethod` is 0% of every benchmark except two — 20% of `list_pass`
+and 16.7% of `strings` — so those are the only places it could pay. Then the lookup was
+removed outright for the case those two are in: a program that mentions no `Dict`, `Set` or
+nominal loads no `Builtin.roc` member, so `methods` and `methods_by_name` are both **empty**
+and the hash is paid only to be told so. Skipping it entirely is strictly more than an
+inline cache can win.
 
-`Op::GetField` scans a `Vec<(&'static str, Value)>` comparing `&str`s. Resolving a field
-to a slot needs the checker's record type at the access site; this was retired once as
-not worth the threading. Revisit **only with a benchmark that shows it** —
-`records` at 14ms for 40,000 update-and-read iterations is 350ns an iteration, which is
-enough to be worth a look now that the plan has a measurement discipline for it.
+It won nothing. Interleaved A/B against a freshly built reverted binary, median of 21:
+
+```
+                reverted   skip-the-lookup
+records            10.8ms       11.5ms      <- 6.5% WORSE
+strings             6.1ms        6.2ms
+list_pass           3.9ms        3.8ms
+matching           20.8ms       20.2ms
+records_tail        9.0ms        8.9ms
+```
+
+So the lookup is not the cost, and an inline cache cannot beat zero. Reverted.
+
+### 4.5 — `GetField` by slot — **measured and rejected**
+
+`GetField` is 20% of `records`'s instructions and 15.4% of `records_tail`'s, which is a real
+number, and it does look up a name: `program.chunks[chunk_id].names[name]`, then a scan of
+the record's fields comparing `&str`.
+
+Making that lookup free changed nothing. The cheap half of the idea — hoisting `consts`,
+`names` and `pats` into locals of the interpreter loop beside `code`, so none of the 20
+sites that read them re-indexes `program.chunks[chunk_id]` — measured as **no win at all**,
+including on `records`. LLVM was already hoisting the chunk lookup where it mattered.
+
+That is evidence about the premise, not just about that patch: if reaching the name costs
+nothing, the name is not what `GetField` spends its time on. The 20% is an instruction
+**count**, and what an instruction costs here is the dispatch, the bounds checks and the
+`Value` clone — none of which a slot removes. Resolving a field to a slot needs the
+checker's record type threaded through the compiler, and it would buy the comparison of a
+one-character field name in a two-field record. Retired for the second time, with numbers
+this time.
+
+### The finding worth keeping from both
+
+**The `exec` match is layout-sensitive.** Adding one branch to the `DispatchMethod` arm
+moved `records` — which executes **no** `DispatchMethod` at all — by 6.5%. A control
+confirmed it is not build nondeterminism: the same source built twice gives the same times
+to within 2%.
+
+So a change to one opcode's arm can cost more elsewhere than it saves where it is aimed,
+and **the whole benchmark suite has to be A/B'd for any VM change, interleaved**, not just
+the benchmark the change targets. Alternating the two binaries in one loop is what made
+these numbers readable at all — this machine drifts 7% across a few minutes, which is
+larger than every effect in this section.
 
 ### 4.6 — top-level names are found by linear scan
 
@@ -872,8 +914,8 @@ Worth one afternoon, after everything above:
 7. **Phase 4.2**, `Dec` arithmetic — smaller than it looked before 4.1 measured it.
 8. ~~**Phase 4.3**~~ — done: `Move` was the most executed opcode, and a destination hint
    plus not materializing a discarded `Unit` took `loop` −26%, `matching` −20%,
-   `records_tail` −19%. **4.4 and 4.5 are still open**, and the histogram that found this
-   is the way to decide whether they are worth it.
+   `records_tail` −19%. **4.4 and 4.5 measured and rejected** — neither's premise held, and
+   perturbing the `DispatchMethod` arm cost `records` 6.5% through code layout alone.
 9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
    discipline to keep it fresh, which Phase 3 does not.
 10. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
