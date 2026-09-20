@@ -862,7 +862,7 @@ Worth one afternoon, after everything above:
 
 ---
 
-## Phase 7 — the allocations that are left — **7.1 done, −13.9% to −55%**
+## Phase 7 — the allocations that are left — **done, −2.7% to −27.5% across the suite**
 
 `Value::List` was put behind an `Rc` because a list is cloned on every register move,
 every argument and every return, and a `Vec` clone copies every element. That argument
@@ -951,94 +951,119 @@ would not fix it: in `p = step(p)` the *caller's* binding holds a second handle 
 the whole call. Making this fire is ownership analysis, which is 7.5. The `make_mut` is
 kept because it is the correct shape and costs exactly what the copy it replaced cost.
 
-### 7.2 — tag payloads: one allocation instead of two, and none for a bare tag
+### 7.2 — tag payloads: one allocation instead of two, and none for a bare tag — **done**
 
-`Value::Tag(&'static str, Rc<Vec<Value>>)` is a pointer to an `Rc` box that holds a
-`Vec` that points at a second heap buffer. Two allocations per tag, for a payload that
-is never mutated after construction.
+`Rc<Vec<Value>>` was a pointer to a box holding a `Vec` pointing at a second buffer:
+two allocations for a payload that is never changed after it is built. It is
+`Rc<[Value]>` now.
 
-| | time | over the control |
+The trap the plan called out is real and worth repeating: **`Rc::from(a_vec)` does not
+save the allocation** — it allocates the box and memcpies into it, then frees the
+`Vec`, which is strictly worse. The win is only there if the payload is never a `Vec`,
+so the 113 `Value::tag(…, vec![…])` call sites became arrays and `MakeTag` collects
+straight out of the register window, which for an exact-size iterator allocates once.
+`Value::tag` takes `impl Into<Rc<[Value]>>`, so an array, a slice and a `Vec` all still
+compile — only the array shape is free.
+
+A tag with no payload is `Value::bare`, cloning one thread-local empty `Rc<[Value]>`.
+Thirty-nine sites were writing `Rc::new(Vec::new())`, which allocates: the `Vec` does
+not, the `Rc` box does. `Try`'s `map_ok`/`map_err` and `on_err` hand the same `Rc` back
+rather than copying the payload.
+
+`matching` −5.0%, `matching_tail` −3.8%, and the two probes at the head of this phase
+−2.3% and −3.2%.
+
+### 7.3 — builtin arguments — **done, and the plan was wrong about where they were**
+
+This one was written as "a `Vec` per `CallBuiltin`", with the counting allocator named
+as the thing to run before writing the fix. Running it first is what stopped a
+4,294-line refactor of the wrong function.
+
+**Builtin argument vectors are 2 to 4 per program on ten of the twelve benchmarks.**
+Phase 5 lowered the callback builtins into in-frame loops and most arithmetic is
+`BinInt`, so `CallBuiltin` is simply not where a program's time goes any more. The two
+exceptions had 12,006 (`list_pass`) and 8,003 (`strings`) — and those were not
+`CallBuiltin` either. They were **`DispatchMethod`**, which collected the register
+window into a `Vec`, `remove(0)`'d the receiver off the front — an O(n) shift — and
+then built a *second* `Vec` to put the receiver back at the front, because that is the
+shape `call_builtin_values` wants. Two allocations and a shift on every `xs.len()`.
+
+Both are gone. `call_builtin_values` and `dispatch_builtin` take `&mut [Value]`, which
+**is** the register window, receiver at slot 0. The plan's claim that "nearly every
+builtin destructures an owned `Vec`" was also wrong: the dispatch layer only ever read
+`&args`, exactly seven functions took one by value, and each of those immediately did
+`let mut args = args;` and `mem::replace`d elements out of it — which is what
+collecting the window did anyway. Those registers are dead after the call either way,
+so handing over the window changes nothing but the `malloc`.
+
+| | allocations before | after |
 |---|---|---|
-| construct `None`, match it | 35.0ms | 47ns per iteration |
-| construct `Some(x)`, match it | 43.0ms | 87ns per iteration |
+| `list_pass` | 34,217 | 14,210 |
+| `strings` | 41,806 | 25,803 |
 
-Two things fall out of that 40ns gap, and both are small, local and unambiguous:
+`list_pass` −7.3%, `list_ops` −4.2%. No `SmallVec` and no pool: the register file was
+already the stack-shaped place these values live, and the honest version of "stack
+instead of heap" was to stop copying them out of it.
 
-- **`Rc<[Value]>` instead of `Rc<Vec<Value>>`.** `MakeTag` already builds its payload
-  from an exact-size iterator over the register window, and `Rc<[T]>` collected from an
-  exact-size iterator allocates **once**. (Note the trap: `Rc::from(some_vec)` does
-  *not* save the allocation — it allocates the box and memcpies. The win is only there
-  if the payload is never a `Vec` in the first place, so `Value::tag` has to take the
-  iterator, not a built `Vec`.) Every `Ok`/`Err` in the program is one of these.
-- **A shared empty payload for a bare tag.** `Value::tag("None", vec![])` is
-  `Rc::new(Vec::new())` — `Vec::new` allocates nothing but `Rc::new` allocates the box,
-  so a tag with no payload still costs a `malloc`. One `thread_local` empty
-  `Rc<[Value]>`, cloned, makes it a refcount bump. `Bool` is its own variant so this is
-  not about `True`/`False`; it is about `None`, `Dot`, `MissingField` and every other
-  bare tag — and `MissingField` in particular is constructed on the *success* path of
-  an optional-field read.
+### 7.4 — the one-liners — **done**
 
-`Closure::captures` is deliberately **not** on this list: it is an inline `Vec` inside a
-struct that is already behind an `Rc`, so it is already one allocation per closure and
-a refcount bump per clone.
+`Chunk::params` and `Closure::params` are `Rc<[&'static str]>`. `MakeRecord` takes each
+field out of its register as `MakeTuple` and `MakeTag` beside it do — the compiler
+resets `next_reg` to `base` before allocating the destination, so those registers are
+dead and cloning them was copying a nested record for nothing.
 
-### 7.3 — builtin arguments: a `Vec` per call, from a register file that already has them
+### 7.5 — the last read takes the value — **done, −11.4% and −9.8%**
 
-`CallBuiltin`, `CallHost`, and `Call`/`TailCall` on a builtin held as a value all do:
+`Rc` made a record cheap to SHARE. It never made one cheap to CHANGE. `Op::Move`
+cloned, so `p = step(p)` left the caller's binding holding a second handle for the
+whole call, and `Rc::make_mut` in `UpdateRecord` always copied.
 
-```rust
-let args = collect(regs, base + b as usize, argc);   // Vec<Value>, one malloc
-crate::eval::call_builtin_values(module, func, args)
-```
+**Confirmed before it was written.** A throwaway build that took unconditionally —
+unsound in general, fine for one program — turned `records.roc`'s 80,720 allocations
+into 719 with the answer unchanged. That said the design was right, and it bounded what
+a sound version could be worth before any of it was built.
 
-The arguments are already contiguous in the register file. The `Vec` exists only because
-`call_builtin_values` takes ownership of one. A builtin call measured ~65ns over a
-plain call in a first cut, which is the whole dispatch and not just the allocation, so
-**the share belonging to the `Vec` is not yet measured** — and this document's own rule
-is that the mechanism gets confirmed before the fix gets written. The probe is a
-counting global allocator behind a `cfg`, or `heaptrack` on `tests/bench/list_ops.roc`.
+`src/vm/liveness.rs` is a backward liveness fixpoint over the flat opcode vector. Where
+it proves a read is the last one, `Move` becomes `MoveTake` and `UpdateRecord` gets
+`take: true`; the value moves out of its register, the refcount falls to one, and
+`make_mut` mutates in place.
 
-If it pays, the shape is `&mut [Value]` — the register window itself, with builtins
-taking what they need out of it — and no new type and no new dependency. It is not a
-small diff: `eval/mod.rs` is 4,294 lines and nearly every builtin destructures an owned
-`Vec`. Do 7.1 and 7.2 first; they are a tenth of the work for a measured win.
+**The soundness rule is one-directional, and it is the whole reason this is safe to
+ship:** reads may be over-approximated and kills under-approximated, never the reverse.
+An extra read or a missed kill only costs a take. A *missed* read would empty a register
+something still needs and answer wrongly, with no crash. So `reads`, `kills` and
+`successors` each match every opcode by name with **no wildcard arm** — a new opcode
+does not compile until someone has said what it does. `GetFieldOr`, `IterNext` and
+`TestStr` write only on one of their outgoing edges, so they kill nothing.
 
-**No `SmallVec`.** Putting a two-element argument list on the stack is a real idea and a
-new dependency for it is not: the register file is already the stack-shaped place these
-values live, so the honest version of "stack instead of heap" here is to stop copying
-them out of it.
+`TailCall` is the one range kill, and it is not a detail: it moves its arguments down
+onto registers `0..argc` before looping back to the top, so a tail-recursive function's
+parameters are **not** live round the loop. Without that kill `records_tail` got no
+takes at all and read **+6.9%** from code layout alone — a regression bought with no
+win. With it, −9.8%. A separate `MoveTake` opcode rather than a flag on `Move`, because
+`Move` is the most executed instruction there is and this VM's dispatch is measurably
+layout-sensitive.
 
-### 7.4 — the one-liners
+| | before | after | allocations |
+|---|---|---|---|
+| `records` | 9.44ms | 8.36ms (**−11.4%**) | 80,720 → 828 |
+| `records_tail` | 9.11ms | 8.22ms (**−9.8%**) | 80,575 → 674 |
+| `loop` | | −3.0% | |
 
-- `Chunk::params` and `Closure::params` are `Rc<Vec<&'static str>>` — two allocations
-  and two indirections for something built once at compile time and read only to print
-  `<lambda |x, y|>`. `Rc<[&'static str]>` is one. Worth the ten minutes it takes, worth
-  no more than that.
-- `MakeRecord` `.clone()`s each field out of its register where `collect` would
-  `mem::replace` it. For a field holding a record or a list, that is a deep copy or a
-  refcount bump that nothing needed. Check first that the source registers are really
-  dead after the op — `collect` is used by `MakeTuple` and `MakeTag` right beside it, so
-  the compiler probably already guarantees it.
+`ListPush` and `Lazy::advance` share the same `make_mut` and will benefit wherever the
+analysis reaches them; nothing was measured there and nothing is claimed.
 
-### 7.5 — the uniqueness this phase did not buy
+### What Phase 7 came to
 
-`Rc` made a record CHEAP to share. It did not make it cheap to *update*, because
-nothing in this interpreter ever knows it holds the only handle. `Op::Move` clones,
-`Op::CallFn` leaves the caller's copy in place, and a global keeps its handle across the
-call that reads it — so `Rc::make_mut` in `UpdateRecord`, `ListPush` and `Lazy::advance`
-all hit a refcount of 2 and copy.
+All of it, against the pre-7.1 binary, interleaved, median of 15:
 
-roc solves this with ownership: a value at its last use is given away, not lent. The
-interpreter's version would be a **last-use take** — the compiler marks the reads it can
-prove are final, and those ops `mem::replace` the register instead of cloning it. The
-machinery is already here: Phase 4.3's `wrote_directly` proves the same class of fact
-about a destination, `branches()` already lists what breaks straight-line reasoning, and
-`Op::IterNext` already takes its iterator out of its register for exactly this reason.
+| | | | |
+|---|---|---|---|
+| `records` −27.5% | `matching_tail` −10.4% | `list_pass` −10.2% | `records_tail` −10.6% |
+| `matching` −9.7% | `list_ops` −7.8% | `strings` −6.2% | `closure_in_loop` −5.6% |
+| `iter_range` −5.3% | `closure_capture` −5.1% | `loop` −2.9% | `calls` −2.7% |
 
-It is the largest remaining item in this document and it is also the one most likely to
-be quietly wrong, so it wants its own phase, its own bytecode dumps and the eval suite
-on every step. Measure first: a counting allocator will say how many of a program's
-allocations are `make_mut` copies before anyone decides it is worth the risk.
+Every benchmark faster, none regressed, 1953 of 1953 throughout.
 
 ### Measured and rejected
 
@@ -1125,18 +1150,17 @@ allocations are `make_mut` copies before anyone decides it is worth the risk.
    perturbing the `DispatchMethod` arm cost `records` 6.5% through code layout alone.
 9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
    discipline to keep it fresh, which Phase 3 does not.
-10. ~~**Phase 7.1**~~ — done: `Record` and `Tuple` behind an `Rc`, so passing either to
-   a function is flat in its width instead of linear. `records` −13.9%,
-   `closure_in_loop` −12.0%, a 16-field record −55.2%, nothing regressed, 46 lines
-   changed. **Its own claim about `Rc::make_mut` was wrong** — the compiler never emits
-   `dst == obj`, so the in-place update never fires; the dead fast path was measured and
-   deleted, and the real fix moved to 7.5.
-11. **Phase 7.2**, tag payloads — the same shape as 7.1, a tenth of the size.
-12. **Phase 7.5**, last-use take. The largest number left and the easiest to get subtly
-   wrong; it is what makes `make_mut` mean anything anywhere.
-13. **Phase 7.3**, builtin argument vectors, only after 7.2 and only if the
-   counting allocator says the `Vec` and not the dispatch is the cost.
-14. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
+10. ~~**Phase 7**~~ — done, all five items. Every benchmark faster, none regressed,
+   1953 of 1953 throughout: `records` −27.5%, `matching_tail` −10.4%, `list_pass`
+   −10.2%, down to `calls` −2.7%. Three of its own claims were wrong and the
+   measurements are what caught each one — 7.1's `make_mut` (the compiler never emits
+   `dst == obj`), 7.3's whole premise (the `Vec`s were in `DispatchMethod`, not
+   `CallBuiltin`, and there were four of them per program elsewhere), and 7.3's "nearly
+   every builtin destructures an owned `Vec`" (seven functions did, and none of them
+   needed to). 7.5 is the one to be careful around: a liveness pass whose failure mode
+   is a wrong answer with no crash, kept safe by matching every opcode with no wildcard
+   arm.
+11. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
    `/bin/true`, which is 0.7s of the suite's 13.0s.
 
 Every phase, the same gates, and the eval suite at 1953 of 1953. A phase that cannot
