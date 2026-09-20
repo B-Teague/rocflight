@@ -640,7 +640,7 @@ scheduled.
 
 ---
 
-## Phase 5 — lower the remaining callback builtins — **four done, one refused**
+## Phase 5 — lower the remaining callback builtins — **eight done, one refused, the rest blocked**
 
 `fold` and `map` compiled into in-frame loops; the rest re-entered the VM per element
 through `call_closure` — a fresh register file, an argument `Vec` and a **Rust** frame
@@ -650,6 +650,10 @@ apiece. Four more are compiled now.
 |---|---|---|
 | `all` | 221ms | **118ms** |
 | `find_first` | 230ms | **106ms** |
+| `fold_try` | 328ms | **205ms** |
+| `fold_with_index` | 273ms | **161ms** |
+| `find_first_index` | 262ms | **146ms** |
+| `find_last_index` | 258ms | **166ms** |
 
 `Compiler::list_loop` took a `fold: bool`; it now takes a `Shape`, and what each element
 does with the callback's answer is `finish_element`. The new opcode is `TestBool`, which
@@ -670,6 +674,30 @@ receiver.
 `count_if` was not implemented at all — `List.count_if` was an unknown function, though
 `Builtin.roc` declares it — so the Rust builtin was written too. A method should not
 exist only in the compiler: the lowering is an optimization, not the only way to reach it.
+
+`fold_try`, `fold_with_index`, `find_first_index` and `find_last_index` pass the same
+test, and `Shape` now answers four questions about itself — `takes_init`, `arity`,
+`needs_index`, `passes_index` — so the loop body is one path instead of three.
+
+Two things in there needed care:
+
+- **`fold_try` is a three-way branch.** An `Err` is the answer and stops the fold; an `Ok`
+  unwraps into the accumulator; anything else becomes the accumulator as it stands, which
+  is what the builtin's `other => acc = other` does. `TestTag "Ok"` already matches a
+  non-tag value and `GetPayload` answers one with itself, so both fall out of one test.
+  Testing for `Ok` explicitly rather than trusting the `Err` test to be exhaustive is what
+  keeps a payload-less tag from indexing an empty payload and panicking. Reaching the end
+  without an `Err` wraps the accumulator in `Ok` **after** the loop, which the early exit
+  jumps past.
+- **"The loop needs a position" is not "the callback gets the position".** Only
+  `fold_with_index` is handed it; `find_first_index` reports a position but its predicate
+  takes just the element. Conflating them passed the index as a second argument and made
+  `xs.find_first_index(big)` fail with "Lambda expects 1 argument(s), got 2".
+  `needs_index` drives register allocation and `passes_index` drives the argument list.
+
+`IterNext`'s own `idx` cannot serve as the position, either: it is the element index only
+for a list or a range, and a lazy iterator carries its own state and never touches it. The
+loop keeps its own counter and advances it right after `IterNext`.
 
 ### Refused: `keep_if` / `drop_if`
 
@@ -700,13 +728,22 @@ neither was taken: `dispatch_builtin` still answers the lazy one for both, and s
 Both need an `Iter` that is its own value rather than a borrowed name for a list, which
 is a representation change and belongs in a correctness plan, not this one.
 
-### Still open
+### Still open, and what blocks it
 
-The remaining `call_function` sites are `walk`, `walk_until`, `fold_try`,
-`fold_with_index`, `find_first_index`, `keep_oks`, `update_at`, `sort_by`, `sort_with`
-and the `Try` methods. `sort_with` cannot be a loop at all. The value-returning ones
-follow the pattern above; anything that answers a **container** needs the `Iter` question
-settled first.
+Every value-returning callback method on `List` is compiled now. What is left answers a
+**container**, and each is blocked on the same `Iter` question as `keep_if`:
+
+| method | why it is still a builtin |
+|---|---|
+| `keep_oks` | answers a `List`; needs the `Iter` question settled |
+| `update_at` | not a walk over every element — it takes an index |
+| `sort_by` | a sort, not a loop; the callback is a key function |
+| `sort_with` | a sort with a comparator; cannot be a loop at all |
+
+`keep_oks` is the only one of the four that a loop would even fit, and it is worth noting
+that it is *probably* safe — `Builtin.roc` declares it on `List` alone, so unlike
+`keep_if` there is no lazy twin to be confused with. It was left for whoever settles the
+`Iter` representation, because the same commit should do both.
 
 Lowering these also removes the last place where "calls do not recurse in Rust" stops
 holding — `call_closure` nests a Rust frame, so `map` inside `map` inside `map` is still
@@ -772,11 +809,13 @@ Worth one afternoon, after everything above:
    everywhere), a 400-char copy per annotation line. The plan's own first item was
    refused on arithmetic. What is left is the lexer, which is its own piece of work —
    see the phase.
-6. ~~**Phase 5**~~ — `any`, `all`, `count_if` and `find_first` compiled into in-frame
-   loops (`all` −47%, `find_first` −54%), and `count_if` implemented at all for the first
-   time. `keep_if`/`drop_if` refused: it would have traded one roc divergence for
-   another. The rest of the callback builtins, and the Rust-stack bound they carry,
-   remain.
+6. ~~**Phase 5**~~ — eight methods compiled into in-frame loops: `fold`, `map`, `any`,
+   `all`, `count_if`, `find_first`, `find_first_index`, `find_last_index`,
+   `fold_with_index`, `fold_try` (−36% to −54% each), and `count_if` implemented at all
+   for the first time. `keep_if`/`drop_if` refused — it would have traded one roc
+   divergence for another. Every value-returning callback method on `List` is now
+   compiled; the four that remain answer containers and are blocked on the `Iter`
+   question.
 7. **Phase 4.2**, `Dec` arithmetic — smaller than it looked before 4.1 measured it.
 8. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.
 9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the

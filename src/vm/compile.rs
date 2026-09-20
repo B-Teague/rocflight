@@ -658,6 +658,63 @@ enum Shape {
     Count,
     /// `xs.find_first(p)`: `Ok(item)` for the first agreement, else `Err(NotFound)`.
     Find,
+    /// `xs.find_first_index(p)` (true) or `xs.find_last_index(p)` (false): the POSITION
+    /// rather than the item, as `Ok(i)`, else `Err(NotFound)`.
+    FindIndex(bool),
+    /// `xs.fold_with_index(init, f)`: a fold whose callback also gets the position.
+    FoldIndex,
+    /// `xs.fold_try(init, f)`: a fold that stops at the first `Err` and hands it back,
+    /// and wraps the accumulator in `Ok` if it reaches the end.
+    FoldTry,
+}
+
+impl Shape {
+    /// Does the method take an accumulator before its callback?
+    fn takes_init(self) -> bool {
+        matches!(self, Shape::Fold | Shape::FoldIndex | Shape::FoldTry)
+    }
+
+    /// How many parameters the callback has.
+    fn arity(self) -> usize {
+        match self {
+            Shape::Fold | Shape::FoldTry => 2,
+            Shape::FoldIndex => 3,
+            _ => 1,
+        }
+    }
+
+    /// Does the LOOP need to track the current element's position?
+    ///
+    /// Not the same question as whether the callback is handed it: `find_first_index`
+    /// reports a position but its predicate takes only the element, which is what
+    /// `arity` says. Conflating the two passed the index as a second argument and made
+    /// `xs.find_first_index(big)` fail with "Lambda expects 1 argument(s), got 2".
+    fn needs_index(self) -> bool {
+        matches!(self, Shape::FoldIndex | Shape::FindIndex(_))
+    }
+
+    /// Is the position one of the callback's arguments?
+    fn passes_index(self) -> bool {
+        matches!(self, Shape::FoldIndex)
+    }
+
+    /// Does it build a tag after the loop, needing a register for the payload?
+    fn needs_slot(self) -> bool {
+        matches!(self, Shape::Find | Shape::FoldTry)
+    }
+}
+
+/// The registers a shape needs beyond the loop's own `dst`, `iter`, `idx` and `item`.
+#[derive(Default, Clone, Copy)]
+struct Spares {
+    /// The constant `1`, for the shapes that count.
+    one: Reg,
+    /// The position the NEXT element will have.
+    pos: Reg,
+    /// The position of the element in hand.
+    cur: Reg,
+    /// Somewhere to put a tag's payload before building it.
+    slot: Reg,
 }
 
 impl Compiler {
@@ -1316,6 +1373,10 @@ impl Compiler {
             ("all", 1) => Shape::Decide(false),
             ("count_if", 1) => Shape::Count,
             ("find_first", 1) => Shape::Find,
+            ("find_first_index", 1) => Shape::FindIndex(true),
+            ("find_last_index", 1) => Shape::FindIndex(false),
+            ("fold_with_index", 2) => Shape::FoldIndex,
+            ("fold_try", 2) => Shape::FoldTry,
             _ => return Ok(None),
         };
         // Every shape above answers a plain VALUE — a list of results, an accumulator, a
@@ -1332,7 +1393,7 @@ impl Compiler {
         // then `xs.keep_if(p)` has a bare name as its receiver. See `dispatch_builtin`,
         // which answers the lazy one for both and says what is still divergent.
         let _ = module;
-        let fold = matches!(shape, Shape::Fold);
+
         // The accumulator, the list being built, or the answer. Allocated first, so it
         // sits below everything the loop uses and survives the temporaries being freed.
         let dst = self.alloc()?;
@@ -1343,17 +1404,18 @@ impl Compiler {
             Shape::Map => self.emit(Op::MakeList { dst, base: dst, n: 0 }),
             Shape::Decide(want) => self.constant(dst, Value::Bool(!want))?,
             Shape::Count => self.constant(dst, Value::Int(0))?,
-            Shape::Find => self.constant(
+            Shape::Find | Shape::FindIndex(_) => self.constant(
                 dst,
                 Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
             )?,
-            Shape::Fold => {}
+            // A fold's answer starts as its `init`, loaded below.
+            Shape::Fold | Shape::FoldIndex | Shape::FoldTry => {}
         }
         let iter = self.expr(receiver)?;
         self.reserve(iter)?;
         let mark = self.st().next_reg;
         let mut rest = args;
-        if fold {
+        if shape.takes_init() {
             let init = self.expr(&rest[0])?;
             if init != dst {
                 self.emit(Op::Move { dst, src: init });
@@ -1369,7 +1431,7 @@ impl Compiler {
         // assignment could reach a `var` the lambda would not have been allowed to.
         let inline = match &rest[0] {
             Expr::Lambda { params, body, .. }
-                if params.len() == if fold { 2 } else { 1 } && !escapes(body) =>
+                if params.len() == shape.arity() && !escapes(body) =>
             {
                 Some((params.clone(), body.clone()))
             }
@@ -1389,52 +1451,84 @@ impl Compiler {
         let idx = self.alloc()?;
         self.constant(idx, Value::Int(0))?;
         let item = self.alloc()?;
-        // A shape that adds to its answer needs the `1` in a register, and one that
-        // builds a tag needs a slot to put the payload in. Allocated before the loop so
-        // the constant is loaded once.
-        let spare = match shape {
-            Shape::Count => {
-                let one = self.alloc()?;
-                self.constant(one, Value::Int(1))?;
-                one
-            }
-            Shape::Find => self.alloc()?,
-            _ => 0,
-        };
+        // Allocated before the loop, so a constant is loaded once rather than per
+        // element. A shape that counts needs the `1`; one that reports a POSITION needs a
+        // running counter and a copy of the current one; one that builds a tag needs
+        // somewhere to put the payload.
+        let mut spares = Spares::default();
+        if matches!(shape, Shape::Count) || shape.needs_index() {
+            spares.one = self.alloc()?;
+            self.constant(spares.one, Value::Int(1))?;
+        }
+        if shape.needs_index() {
+            spares.pos = self.alloc()?;
+            self.constant(spares.pos, Value::Int(0))?;
+            spares.cur = self.alloc()?;
+        }
+        if shape.needs_slot() {
+            spares.slot = self.alloc()?;
+        }
 
         let top = self.here();
         self.emit(Op::IterNext { dst: item, iter, idx, to: u32::MAX });
-        // Where an `any`/`all` goes when an element settles the answer: patched to the
-        // loop's exit once that is known, the same place `IterNext` jumps to.
-        let mut decided: Option<u32> = None;
+        // The position of the element just taken, and the counter moved on for the next
+        // one. `IterNext`'s own `idx` cannot serve: it is the position only for a list or
+        // a range, and a lazy iterator carries its state instead and never touches it.
+        if shape.needs_index() {
+            self.emit(Op::Move { dst: spares.cur, src: spares.pos });
+            self.emit(Op::BinInt {
+                dst: spares.pos,
+                a: spares.pos,
+                b: spares.one,
+                op: crate::ast::BinOp::Add,
+                width: 0,
+            });
+        }
+        // Where a shape that can stop early goes once an element settles the answer:
+        // patched to the loop's exit when that is known.
+        let decided: Option<u32>;
         // The callback's arguments go in consecutive registers, where `Call` expects
         // them; its frame then starts there.
         let base = self.st().next_reg;
+        // What the callback is handed, in the order roc declares it: the accumulator if
+        // there is one, then the element, then its position if the method reports one.
+        let mut args_for = Vec::with_capacity(3);
+        if shape.takes_init() {
+            args_for.push(dst);
+        }
+        args_for.push(item);
+        if shape.passes_index() {
+            args_for.push(spares.cur);
+        }
         if let Some((params, body)) = inline {
             let locals_before = self.st().locals.len();
-            let bound: &[(&'static str, Reg)] =
-                if fold { &[(params[0], dst), (params[1], item)] } else { &[(params[0], item)] };
-            for &(name, reg) in bound {
-                self.st().locals.push(Local { name, reg, is_var: false, captured: false, boxed: false });
+            for (name, reg) in params.iter().zip(&args_for) {
+                self.st().locals.push(Local { name, reg: *reg, is_var: false, captured: false, boxed: false });
             }
             let out = self.expr(&body)?;
             self.st().locals.truncate(locals_before);
-            decided = self.finish_element(shape, dst, item, out, base, top, spare)?;
-        } else if fold {
-            self.reserve(base + 1)?;
-            self.emit(Op::Move { dst: base, src: dst });
-            self.emit(Op::Move { dst: base + 1, src: item });
-            self.emit(Op::Call { dst, func, base, argc: 2 });
+            decided = self.finish_element(shape, dst, item, out, base, top, spares)?;
         } else {
-            self.reserve(base)?;
-            self.emit(Op::Move { dst: base, src: item });
-            // The result lands where the argument was: the callee's frame is dead by
-            // then, and it is pushed straight onto the list.
-            self.emit(Op::Call { dst: base, func, base, argc: 1 });
-            decided = self.finish_element(shape, dst, item, base, base, top, spare)?;
+            let argc = args_for.len() as u16;
+            self.reserve(base + argc - 1)?;
+            for (i, src) in args_for.iter().enumerate() {
+                self.emit(Op::Move { dst: base + i as Reg, src: *src });
+            }
+            // The result lands where the first argument was: the callee's frame is dead
+            // by then.
+            self.emit(Op::Call { dst: base, func, base, argc });
+            decided = self.finish_element(shape, dst, item, base, base, top, spares)?;
         }
         self.emit(Op::Jump { to: top });
         self.patch_to_here(top);
+        // Reaching the end without an `Err` means the accumulator is the answer, wrapped:
+        // `fold_try` gives `Try(state, err)`. An element that stopped early already holds
+        // its `Err` and jumps PAST this.
+        if matches!(shape, Shape::FoldTry) {
+            let ok = self.name_idx("Ok")?;
+            self.emit(Op::Move { dst: spares.slot, src: dst });
+            self.emit(Op::MakeTag { dst, name: ok, base: spares.slot, n: 1 });
+        }
         if let Some(at) = decided {
             self.patch_to_here(at);
         }
@@ -1454,10 +1548,10 @@ impl Compiler {
         out: Reg,
         base: Reg,
         top: u32,
-        spare: Reg,
+        spares: Spares,
     ) -> Result<Option<u32>, String> {
         match shape {
-            Shape::Fold => {
+            Shape::Fold | Shape::FoldIndex => {
                 if out != dst {
                     self.emit(Op::Move { dst, src: out });
                 }
@@ -1490,7 +1584,7 @@ impl Compiler {
             // count has no declared integer width to overflow.
             Shape::Count => {
                 self.emit(Op::TestBool { cond: out, want: true, to: top });
-                self.emit(Op::BinInt { dst, a: dst, b: spare, op: crate::ast::BinOp::Add, width: 0 });
+                self.emit(Op::BinInt { dst, a: dst, b: spares.one, op: crate::ast::BinOp::Add, width: 0 });
                 Ok(None)
             }
             // `Ok(item)` and out. `MakeTag` wants its payload in consecutive registers,
@@ -1499,10 +1593,48 @@ impl Compiler {
             Shape::Find => {
                 self.emit(Op::TestBool { cond: out, want: true, to: top });
                 let name = self.name_idx("Ok")?;
-                self.emit(Op::Move { dst: spare, src: item });
-                self.emit(Op::MakeTag { dst, name, base: spare, n: 1 });
+                self.emit(Op::Move { dst: spares.slot, src: item });
+                self.emit(Op::MakeTag { dst, name, base: spares.slot, n: 1 });
                 let at = self.here();
                 self.emit(Op::Jump { to: u32::MAX });
+                Ok(Some(at))
+            }
+            // The POSITION, which `cur` already holds. `find_last_index` keeps looking
+            // and lets a later element overwrite the answer; `find_first_index` leaves.
+            Shape::FindIndex(first) => {
+                self.emit(Op::TestBool { cond: out, want: true, to: top });
+                let name = self.name_idx("Ok")?;
+                self.emit(Op::MakeTag { dst, name, base: spares.cur, n: 1 });
+                if !first {
+                    return Ok(None);
+                }
+                let at = self.here();
+                self.emit(Op::Jump { to: u32::MAX });
+                Ok(Some(at))
+            }
+            // An `Err` is the answer and stops the fold; an `Ok` unwraps into the
+            // accumulator. Anything else becomes the accumulator as it stands, which is
+            // what the builtin's `other => acc = other` does — and `GetPayload` already
+            // answers a non-tag with itself, so `TestTag "Ok"` covers both. Testing for
+            // `Ok` rather than trusting the `Err` test to be exhaustive is what keeps a
+            // payload-less tag from indexing an empty payload.
+            Shape::FoldTry => {
+                let err = self.name_idx("Err")?;
+                let not_err = self.here();
+                self.emit(Op::TestTag { obj: out, name: err, n: 1, to: u32::MAX });
+                self.emit(Op::Move { dst, src: out });
+                let at = self.here();
+                self.emit(Op::Jump { to: u32::MAX });
+                self.patch_to_here(not_err);
+                let ok = self.name_idx("Ok")?;
+                let not_ok = self.here();
+                self.emit(Op::TestTag { obj: out, name: ok, n: 1, to: u32::MAX });
+                self.emit(Op::GetPayload { dst, obj: out, i: 0 });
+                let done = self.here();
+                self.emit(Op::Jump { to: u32::MAX });
+                self.patch_to_here(not_ok);
+                self.emit(Op::Move { dst, src: out });
+                self.patch_to_here(done);
                 Ok(Some(at))
             }
         }
