@@ -370,7 +370,7 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     // The top level: assign each global in order, then evaluate the trailing
     // expression. Order matters — a global that reads one declared below it gets
     // "Used before it was defined", which is what the tree-walker does too.
-    c.states.push(FnState::new("top level", Rc::new(Vec::new()), None, false));
+    c.states.push(FnState::new("top level", Rc::from([]), None, false));
     for (name, text) in &unit.ingested {
         let reg = c.alloc()?;
         c.constant(reg, crate::eval::str_value(text.clone()))?;
@@ -502,7 +502,7 @@ struct FnState {
     /// inside the body yields the running closure, which is how a block-local function
     /// calls itself without capturing a binding that does not exist yet.
     self_name: Option<&'static str>,
-    params: Rc<Vec<&'static str>>,
+    params: Rc<[&'static str]>,
     name: &'static str,
     /// The top level is not a function, so `return` there is an error rather than a
     /// silent disagreement with the tree-walker about what it means.
@@ -512,7 +512,7 @@ struct FnState {
 impl FnState {
     fn new(
         name: &'static str,
-        params: Rc<Vec<&'static str>>,
+        params: Rc<[&'static str]>,
         self_name: Option<&'static str>,
         in_function: bool,
     ) -> Self {
@@ -972,7 +972,7 @@ impl Compiler {
         &mut self,
         chunk: ChunkId,
         name: &'static str,
-        params: &Rc<Vec<&'static str>>,
+        params: &Rc<[&'static str]>,
         body: &Expr,
         self_name: Option<&'static str>,
     ) -> Result<Vec<CapSource>, String> {
@@ -1008,7 +1008,7 @@ impl Compiler {
     fn closure(
         &mut self,
         name: &'static str,
-        params: &Rc<Vec<&'static str>>,
+        params: &Rc<[&'static str]>,
         body: &Expr,
         self_name: Option<&'static str>,
     ) -> Result<Reg, String> {
@@ -1455,7 +1455,7 @@ impl Compiler {
             Shape::Count => self.constant(dst, Value::Int(0))?,
             Shape::Find | Shape::FindIndex(_) => self.constant(
                 dst,
-                Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
+                Value::tag("Err", [Value::bare("NotFound")]),
             )?,
             // A fold's answer starts as its `init`, loaded below.
             Shape::Fold | Shape::FoldIndex | Shape::FoldTry => {}
@@ -3279,7 +3279,7 @@ fn operator_method_name(op: crate::ast::BinOp) -> Option<&'static str> {
 fn type_descriptor(ty: &crate::types::Type) -> Value {
     use crate::types::Type;
     match ty {
-        Type::List(inner) => Value::tag("List", vec![type_descriptor(inner)]),
+        Type::List(inner) => Value::tag("List", [type_descriptor(inner)]),
         // A record's FIELDS carry the shape down: without them a field holding a
         // nominal with its own `parser_for` was read as whatever the document said.
         Type::Record { fields, .. } => Value::tag(

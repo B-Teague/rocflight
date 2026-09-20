@@ -143,14 +143,14 @@ pub fn numeral_text(numeral: &Value) -> Option<String> {
 ///
 /// The three callables are the nominal's `from_quote`, `from_numeral` and
 /// `from_interpolation`, or `{}` where it has none.
-pub fn coerce(args: Vec<Value>) -> Result<Value, EvalError> {
+pub fn coerce(args: &mut [Value]) -> Result<Value, EvalError> {
     let mut args = args.into_iter();
     let (Some(value), Some(quote), Some(numeral), Some(interp)) =
         (args.next(), args.next(), args.next(), args.next())
     else {
         return Err(EvalError { message: "Lit.coerce takes a value and three converters".to_string() });
     };
-    coerce_value(value, &quote, &numeral, &interp)
+    coerce_value(std::mem::replace(value, Value::Unit), &quote, &numeral, &interp)
 }
 
 fn callable(f: &Value) -> bool {
@@ -188,7 +188,7 @@ fn coerce_value(value: Value, quote: &Value, numeral: &Value, interp: &Value) ->
         }
         Value::Tag("Ok", payload) if payload.len() == 1 => {
             let inner = coerce_value(payload[0].clone(), quote, numeral, interp)?;
-            Ok(Value::tag("Ok", vec![inner]))
+            Ok(Value::tag("Ok", [inner]))
         }
         other => Ok(other),
     }

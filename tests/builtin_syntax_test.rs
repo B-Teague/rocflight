@@ -221,8 +221,9 @@ fn the_low_level_section_is_cut_to_what_the_other_members_reach() {
 #[test]
 fn low_level_ops_run() {
     use rocflight::eval::{call_builtin_values, Value};
-    let call = |name: &str, args: Vec<Value>| {
-        call_builtin_values("LowLevel", name, args).unwrap_or_else(|e| panic!("{}: {}", name, e))
+    let call = |name: &str, mut args: Vec<Value>| {
+        call_builtin_values("LowLevel", name, &mut args)
+            .unwrap_or_else(|e| panic!("{}: {}", name, e))
     };
     let list = |ns: &[i128]| Value::list(ns.iter().map(|n| Value::Int(*n)).collect());
 
@@ -247,14 +248,14 @@ fn low_level_ops_run() {
 
     // "unsafe" means the caller proved the index; rocflight cannot elide Rust's bounds
     // check, so a bad index is a message and never a panic.
-    let err = match call_builtin_values("LowLevel", "list_get_unsafe", vec![list(&[1]), Value::Int(5)]) {
+    let err = match call_builtin_values("LowLevel", "list_get_unsafe", &mut [list(&[1]), Value::Int(5)]) {
         Err(e) => e.message,
         Ok(_) => panic!("reading past the end should fail"),
     };
     assert!(err.contains("past the end"), "got {}", err);
 
     // An op Builtin.roc declares but Rust has not written yet names itself.
-    let err = match call_builtin_values("LowLevel", "u8_from_str", vec![]) {
+    let err = match call_builtin_values("LowLevel", "u8_from_str", &mut []) {
         Err(e) => e.message,
         Ok(_) => panic!("an unimplemented op should fail"),
     };
@@ -473,7 +474,8 @@ fn a_nominal_backed_by_a_nominal_unifies_with_it() {
 fn the_numeric_width_operations_respect_their_width() {
     use rocflight::eval::{call_builtin_values, Value};
     let call = |module: &str, name: &str, args: Vec<i128>| {
-        call_builtin_values(module, name, args.into_iter().map(Value::Int).collect())
+        let mut args: Vec<Value> = args.into_iter().map(Value::Int).collect();
+        call_builtin_values(module, name, &mut args)
             .unwrap_or_else(|e| panic!("{}.{}: {}", module, name, e))
             .to_string()
     };
@@ -506,8 +508,9 @@ fn equal_values_hash_alike() {
     use rocflight::eval::{call_builtin_values, Value};
     let hash = |value: Value| {
         let empty = Value::record(vec![("state", Value::Int(0))]);
-        let written = call_builtin_values("Str", "to_hash", vec![value, empty]).expect("hashed");
-        call_builtin_values("LowLevel", "hasher_finish", vec![written])
+        let written =
+            call_builtin_values("Str", "to_hash", &mut [value, empty]).expect("hashed");
+        call_builtin_values("LowLevel", "hasher_finish", &mut [written])
             .expect("finished")
             .to_string()
     };

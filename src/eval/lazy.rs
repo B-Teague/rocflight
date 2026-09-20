@@ -22,8 +22,8 @@ pub enum Hint {
 impl Hint {
     pub fn value(self) -> Value {
         match self {
-            Hint::Known(n) => Value::tag("Known", vec![Value::Int(n as i128)]),
-            Hint::Unknown => Value::tag("Unknown", vec![]),
+            Hint::Known(n) => Value::tag("Known", [Value::Int(n as i128)]),
+            Hint::Unknown => Value::bare("Unknown"),
         }
     }
 }
@@ -375,7 +375,7 @@ fn rest_value(rest: Rc<Lazy>) -> Value {
 /// The iterator methods, dispatched here when the receiver is a `Value::Iter`. The lazy
 /// transformers wrap; the terminal ones drive the steps. Returns `None` for a method
 /// this does not handle, so the caller can fall back.
-pub fn call(name: &str, args: &mut Vec<Value>) -> Option<Result<Value, EvalError>> {
+pub fn call(name: &str, args: &mut [Value]) -> Option<Result<Value, EvalError>> {
     let this = args.first().cloned()?;
     let iter = of(this)?;
     Some(match name {
@@ -463,10 +463,10 @@ pub fn step_range(iter: &Rc<Lazy>, wanted: &Value) -> Result<Value, EvalError> {
 /// ahead — so a single step is the whole of it.
 fn next(iter: &Rc<Lazy>) -> Result<Value, EvalError> {
     Ok(match Rc::clone(iter).step()? {
-        Step::Done => Value::tag("Done", vec![]),
-        Step::Skip(rest) => Value::tag("Skip", vec![Value::record(vec![("rest", rest_value(rest))])]),
+        Step::Done => Value::bare("Done"),
+        Step::Skip(rest) => Value::tag("Skip", [Value::record(vec![("rest", rest_value(rest))])]),
         Step::One(item, rest) => {
-            Value::tag("One", vec![Value::record(vec![("item", item), ("rest", rest_value(rest))])])
+            Value::tag("One", [Value::record(vec![("item", item), ("rest", rest_value(rest))])])
         }
     })
 }

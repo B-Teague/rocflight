@@ -600,16 +600,16 @@ mod tests {
 
     #[test]
     fn tags_write_their_discriminant_after_the_payload() {
-        let bytes = round_trip(Value::tag("NotFound", vec![]), &io_err());
+        let bytes = round_trip(Value::bare("NotFound"), &io_err());
         assert_eq!(bytes[24], 5);
-        let bytes = round_trip(Value::tag("Other", vec![str_value("disk on fire")]), &io_err());
+        let bytes = round_trip(Value::tag("Other", [str_value("disk on fire")]), &io_err());
         assert_eq!(bytes[24], 6);
-        let bytes = round_trip(Value::tag("Utf8", vec![str_value("/tmp")]), &os_str());
+        let bytes = round_trip(Value::tag("Utf8", [str_value("/tmp")]), &os_str());
         assert_eq!(bytes[24], 1);
-        round_trip(Value::tag("UnixBytes", vec![Value::list(vec![Value::Int(47)])]), &os_str());
+        round_trip(Value::tag("UnixBytes", [Value::list(vec![Value::Int(47)])]), &os_str());
         // Two arguments are a tuple payload, given back in order.
         round_trip(
-            Value::tag("Pair", vec![Value::Int(9), str_value("nine")]),
+            Value::tag("Pair", [Value::Int(9), str_value("nine")]),
             &union_ty(&[("Pair", &[Type::U8, Type::Str]), ("None", &[])]),
         );
     }
@@ -619,28 +619,28 @@ mod tests {
         // `Try(List(U8), [EndOfFile, StdinErr(IOErr)])`, the stdin_bytes! result.
         let err = union_ty(&[("EndOfFile", &[]), ("StdinErr", &[io_err()])]);
         let ty = union_ty(&[("Ok", &[list(Type::U8)]), ("Err", &[err])]);
-        let bytes = round_trip(Value::tag("Ok", vec![Value::list(vec![Value::Int(10)])]), &ty);
+        let bytes = round_trip(Value::tag("Ok", [Value::list(vec![Value::Int(10)])]), &ty);
         assert_eq!(bytes[40], 1, "Ok is 1");
-        let bytes = round_trip(Value::tag("Err", vec![Value::tag("EndOfFile", vec![])]), &ty);
+        let bytes = round_trip(Value::tag("Err", [Value::bare("EndOfFile")]), &ty);
         assert_eq!((bytes[40], bytes[32]), (0, 0), "Err is 0, EndOfFile is 0");
         round_trip(
-            Value::tag("Err", vec![Value::tag("StdinErr", vec![Value::tag("Other", vec![str_value("a long enough message to be heap allocated")])])]),
+            Value::tag("Err", [Value::tag("StdinErr", [Value::tag("Other", [str_value("a long enough message to be heap allocated")])])]),
             &ty,
         );
         // `Try({}, [Exit(I32), ..])`: the single-tag error union is bare.
         let exit = Type::TagUnion { tags: vec![("Exit".into(), vec![Type::I32])], open: true };
         let ty = union_ty(&[("Ok", &[Type::Unit]), ("Err", &[exit])]);
-        let bytes = round_trip(Value::tag("Err", vec![Value::tag("Exit", vec![Value::Int(3)])]), &ty);
+        let bytes = round_trip(Value::tag("Err", [Value::tag("Exit", [Value::Int(3)])]), &ty);
         assert_eq!((&bytes[..4], bytes[4]), (&3i32.to_le_bytes()[..], 0));
-        round_trip(Value::tag("Ok", vec![Value::Unit]), &ty);
+        round_trip(Value::tag("Ok", [Value::Unit]), &ty);
     }
 
     #[test]
     fn a_list_of_os_strs_is_what_main_receives() {
         let args = Value::list(vec![
-            Value::tag("Utf8", vec![str_value("program")]),
-            Value::tag("Utf8", vec![str_value("--an-argument-long-enough-for-the-heap")]),
-            Value::tag("UnixBytes", vec![Value::list(vec![Value::Int(255), Value::Int(0)])]),
+            Value::tag("Utf8", [str_value("program")]),
+            Value::tag("Utf8", [str_value("--an-argument-long-enough-for-the-heap")]),
+            Value::tag("UnixBytes", [Value::list(vec![Value::Int(255), Value::Int(0)])]),
         ]);
         round_trip(args, &list(os_str()));
     }
@@ -665,8 +665,8 @@ mod tests {
         let mut heap = FakeHeap::default();
         let mut bytes = vec![0u8; 32];
         assert!(write_value(&Value::Int(1), &lay(&Type::Str), &mut heap, &mut bytes[..24]).is_err());
-        assert!(write_value(&Value::tag("Nope", vec![]), &lay(&io_err()), &mut heap, &mut bytes[..32]).is_err());
-        assert!(write_value(&Value::tag("Other", vec![]), &lay(&io_err()), &mut heap, &mut bytes[..32]).is_err());
+        assert!(write_value(&Value::bare("Nope"), &lay(&io_err()), &mut heap, &mut bytes[..32]).is_err());
+        assert!(write_value(&Value::bare("Other"), &lay(&io_err()), &mut heap, &mut bytes[..32]).is_err());
         let record = lay(&Type::closed_record(vec![("x".into(), Type::I64)]));
         assert!(write_value(&Value::record(vec![]), &record, &mut heap, &mut bytes[..8]).is_err());
         assert_eq!(heap.live(), 0);

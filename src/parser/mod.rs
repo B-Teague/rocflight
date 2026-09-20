@@ -1228,7 +1228,7 @@ impl Parser {
                     fields[index].1.clone(),
                     built,
                     Expr::Lambda { id: self.node(),
-                        params: std::rc::Rc::new(vec![head, tail]),
+                        params: std::rc::Rc::from([head, tail]),
                         body: std::rc::Rc::new(body),
                     },
                 ],
@@ -5097,7 +5097,7 @@ impl Parser {
             };
         }
 
-        Ok(Expr::Lambda { id: self.node(), params: std::rc::Rc::new(params), body: std::rc::Rc::new(body) })
+        Ok(Expr::Lambda { id: self.node(), params: params.into(), body: std::rc::Rc::new(body) })
     }
 
     /// Skip whitespace

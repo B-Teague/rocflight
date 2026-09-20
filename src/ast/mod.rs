@@ -281,7 +281,7 @@ pub enum Expr {
     /// iteration. It also forced a lifetime transmute, since the clone was not
     /// `'static`. Sharing is sound because the AST is immutable after parsing.
     Lambda {
-        params: std::rc::Rc<Vec<&'static str>>,
+        params: std::rc::Rc<[&'static str]>,
         body: std::rc::Rc<Expr>,
         id: NodeId,
     },

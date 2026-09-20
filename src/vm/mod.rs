@@ -398,7 +398,7 @@ pub struct Chunk {
     pub arity: u16,
     /// Parameter names. Shared with the AST node, and used only to render a function
     /// value as `<lambda |x, y|>` — the same text the tree-walker produces.
-    pub params: Rc<Vec<&'static str>>,
+    pub params: Rc<[&'static str]>,
     /// Field and tag names, by index. Names are compared by content at run time —
     /// resolving a field to a SLOT needs the record's type at the access site, which
     /// means threading the checker's types through the compiler. A later phase.
@@ -433,7 +433,7 @@ pub struct Chunk {
 pub struct Closure {
     pub chunk: ChunkId,
     /// Copied from the chunk, so rendering a function value needs no program.
-    pub params: Rc<Vec<&'static str>>,
+    pub params: Rc<[&'static str]>,
     pub captures: Vec<Value>,
 }
 
@@ -1102,15 +1102,40 @@ impl Vm {
                     }
                 }
                 Op::MakeTag { dst, name, base: b, n } => {
-                    let items = collect(regs, base + b as usize, n);
                     let tag = program.chunks[chunk_id as usize].names[name as usize];
-                    regs[base + dst as usize] = Value::tag(tag, items);
+                    // Straight into the `Rc` from an exact-size iterator, which
+                    // allocates ONCE; going through a `Vec` allocated twice. A tag
+                    // with no payload shares one and allocates nothing.
+                    let value = if n == 0 {
+                        Value::bare(tag)
+                    } else {
+                        Value::Tag(
+                            tag,
+                            (0..n as usize)
+                                .map(|i| {
+                                    std::mem::replace(
+                                        &mut regs[base + b as usize + i],
+                                        Value::Unit,
+                                    )
+                                })
+                                .collect(),
+                        )
+                    };
+                    regs[base + dst as usize] = value;
                 }
                 Op::MakeRecord { dst, name, base: b, n } => {
                     let names = &program.chunks[chunk_id as usize].names;
                     let mut fields = Vec::with_capacity(n as usize);
                     for i in 0..n as usize {
-                        fields.push((names[name as usize + i], regs[base + b as usize + i].clone()));
+                        // TAKE the field out of its register, as `MakeTuple` and
+                        // `MakeTag` beside it do. The compiler resets `next_reg` to
+                        // `base` before allocating the destination, so these registers
+                        // are dead the moment this op runs; cloning them was copying a
+                        // nested record or bumping a refcount for nothing.
+                        fields.push((
+                            names[name as usize + i],
+                            std::mem::replace(&mut regs[base + b as usize + i], Value::Unit),
+                        ));
                     }
                     regs[base + dst as usize] = Value::record(fields);
                 }
@@ -1176,12 +1201,12 @@ impl Vm {
                         Value::Record(fields) => match fields.iter().find(|(f, _)| *f == field) {
                             Some((_, Value::Missing)) | None => {
                                 // Absent, which is the point of an optional field.
-                                Value::tag("Err", vec![Value::tag("MissingField", vec![])])
+                                Value::tag("Err", [Value::bare("MissingField")])
                             }
-                            Some((_, v)) => Value::tag("Ok", vec![v.clone()]),
+                            Some((_, v)) => Value::tag("Ok", [v.clone()]),
                         },
                         // `{}` is the empty record: every optional field is absent.
-                        Value::Unit => Value::tag("Err", vec![Value::tag("MissingField", vec![])]),
+                        Value::Unit => Value::tag("Err", [Value::bare("MissingField")]),
                         other => {
                             return Err(locate_error(&program, chunk_id, ip, EvalError {
                                 message: format!(
@@ -1299,7 +1324,7 @@ impl Vm {
                         Value::Tag(_, payload) => payload[i as usize].clone(),
                         // See `TestTag`: an optional field's `Ok` payload is the value,
                         // and a missing one's `Err` payload is `MissingField`.
-                        Value::Missing => Value::tag("MissingField", vec![]),
+                        Value::Missing => Value::bare("MissingField"),
                         other => other.clone(),
                     };
                     regs[base + dst as usize] = value;
@@ -1459,9 +1484,18 @@ impl Vm {
                 Op::CallBuiltin { dst, name, base: b, argc } => {
                     let names = &program.chunks[chunk_id as usize].names;
                     let (module, func) = (names[name as usize], names[name as usize + 1]);
-                    let args = collect(regs, base + b as usize, argc);
-                    let value = crate::eval::call_builtin_values(module, func, args)
-                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                    // The register window IS the argument list. Collecting it into a
+                    // `Vec` first was a `malloc` per builtin call and bought nothing:
+                    // the arguments are already contiguous, they are already dead after
+                    // the call, and `collect` took them out with the same
+                    // `mem::replace` the builtins do themselves.
+                    let from = base + b as usize;
+                    let value = crate::eval::call_builtin_values(
+                        module,
+                        func,
+                        &mut regs[from..from + argc as usize],
+                    )
+                    .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
                 Op::CallHost { dst, name, base: b, argc } => {
@@ -1588,10 +1622,14 @@ impl Vm {
                             ip = 0;
                         }
                         None => {
-                            let mut args = collect(regs, base + b as usize, argc);
-                            let receiver = args.remove(0);
-                            let value = crate::eval::dispatch_builtin(receiver, method, args)
-                                .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                            // Receiver at slot 0, arguments after it: the register
+                            // window is already the argument list every builtin wants.
+                            let from = base + b as usize;
+                            let value = crate::eval::dispatch_builtin(
+                                method,
+                                &mut regs[from..from + argc as usize],
+                            )
+                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                             regs[base + dst as usize] = value;
                         }
                     }

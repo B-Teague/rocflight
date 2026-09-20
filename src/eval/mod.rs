@@ -63,7 +63,7 @@ fn custom_inspect(value: &Value) -> Option<Value> {
 /// dispatch opcode has nothing else to give it.
 pub fn try_method(
     tag: &str,
-    payload: &[Value],
+    payload: &std::rc::Rc<[Value]>,
     method: &str,
     evaluated: Vec<Value>,
 ) -> Result<Option<Value>, EvalError> {
@@ -76,12 +76,12 @@ pub fn try_method(
         "is_err" => Value::Bool(!is_ok),
         // Rebuild the same tag around the mapped payload; the other side passes
         // through untouched.
-        "map_ok" if is_ok => Value::tag("Ok", vec![call_function(first(), vec![inner])?]),
-        "map_err" if !is_ok => Value::tag("Err", vec![call_function(first(), vec![inner])?]),
-        "map_ok" | "map_err" => Value::tag(
-            if is_ok { "Ok" } else { "Err" },
-            payload.to_vec(),
-        ),
+        "map_ok" if is_ok => Value::tag("Ok", [call_function(first(), vec![inner])?]),
+        "map_err" if !is_ok => Value::tag("Err", [call_function(first(), vec![inner])?]),
+        // The payload is unchanged, so the same `Rc` serves: no copy, no allocation.
+        "map_ok" | "map_err" => {
+            Value::Tag(if is_ok { "Ok" } else { "Err" }, payload.clone())
+        }
         "ok_or" => {
             if is_ok {
                 inner
@@ -90,7 +90,7 @@ pub fn try_method(
             }
         }
         "on_err" if !is_ok => call_function(first(), vec![inner])?,
-        "on_err" => Value::tag("Ok", payload.to_vec()),
+        "on_err" => Value::Tag("Ok", payload.clone()),
         _ => return Ok(None),
     }))
 }
@@ -172,7 +172,7 @@ fn elements(value: Value, name: &str) -> Result<Elements, EvalError> {
     }
 }
 
-fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
     let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
         if wanted == got {
             Ok(())
@@ -183,9 +183,9 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
     };
 
-    // Takes the argument OUT of `args`: when nothing else holds the list, the `Vec`
-    // comes back without a copy and the operation below mutates it in place.
-    let mut args = args;
+    // Takes the argument OUT of `args` — which is the VM's own register window, so
+    // there is no `Vec` here at all: when nothing else holds the list, the elements
+    // come back without a copy and the operation below mutates them in place.
     let as_list = |v: &mut Value| -> Result<Vec<Value>, EvalError> {
         match std::mem::replace(v, Value::Unit) {
             Value::List(items) => Ok(value::into_items(items)),
@@ -260,7 +260,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         // `.iter()` and `.collect()` are the identity on what is already a list.
         "iter" | "collect" => {
             expect(1, args.len())?;
-            Ok(args.remove(0))
+            Ok(std::mem::replace(&mut args[0], Value::Unit))
         }
         "iter_rev" => {
             expect(1, args.len())?;
@@ -273,7 +273,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let count = Elements::count_of(&args[0]).ok_or_else(|| EvalError {
                 message: format!("List.{} needs a List, got {}", name, args[0]),
             })?;
-            Ok(Value::tag("Known", vec![Value::Int(count as i128)]))
+            Ok(Value::tag("Known", [Value::Int(count as i128)]))
         }
         // `step_by(0)` yields nothing. On a range the step is ABSOLUTE — roc's
         // `(1..=10).step_by(2).step_by(3)` is `[1, 4, 7, 10]` — so it stays a range.
@@ -298,7 +298,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
         }
         "single" => {
             expect(1, args.len())?;
-            Ok(Value::list(vec![args.remove(0)]))
+            Ok(Value::list(vec![std::mem::replace(&mut args[0], Value::Unit)]))
         }
         "prepended" => {
             expect(2, args.len())?;
@@ -310,10 +310,10 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             expect(1, args.len())?;
             let mut items = as_list(&mut args[0])?;
             Ok(if items.is_empty() {
-                Value::tag("Done", vec![])
+                Value::bare("Done")
             } else {
                 let item = items.remove(0);
-                Value::tag("One", vec![Value::record(vec![("item", item), ("rest", Value::list(items))])])
+                Value::tag("One", [Value::record(vec![("item", item), ("rest", Value::list(items))])])
             })
         }
         // `Iter.custom(state, hint, step)`: run the step until it says `NoMore`. Eager,
@@ -375,10 +375,10 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let func = args[1].clone();
             for item in items {
                 if matches!(call_function(func.clone(), vec![item.clone()])?, Value::Bool(true)) {
-                    return Ok(Value::tag("Ok", vec![item]));
+                    return Ok(Value::tag("Ok", [item]));
                 }
             }
-            Ok(Value::tag("Err", vec![Value::tag("NotFound", vec![])]))
+            Ok(Value::tag("Err", [Value::bare("NotFound")]))
         }
         // The INDEX of the first match rather than the item, which is what a caller
         // that goes on to slice the list needs.
@@ -396,8 +396,8 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                 }
             }
             Ok(match found {
-                Some(i) => Value::tag("Ok", vec![Value::Int(i as i128)]),
-                None => Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
+                Some(i) => Value::tag("Ok", [Value::Int(i as i128)]),
+                None => Value::tag("Err", [Value::bare("NotFound")]),
             })
         }
         "sum" | "product" => {
@@ -407,20 +407,20 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                 return Ok(if name == "sum" {
                     Value::Int(0)
                 } else {
-                    Value::tag("Err", vec![Value::tag("IterWasEmpty", vec![])])
+                    Value::tag("Err", [Value::bare("IterWasEmpty")])
                 });
             };
             let op = if name == "sum" { BinOp::Add } else { BinOp::Mul };
             for item in items {
                 acc = apply_binop(op, &acc, &item)?;
             }
-            Ok(if name == "sum" { acc } else { Value::tag("Ok", vec![acc]) })
+            Ok(if name == "sum" { acc } else { Value::tag("Ok", [acc]) })
         }
         "min" | "max" => {
             expect(1, args.len())?;
             let mut items = elements(args[0].clone(), name)?;
             let Some(mut best) = items.next() else {
-                return Ok(Value::tag("Err", vec![Value::tag("IterWasEmpty", vec![])]));
+                return Ok(Value::tag("Err", [Value::bare("IterWasEmpty")]));
             };
             for item in items {
                 let ordering = order_values(&item, &best);
@@ -430,7 +430,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                     best = item;
                 }
             }
-            Ok(Value::tag("Ok", vec![best]))
+            Ok(Value::tag("Ok", [best]))
         }
         "sort" | "sort_reversed" | "sort_by" | "sort_by_reversed" | "sort_with" | "sort_with_reversed" => {
             let has_fn = name != "sort" && name != "sort_reversed";
@@ -555,7 +555,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let mut items = as_list(&mut args[0])?;
             let index = as_index(&args[1]).unwrap_or(usize::MAX);
             let in_bounds = if name == "insert" { index <= items.len() } else { index < items.len() };
-            let out_of_bounds = || Ok(Value::tag("Err", vec![Value::tag("OutOfBounds", vec![])]));
+            let out_of_bounds = || Ok(Value::tag("Err", [Value::bare("OutOfBounds")]));
             if !in_bounds {
                 return out_of_bounds();
             }
@@ -578,7 +578,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                     ));
                 }
             }
-            Ok(Value::tag("Ok", vec![Value::list(items)]))
+            Ok(Value::tag("Ok", [Value::list(items)]))
         }
         // A range knows its length from its bounds, so neither of these walks anything.
         "len" => {
@@ -649,8 +649,8 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let items = peek(&args[0], name)?;
             let picked = if name == "first" { items.first() } else { items.last() };
             Ok(match picked {
-                Some(v) => Value::tag("Ok", vec![v.clone()]),
-                None => Value::tag("Err", vec![Value::tag("ListWasEmpty", vec![])]),
+                Some(v) => Value::tag("Ok", [v.clone()]),
+                None => Value::tag("Err", [Value::bare("ListWasEmpty")]),
             })
         }
         "get" => {
@@ -658,8 +658,8 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
             let items = peek(&args[0], name)?;
             let index = as_index(&args[1]).unwrap_or(usize::MAX);
             Ok(match items.get(index) {
-                Some(v) => Value::tag("Ok", vec![v.clone()]),
-                None => Value::tag("Err", vec![Value::tag("OutOfBounds", vec![])]),
+                Some(v) => Value::tag("Ok", [v.clone()]),
+                None => Value::tag("Err", [Value::bare("OutOfBounds")]),
             })
         }
         "keep_if" | "drop_if" => {
@@ -704,7 +704,7 @@ fn call_list_builtin(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
                     other => acc = other,
                 }
             }
-            Ok(Value::tag("Ok", vec![acc]))
+            Ok(Value::tag("Ok", [acc]))
         }
         // Collecting an iterator into a list. A range reaches here still a range —
         // `.iter()` no longer materializes one — so this is where it becomes a list.
@@ -739,8 +739,8 @@ pub fn size_hint_of(value: &Value) -> Result<Value, EvalError> {
         }
     }
     match Elements::count_of(value) {
-        Some(count) => Ok(Value::tag("Known", vec![Value::Int(count as i128)])),
-        None => Ok(Value::tag("Unknown", vec![])),
+        Some(count) => Ok(Value::tag("Known", [Value::Int(count as i128)])),
+        None => Ok(Value::bare("Unknown")),
     }
 }
 
@@ -804,7 +804,7 @@ fn call_str_more(name: &str, args: &[Value]) -> Option<Result<Value, EvalError>>
         Some(Value::Str(t)) => Some(&**t),
         _ => None,
     };
-    let not_found = || Ok(Value::tag("Err", vec![Value::tag("NotFound", vec![])]));
+    let not_found = || Ok(Value::tag("Err", [Value::bare("NotFound")]));
     Some(match name {
         "with_capacity" => Ok(str_value(String::new())),
         "reserve" | "release_excess_capacity" => Ok(Value::Str(text?.into())),
@@ -828,7 +828,7 @@ fn call_str_more(name: &str, args: &[Value]) -> Option<Result<Value, EvalError>>
                 (&haystack[..haystack.len() - needle.len()], &haystack[haystack.len() - needle.len()..])
             };
             if checked.eq_ignore_ascii_case(needle) {
-                Ok(Value::tag("Ok", vec![str_value(kept.to_string())]))
+                Ok(Value::tag("Ok", [str_value(kept.to_string())]))
             } else {
                 not_found()
             }
@@ -843,12 +843,12 @@ fn call_str_more(name: &str, args: &[Value]) -> Option<Result<Value, EvalError>>
             let n = as_index(args.get(1)?)?;
             let text = text?;
             if n >= text.len() {
-                return Some(Ok(Value::tag("Ok", vec![str_value(String::new())])));
+                return Some(Ok(Value::tag("Ok", [str_value(String::new())])));
             }
             let kept = if name == "drop_first_bytes" { text.get(n..) } else { text.get(..text.len() - n) };
             Ok(match kept {
-                Some(rest) => Value::tag("Ok", vec![str_value(rest.to_string())]),
-                None => Value::tag("Err", vec![Value::tag("BadUtf8", vec![])]),
+                Some(rest) => Value::tag("Ok", [str_value(rest.to_string())]),
+                None => Value::tag("Err", [Value::bare("BadUtf8")]),
             })
         }
         "split_last" => {
@@ -1010,8 +1010,8 @@ fn call_u128(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
             let Value::Str(text) = args.first()? else { return None };
             let parsed = text.trim().parse::<u128>().ok();
             return Some(Ok(match parsed {
-                Some(n) => Value::tag("Ok", vec![Value::U128(n)]),
-                None => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
+                Some(n) => Value::tag("Ok", [Value::U128(n)]),
+                None => Value::tag("Err", [Value::bare("BadNumStr")]),
             }));
         }
         _ => {}
@@ -1073,8 +1073,8 @@ fn call_u128(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
                 _ => a.checked_mul(b),
             };
             Ok(match r {
-                Some(n) => Value::tag("Ok", vec![Value::U128(n)]),
-                None => Value::tag("Err", vec![Value::tag("Overflow", vec![])]),
+                Some(n) => Value::tag("Ok", [Value::U128(n)]),
+                None => Value::tag("Err", [Value::bare("Overflow")]),
             })
         }
         ("plus_saturated", Some(b)) => out(a.checked_add(b).unwrap_or(u128::MAX)),
@@ -1085,17 +1085,17 @@ fn call_u128(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
             None => crash("overflowed"),
         },
         ("pow_try", Some(b)) => Ok(match u32::try_from(b).ok().and_then(|e| a.checked_pow(e)) {
-            Some(n) => Value::tag("Ok", vec![Value::U128(n)]),
-            None => Value::tag("Err", vec![Value::tag("Overflow", vec![])]),
+            Some(n) => Value::tag("Ok", [Value::U128(n)]),
+            None => Value::tag("Err", [Value::bare("Overflow")]),
         }),
         ("div_try", Some(0)) | ("div_ceil_try", Some(0)) | ("div_floor_try", Some(0)) => {
-            Ok(Value::tag("Err", vec![Value::tag("DivByZero", vec![])]))
+            Ok(Value::tag("Err", [Value::bare("DivByZero")]))
         }
-        ("div_try", Some(b)) => Ok(Value::tag("Ok", vec![Value::U128(a / b)])),
+        ("div_try", Some(b)) => Ok(Value::tag("Ok", [Value::U128(a / b)])),
         // Unsigned, so ceil/floor of a division differ from trunc only when there is a
         // remainder; both round toward +inf here because operands are non-negative.
-        ("div_ceil_try", Some(b)) => Ok(Value::tag("Ok", vec![Value::U128(a / b + u128::from(a % b != 0))])),
-        ("div_floor_try", Some(b)) => Ok(Value::tag("Ok", vec![Value::U128(a / b)])),
+        ("div_ceil_try", Some(b)) => Ok(Value::tag("Ok", [Value::U128(a / b + u128::from(a % b != 0))])),
+        ("div_floor_try", Some(b)) => Ok(Value::tag("Ok", [Value::U128(a / b)])),
         ("div_ceil_by", Some(b)) if b != 0 => out(a / b + u128::from(a % b != 0)),
         ("div_floor_by", Some(b)) if b != 0 => out(a / b),
         ("mod_by", Some(b)) if b != 0 => out(a % b),
@@ -1472,7 +1472,7 @@ pub fn call_crypto(module: &str, method: &str, args: &[Value]) -> Option<Result<
             _ => None,
         }
     };
-    let make_digest = |bytes: Vec<u8>| Value::tag("CryptoDigest", vec![Value::list(bytes.into_iter().map(|b| Value::Int(i128::from(b))).collect())]);
+    let make_digest = |bytes: Vec<u8>| Value::tag("CryptoDigest", [Value::list(bytes.into_iter().map(|b| Value::Int(i128::from(b))).collect())]);
     let hash = |algo: &str, data: &[u8]| -> [u8; 32] {
         if algo == "Sha256" { crypto::sha256(data) } else { crypto::blake3(data) }
     };
@@ -1495,13 +1495,13 @@ pub fn call_crypto(module: &str, method: &str, args: &[Value]) -> Option<Result<
             Ok(make_digest(hash(algo, &data).to_vec()))
         }
         (_, "empty") if module.ends_with("Hasher") => {
-            Ok(Value::tag("CryptoHasher", vec![str_value(algo), Value::list(Vec::new())]))
+            Ok(Value::tag("CryptoHasher", [str_value(algo), Value::list(Vec::new())]))
         }
         (_, "write") if module.ends_with("Hasher") => {
             let Value::Tag("CryptoHasher", payload) = &args[0] else { return None };
             let mut acc = byte_vec(payload.get(1)?)?;
             acc.extend(byte_vec(args.get(1)?)?);
-            Ok(Value::tag("CryptoHasher", vec![payload[0].clone(), Value::list(acc.into_iter().map(|b| Value::Int(i128::from(b))).collect())]))
+            Ok(Value::tag("CryptoHasher", [payload[0].clone(), Value::list(acc.into_iter().map(|b| Value::Int(i128::from(b))).collect())]))
         }
         (_, "finish") if module.ends_with("Hasher") => {
             let Value::Tag("CryptoHasher", payload) = &args[0] else { return None };
@@ -1517,9 +1517,9 @@ pub fn call_crypto(module: &str, method: &str, args: &[Value]) -> Option<Result<
         (_, "from_bytes") => {
             let bytes = byte_vec(args.first()?)?;
             Ok(if bytes.len() == 32 {
-                Value::tag("Ok", vec![make_digest(bytes)])
+                Value::tag("Ok", [make_digest(bytes)])
             } else {
-                Value::tag("Err", vec![Value::tag("WrongLength", vec![Value::record(vec![
+                Value::tag("Err", [Value::tag("WrongLength", [Value::record(vec![
                     ("expected", Value::Int(32)),
                     ("actual", Value::Int(bytes.len() as i128)),
                 ])])])
@@ -1530,20 +1530,20 @@ pub fn call_crypto(module: &str, method: &str, args: &[Value]) -> Option<Result<
             // 64 hex digits for a 32-byte digest; a wrong count is `WrongLength`, an
             // out-of-range digit is `InvalidHex` with its index and byte value.
             if text.len() != 64 {
-                return Some(Ok(Value::tag("Err", vec![Value::tag("WrongLength", vec![Value::record(vec![
+                return Some(Ok(Value::tag("Err", [Value::tag("WrongLength", [Value::record(vec![
                     ("expected", Value::Int(64)),
                     ("actual", Value::Int(text.len() as i128)),
                 ])])])));
             }
             for (i, b) in text.bytes().enumerate() {
                 if !(b as char).is_ascii_hexdigit() {
-                    return Some(Ok(Value::tag("Err", vec![Value::tag("InvalidHex", vec![Value::record(vec![
+                    return Some(Ok(Value::tag("Err", [Value::tag("InvalidHex", [Value::record(vec![
                         ("index", Value::Int(i as i128)),
                         ("byte", Value::Int(i128::from(b))),
                     ])])])));
                 }
             }
-            Ok(Value::tag("Ok", vec![make_digest(crypto::from_hex(text)?)]))
+            Ok(Value::tag("Ok", [make_digest(crypto::from_hex(text)?)]))
         }
         _ => return None,
     })
@@ -1776,8 +1776,8 @@ fn call_checked(
     Some(Ok(if method.ends_with("_try") {
         // `Try` on overflow, which is what lets `SafeMath` report one.
         match exact {
-            Some(value) => Value::tag("Ok", vec![Value::Dec(value)]),
-            None => Value::tag("Err", vec![Value::tag("Overflow", Vec::new())]),
+            Some(value) => Value::tag("Ok", [Value::Dec(value)]),
+            None => Value::tag("Err", [Value::tag("Overflow", Vec::new())]),
         }
     } else {
         // Saturating: pinned at the bound, which is how `times_saturated` signals an
@@ -1829,15 +1829,15 @@ fn call_dec(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
         "is_positive" => Some(Ok(Value::Bool(a > 0))),
         "to_f64" => Some(Ok(Value::Float(as_f64()))),
         "to_f32" | "to_f32_wrap" => Some(Ok(Value::F32(as_f32()))),
-        "to_f32_try" => Some(Ok(Value::tag("Ok", vec![Value::F32(as_f32())]))),
+        "to_f32_try" => Some(Ok(Value::tag("Ok", [Value::F32(as_f32())]))),
         "round" => Some(Ok(Value::Dec(rounded * DEC_SCALE))),
         "floor" => Some(Ok(Value::Dec(floored * DEC_SCALE))),
         "ceiling" => Some(Ok(Value::Dec(ceiled * DEC_SCALE))),
         "round_to_i128" => Some(Ok(Value::Int(rounded))),
         "sqrt" if a < 0 => Some(crash("of a negative")),
         "sqrt" => Some(via_f64(f64::sqrt)),
-        "sqrt_try" if a < 0 => Some(Ok(Value::tag("Err", vec![Value::tag("SqrtOfNegative", vec![])]))),
-        "sqrt_try" => Some(via_f64(f64::sqrt).map(|v| Value::tag("Ok", vec![v]))),
+        "sqrt_try" if a < 0 => Some(Ok(Value::tag("Err", [Value::bare("SqrtOfNegative")]))),
+        "sqrt_try" => Some(via_f64(f64::sqrt).map(|v| Value::tag("Ok", [v]))),
         "sin" => Some(via_f64(f64::sin)),
         "cos" => Some(via_f64(f64::cos)),
         "tan" => Some(via_f64(f64::tan)),
@@ -1865,8 +1865,8 @@ fn call_dec(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
         let wrapped = wrap_to(whole, bits, signed);
         return Some(match mode {
             Conversion::Wrap => Ok(Value::Int(wrapped)),
-            Conversion::Try if wrapped == whole => Ok(Value::tag("Ok", vec![Value::Int(whole)])),
-            Conversion::Try => Ok(Value::tag("Err", vec![Value::tag("OutOfRange", vec![])])),
+            Conversion::Try if wrapped == whole => Ok(Value::tag("Ok", [Value::Int(whole)])),
+            Conversion::Try => Ok(Value::tag("Err", [Value::bare("OutOfRange")])),
             Conversion::Plain if wrapped == whole => Ok(Value::Int(whole)),
             Conversion::Plain => crash("does not fit"),
         });
@@ -1955,8 +1955,8 @@ fn call_float(module: &str, method: &str, args: &[Value]) -> Option<Result<Value
                 text.parse::<f64>().ok().filter(|x| x.is_finite())
             };
             return Some(Ok(match parsed {
-                Some(x) => Value::tag("Ok", vec![mk(x)]),
-                None => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
+                Some(x) => Value::tag("Ok", [mk(x)]),
+                None => Value::tag("Err", [Value::bare("BadNumStr")]),
             }));
         }
         "from_bits" => {
@@ -1984,9 +1984,9 @@ fn call_float(module: &str, method: &str, args: &[Value]) -> Option<Result<Value
         "negate" => Some(ok(-a)),
         "sqrt" => Some(ok(a.sqrt())),
         "sqrt_try" => Some(Ok(if a < 0.0 {
-            Value::tag("Err", vec![Value::tag("SqrtOfNegative", vec![])])
+            Value::tag("Err", [Value::bare("SqrtOfNegative")])
         } else {
-            Value::tag("Ok", vec![mk(a.sqrt())])
+            Value::tag("Ok", [mk(a.sqrt())])
         })),
         // Bit-exact with roc: its F64 transcendentals are musl's (the `libm` crate
         // ports the same code) and its F32 ones are its own binary32 algorithms.
@@ -2011,9 +2011,9 @@ fn call_float(module: &str, method: &str, args: &[Value]) -> Option<Result<Value
         "to_f32" | "to_f32_wrap" => Some(Ok(Value::F32(a as f32))),
         // Past `F32.highest` is out of range even where rounding would land on it.
         "to_f32_try" => Some(Ok(if !a.is_finite() || a.abs() > f64::from(f32::MAX) {
-            Value::tag("Err", vec![Value::tag("OutOfRange", vec![])])
+            Value::tag("Err", [Value::bare("OutOfRange")])
         } else {
-            Value::tag("Ok", vec![Value::F32(a as f32)])
+            Value::tag("Ok", [Value::F32(a as f32)])
         })),
         "to_dec" => Some(Ok(Value::Dec(dec_from_f64(a)))),
         _ => None,
@@ -2054,8 +2054,8 @@ fn call_float(module: &str, method: &str, args: &[Value]) -> Option<Result<Value
             Conversion::Try | Conversion::Plain => {
                 let fits = as_int.filter(|n| wrap_to(*n, bits, signed) == *n);
                 match (fits, mode) {
-                    (Some(n), Conversion::Try) => Ok(Value::tag("Ok", vec![Value::Int(n)])),
-                    (None, Conversion::Try) => Ok(Value::tag("Err", vec![Value::tag("OutOfRange", vec![])])),
+                    (Some(n), Conversion::Try) => Ok(Value::tag("Ok", [Value::Int(n)])),
+                    (None, Conversion::Try) => Ok(Value::tag("Err", [Value::bare("OutOfRange")])),
                     (Some(n), _) => Ok(Value::Int(n)),
                     (None, _) => crash("does not fit"),
                 }
@@ -2165,8 +2165,8 @@ fn call_numeric(
                 (attos % DEC_SCALE == 0).then_some(attos / DEC_SCALE)
             });
             return Some(Ok(match parsed {
-                Some(n) if fits(n) => Value::tag("Ok", vec![Value::Int(n)]),
-                _ => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
+                Some(n) if fits(n) => Value::tag("Ok", [Value::Int(n)]),
+                _ => Value::tag("Err", [Value::bare("BadNumStr")]),
             }));
         }
         _ => {}
@@ -2178,8 +2178,8 @@ fn call_numeric(
         let converted = wrap_to(a, to_bits, to_signed);
         return Some(match mode {
             Conversion::Wrap => Ok(Value::Int(converted)),
-            Conversion::Try if converted == a => Ok(Value::tag("Ok", vec![Value::Int(a)])),
-            Conversion::Try => Ok(Value::tag("Err", vec![Value::tag("OutOfRange", vec![])])),
+            Conversion::Try if converted == a => Ok(Value::tag("Ok", [Value::Int(a)])),
+            Conversion::Try => Ok(Value::tag("Err", [Value::bare("OutOfRange")])),
             Conversion::Plain if converted == a => Ok(Value::Int(a)),
             Conversion::Plain => Err(EvalError {
                 message: format!("{}.{} cannot hold {}", module, method, a),
@@ -2192,8 +2192,8 @@ fn call_numeric(
     let b = args.get(1).and_then(whole);
     let try_of = |exact: Option<i128>| {
         Ok(match exact {
-            Some(v) if fits(v) => Value::tag("Ok", vec![Value::Int(v)]),
-            _ => Value::tag("Err", vec![Value::tag("Overflow", vec![])]),
+            Some(v) if fits(v) => Value::tag("Ok", [Value::Int(v)]),
+            _ => Value::tag("Err", [Value::bare("Overflow")]),
         })
     };
     let saturated = |exact: Option<i128>, positive: bool| {
@@ -2254,11 +2254,11 @@ fn call_numeric(
         ("pow", Some(b)) => checked(u32::try_from(b).ok().and_then(|e| a.checked_pow(e))),
         // A negative exponent on a whole number underflows to a fraction — except a
         // base of 1 (always 1) or -1 (±1 by the exponent's parity), which are exact.
-        ("pow_try", Some(b)) if b < 0 && a == 1 => Ok(Value::tag("Ok", vec![Value::Int(1)])),
+        ("pow_try", Some(b)) if b < 0 && a == 1 => Ok(Value::tag("Ok", [Value::Int(1)])),
         ("pow_try", Some(b)) if b < 0 && a == -1 => {
-            Ok(Value::tag("Ok", vec![Value::Int(if b % 2 == 0 { 1 } else { -1 })]))
+            Ok(Value::tag("Ok", [Value::Int(if b % 2 == 0 { 1 } else { -1 })]))
         }
-        ("pow_try", Some(b)) if b < 0 => Ok(Value::tag("Err", vec![Value::tag("Underflow", vec![])])),
+        ("pow_try", Some(b)) if b < 0 => Ok(Value::tag("Err", [Value::bare("Underflow")])),
         ("pow_try", Some(b)) => try_of(u32::try_from(b).ok().and_then(|e| a.checked_pow(e))),
         ("plus", Some(b)) => checked(a.checked_add(b)),
         ("minus", Some(b)) => checked(a.checked_sub(b)),
@@ -2280,7 +2280,7 @@ fn call_numeric(
             crash("divided by zero")
         }
         ("div_try", Some(0)) | ("div_ceil_try", Some(0)) | ("div_floor_try", Some(0)) => {
-            Ok(Value::tag("Err", vec![Value::tag("DivByZero", vec![])]))
+            Ok(Value::tag("Err", [Value::bare("DivByZero")]))
         }
         ("div_try", Some(b)) => try_of(a.checked_div(b)),
         ("div_ceil_try", Some(b)) => try_of(
@@ -2337,11 +2337,10 @@ pub fn low_level_arity(name: &str) -> Option<usize> {
 }
 
 /// Run one low-level op. `low_level_arity` decides what reaches here.
-fn call_low_level(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
+fn call_low_level(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
     let wrong = |what: &str| EvalError { message: format!("{} needs {}", name, what) };
     // Moved out of `args`, so a list nothing else holds is mutated in place — which is
     // what `Dict`'s bucket writes count on being cheap.
-    let mut args = args;
     let list = |v: &mut Value| match std::mem::replace(v, Value::Unit) {
         Value::List(items) => Ok(value::into_items(items)),
         other => Err(EvalError { message: format!("{} needs a List, got {}", name, other) }),
@@ -2417,10 +2416,18 @@ fn call_low_level(name: &str, args: Vec<Value>) -> Result<Value, EvalError> {
     }
 }
 
+/// `args` is the caller's REGISTER WINDOW, not a `Vec`.
+///
+/// It used to be a `Vec` collected out of the registers, which cost a `malloc` per
+/// builtin call — 12,006 of `list_pass`'s 34,217 allocations and 8,003 of `strings`'s.
+/// Nothing here ever needed to own the vector: the dispatch layer reads `&args`, and
+/// the handful of builtins that take a value out already do it with `mem::replace`,
+/// which is exactly what collecting the window did anyway. So the window is passed
+/// straight through, and those registers are dead after the call either way.
 pub fn call_builtin_values(
     module: &str,
     name: &str,
-    args: Vec<Value>,
+    args: &mut [Value],
 ) -> Result<Value, EvalError> {
     // The low-level ops are spelled as bare names in Builtin.roc, so the compiler sends
     // them here under a module of its own rather than one of Roc's.
@@ -2445,11 +2452,11 @@ pub fn call_builtin_values(
         let text = args.first().and_then(numeral::numeral_text).ok_or_else(|| EvalError {
             message: format!("{}.from_numeral needs a Numeral", module),
         })?;
-        return Ok(match call_builtin_values(module, "from_str", vec![str_value(text.clone())])? {
-            Value::Tag("Ok", payload) => Value::tag("Ok", payload.to_vec()),
+        return Ok(match call_builtin_values(module, "from_str", &mut [str_value(text.clone())])? {
+            Value::Tag("Ok", payload) => Value::Tag("Ok", payload),
             _ => Value::tag(
                 "Err",
-                vec![Value::tag("InvalidNumeral", vec![str_value(format!("{} is not a {}", text, module))])],
+                [Value::tag("InvalidNumeral", [str_value(format!("{} is not a {}", text, module))])],
             ),
         });
     }
@@ -2549,8 +2556,8 @@ pub fn call_builtin_values(
             _ => text.parse::<f64>().ok().map(Value::Float),
         };
         return Ok(match parsed {
-            Some(value) => Value::tag("Ok", vec![value]),
-            None => Value::tag("Err", vec![Value::tag("BadNumStr", vec![])]),
+            Some(value) => Value::tag("Ok", [value]),
+            None => Value::tag("Err", [Value::bare("BadNumStr")]),
         });
     }
 
@@ -2617,7 +2624,7 @@ pub fn call_builtin_values(
                     } else {
                         Value::Float(value)
                     };
-                    return Ok(if wraps { Value::tag("Ok", vec![value]) } else { value });
+                    return Ok(if wraps { Value::tag("Ok", [value]) } else { value });
                 }
             }
         }
@@ -2653,7 +2660,6 @@ pub fn call_builtin_values(
 
     // An `Iter` is the list (or range) it walks, and `Range.size_hint` is its length.
     if matches!(module, "List" | "Iter" | "Range") {
-        let mut args = args;
         // A lazy iterator — or a method that must stay lazy (an unbounded source, a
         // filter that emits `Skip`, an unknown length) — is driven by `lazy`, not
         // materialized. A plain `List.map`/`fold` stays eager below.
@@ -2682,7 +2688,7 @@ pub fn call_builtin_values(
             || (matches!(name, "concat" | "size_hint") && on_lazy_source)
             || (name == "from_iter" && on_iter);
         if lazy_method {
-            if let Some(result) = lazy::call(name, &mut args) {
+            if let Some(result) = lazy::call(name, args) {
                 return result;
             }
         }
@@ -2695,9 +2701,12 @@ pub fn call_builtin_values(
     }
     // A boxed value is the value: nothing here needs the indirection.
     if module == "Box" && matches!(name, "box" | "unbox") {
-        return args.into_iter().next().ok_or_else(|| EvalError {
-            message: format!("Box.{} expects 1 argument, got 0", name),
-        });
+        return match args.first_mut() {
+            Some(v) => Ok(std::mem::replace(v, Value::Unit)),
+            None => Err(EvalError {
+                message: format!("Box.{} expects 1 argument, got 0", name),
+            }),
+        };
     }
 
     match (module, name) {
@@ -2762,7 +2771,7 @@ pub fn call_builtin_values(
                         ),
                     ])],
                 ),
-                None => Value::tag("Err", vec![Value::tag("NotFound", vec![])]),
+                None => Value::tag("Err", [Value::bare("NotFound")]),
             })
         }
         // `Str.join_with(list, separator)`, the subject first as always.
@@ -2861,8 +2870,8 @@ pub fn call_builtin_values(
                 })
                 .collect();
             Ok(match String::from_utf8(raw) {
-                Ok(text) => Value::tag("Ok", vec![str_value(text)]),
-                Err(_) => Value::tag("Err", vec![Value::tag("BadUtf8", vec![])]),
+                Ok(text) => Value::tag("Ok", [str_value(text)]),
+                Err(_) => Value::tag("Err", [Value::bare("BadUtf8")]),
             })
         }
         ("Str", "to_utf8") => {
@@ -2880,7 +2889,7 @@ pub fn call_builtin_values(
         }
         ("Str", "concat") => {
             let mut result = String::new();
-            for val in &args {
+            for val in args.iter() {
                 match val {
                     Value::Str(text) => result.push_str(text),
                     other => result.push_str(&other.to_string()),
@@ -3433,11 +3442,16 @@ pub fn interpolated(value: &Value) -> String {
 /// A nominal's own method block is not consulted here: the compiler resolves that to a
 /// chunk and calls it directly. Everything after that point is this function — the
 /// `iter` shorthand, the `Try` methods, then the module's builtin table.
-pub fn dispatch_builtin(
-    receiver: Value,
-    method: &str,
-    args: Vec<Value>,
-) -> Result<Value, EvalError> {
+/// `values` is the caller's REGISTER WINDOW: the receiver at slot 0 and the arguments
+/// after it, which is already the shape every builtin wants — `xs.map(f)` is
+/// `List.map(xs, f)`. It used to arrive as a `Vec` collected out of the registers, with
+/// the receiver then `remove`d off the front and a SECOND `Vec` built to put it back:
+/// two allocations and an O(n) shift on every method call that reaches a builtin.
+pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, EvalError> {
+    let (receiver, args) = values.split_first().ok_or_else(|| EvalError {
+        message: format!("`{}` was dispatched on nothing", method),
+    })?;
+    let receiver = receiver.clone();
     // `.iter()` on something already iterable is the identity. A range STAYS a range:
     // building the list of its elements cost 190 MB on a two-million-element range, and
     // every builtin that only walks the elements can walk a range instead. It also
@@ -3467,7 +3481,7 @@ pub fn dispatch_builtin(
     // than in `module_for` because the payload has to be rebuilt around the result.
     if let Value::Tag(tag, payload) = &receiver {
         if matches!(*tag, "Ok" | "Err") {
-            if let Some(result) = try_method(tag, payload, method, args.clone())? {
+            if let Some(result) = try_method(tag, payload, method, args.to_vec())? {
                 return Ok(result);
             }
         }
@@ -3482,20 +3496,14 @@ pub fn dispatch_builtin(
             "Sha256".to_string()
         };
         let module = if *tag == "CryptoHasher" { format!("{}Hasher", algo) } else { format!("{}Digest", algo) };
-        let mut values = Vec::with_capacity(args.len() + 1);
-        values.push(receiver.clone());
-        values.extend(args.iter().cloned());
-        if let Some(result) = call_crypto(&module, method, &values) {
+        if let Some(result) = call_crypto(&module, method, values) {
             return result;
         }
     }
     // `to_hash` on a record, tuple or tag — a structural `Dict`/`Set` key — hashes
     // structurally: none of the nominal `to_hash` blocks fit, so the builtin does it.
     if method == "to_hash" {
-        let mut values = Vec::with_capacity(args.len() + 1);
-        values.push(receiver.clone());
-        values.extend(args.iter().cloned());
-        if let Some(result) = call_hasher("Builtin", method, &values) {
+        if let Some(result) = call_hasher("Builtin", method, values) {
             return result;
         }
     }
@@ -3506,10 +3514,7 @@ pub fn dispatch_builtin(
         if fields.iter().any(|(name, _)| *name == "lower")
             && fields.iter().any(|(name, _)| *name == "len_if_known")
         {
-            let mut values = Vec::with_capacity(args.len() + 1);
-            values.push(receiver.clone());
-            values.extend(args.iter().cloned());
-            if let Some(result) = call_range(method, &values) {
+            if let Some(result) = call_range(method, values) {
                 return result;
             }
         }
@@ -3531,11 +3536,8 @@ pub fn dispatch_builtin(
         message: format!("Cannot dispatch `{}` on {}", method, receiver),
     })?;
 
-    // The receiver becomes the FIRST argument, which is why roc's builtins take their
-    // subject first: `xs.map(f)` is `List.map(xs, f)`.
-    let mut values = Vec::with_capacity(args.len() + 1);
-    values.push(receiver);
-    values.extend(args);
+    // The receiver is already the FIRST argument, which is why roc's builtins take
+    // their subject first: `xs.map(f)` is `List.map(xs, f)`.
     call_builtin_values(module, method, values)
 }
 
@@ -3621,7 +3623,7 @@ pub fn literal_pattern_matches(pattern: &Pattern, value: &Value) -> bool {
 ///
 /// The builtins' callback hook: `xs.map(f)` reaches a function through here, whether
 /// `f` is a closure the compiler produced or a builtin passed as a value.
-pub fn call_function(func: Value, args: Vec<Value>) -> Result<Value, EvalError> {
+pub fn call_function(func: Value, mut args: Vec<Value>) -> Result<Value, EvalError> {
     match func {
         Value::Closure(closure) => crate::vm::call_closure(&closure, args),
         // A builtin passed as a value — `xs.map(Str.inspect)`.
@@ -3629,7 +3631,7 @@ pub fn call_function(func: Value, args: Vec<Value>) -> Result<Value, EvalError> 
             let (module, name) = qualified.split_once('.').ok_or_else(|| EvalError {
                 message: format!("`{}` is not a qualified builtin", qualified),
             })?;
-            call_builtin_values(module, name, args)
+            call_builtin_values(module, name, &mut args)
         }
         other => Err(EvalError {
             message: format!("Attempted to call a non-function value: {}", other),
@@ -3729,9 +3731,9 @@ fn json_parse_piece(read: &str, state: Option<&Value>) -> Result<Value, EvalErro
     // because there is no value in a `null`.
     if read == "null" {
         return Ok(if cursor.eat("null") {
-            Value::tag("Ok", vec![str_value(text[cursor.at..].to_string())])
+            Value::tag("Ok", [str_value(text[cursor.at..].to_string())])
         } else {
-            Value::tag("Err", vec![Value::tag("InvalidJson", vec![str_value(text)])])
+            Value::tag("Err", [Value::tag("InvalidJson", [str_value(text)])])
         });
     }
     let value = match read {
@@ -3748,7 +3750,7 @@ fn json_parse_piece(read: &str, state: Option<&Value>) -> Result<Value, EvalErro
         ),
         None => Value::tag(
             "Err",
-            vec![Value::tag("InvalidJson", vec![str_value(text)])],
+            vec![Value::tag("InvalidJson", [str_value(text)])],
         ),
     })
 }
@@ -3782,12 +3784,12 @@ fn call_json(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
             // `record.image.title` lands on a field.
             let target = args.get(1).cloned().unwrap_or(Value::Unit);
             let invalid =
-                || Value::tag("Err", vec![Value::tag("InvalidJson", vec![str_value(text.clone())])]);
+                || Value::tag("Err", [Value::tag("InvalidJson", [str_value(text.clone())])]);
             let mut cursor = JsonCursor { bytes: text.as_bytes(), at: 0 };
             Some(match json_read_as(&mut cursor, &target) {
                 Err(e) => Err(e),
                 Ok(Some(value)) if { cursor.space(); cursor.at >= cursor.bytes.len() } => {
-                    Ok(Value::tag("Ok", vec![value]))
+                    Ok(Value::tag("Ok", [value]))
                 }
                 Ok(_) => Ok(invalid()),
             })
@@ -3818,7 +3820,7 @@ fn call_json(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
                 )),
                 Ok(None) => Ok(Value::tag(
                     "Err",
-                    vec![Value::tag("InvalidJson", vec![str_value(text)])],
+                    vec![Value::tag("InvalidJson", [str_value(text)])],
                 )),
             })
         }
@@ -3830,7 +3832,7 @@ fn call_json(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
                 _ => String::new(),
             };
             Some(json_encode(value).map(|text| {
-                Value::tag("Ok", vec![str_value(format!("{}{}", state, text))])
+                Value::tag("Ok", [str_value(format!("{}{}", state, text))])
             }))
         }
         "to_str" | "encode" => Some(json_encode(args.first()?).map(str_value)),
@@ -3853,8 +3855,8 @@ fn call_json(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
                 _ => None,
             };
             Some(match non_finite {
-                Some(why) => Ok(Value::tag("Err", vec![Value::tag(why, Vec::new())])),
-                None => json_encode(value).map(|text| Value::tag("Ok", vec![str_value(text)])),
+                Some(why) => Ok(Value::tag("Err", [Value::tag(why, Vec::new())])),
+                None => json_encode(value).map(|text| Value::tag("Ok", [str_value(text)])),
             })
         }
         _ => None,

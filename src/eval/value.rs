@@ -110,14 +110,37 @@ pub enum Value {
     /// fresh allocation and a copy of every element, which is what passing one to a
     /// function does.
     ///
-    /// Build one with `Value::tag`, which takes an ordinary `Vec`.
-    Tag(&'static str, std::rc::Rc<Vec<Value>>),
+    /// `Rc<[Value]>` and not `Rc<Vec<Value>>`: a payload is never changed after it is
+    /// built, and the `Vec` cost a second heap allocation and a second indirection for
+    /// nothing. Build one with `Value::tag` from an ARRAY or an exact-size iterator,
+    /// which allocates once — `Rc::from(a_vec)` does not save anything, it allocates
+    /// the box and memcpies into it. A tag with no payload is `Value::bare`, which
+    /// allocates nothing at all.
+    Tag(&'static str, std::rc::Rc<[Value]>),
+}
+
+/// The payload every bare tag shares.
+///
+/// `Rc::new(Vec::new())` allocated: the `Vec` does not, but the `Rc` box does, so
+/// `None`, `Dot` and `MissingField` each cost a `malloc` to build. One of these,
+/// cloned, costs a refcount bump. Thread-local because `Value` is not `Send`.
+fn empty_payload() -> std::rc::Rc<[Value]> {
+    thread_local! {
+        static EMPTY: std::rc::Rc<[Value]> = std::rc::Rc::from([]);
+    }
+    EMPTY.with(std::rc::Rc::clone)
 }
 
 impl Value {
-    /// A tag value. Wraps the payload so call sites stay readable.
-    pub fn tag(name: &'static str, payload: Vec<Value>) -> Value {
-        Value::Tag(name, std::rc::Rc::new(payload))
+    /// A tag value. Takes an array or anything else that becomes an `Rc<[Value]>` in
+    /// one allocation — NOT a `Vec`, which costs two; see the variant's own note.
+    pub fn tag(name: &'static str, payload: impl Into<std::rc::Rc<[Value]>>) -> Value {
+        Value::Tag(name, payload.into())
+    }
+
+    /// A tag with no payload: `None`, `Dot`, `MissingField`. Allocates nothing.
+    pub fn bare(name: &'static str) -> Value {
+        Value::Tag(name, empty_payload())
     }
 
     /// A list value. Wraps the elements so call sites stay readable.
