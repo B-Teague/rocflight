@@ -547,9 +547,11 @@ impl FnState {
             self.code.len(),
             self.spans.len()
         );
-        // The last read of a register may take the value out of it instead of cloning
-        // it; `liveness` is what proves which reads those are. Done here, on finished
-        // code, because it needs the whole chunk's control flow.
+        // Pairs the machine can run as one instruction, then the last read of a
+        // register taking its value instead of cloning it. Both want finished code —
+        // they reason about the whole chunk's control flow — and `fuse` runs first so
+        // that `liveness` sees the opcodes that will actually run.
+        super::peephole::fuse(&mut self.code);
         super::liveness::mark_takes(&mut self.code, self.max_reg);
         Chunk {
             code: self.code,

@@ -131,7 +131,7 @@ fn live_out(live: &[u64], code: &[Op], words: usize, ip: usize) -> Vec<u64> {
 /// Over-approximate: a successor that cannot really be reached only keeps registers
 /// live, which loses a take rather than breaking one. `TailCall` is listed as jumping
 /// to the top of the chunk even though a builtin in tail position returns instead.
-fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize)) {
+pub(super) fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize)) {
     let next = ip + 1;
     let fall = |f: &mut dyn FnMut(usize)| {
         if next < len {
@@ -153,7 +153,8 @@ fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize)) {
         | Op::TestList { to, .. }
         | Op::TestBool { to, .. }
         | Op::GetFieldOr { to, .. }
-        | Op::IterNext { to, .. } => {
+        | Op::IterNext { to, .. }
+        | Op::IterNextBack { to, .. } => {
             f(to as usize);
             fall(&mut f);
         }
@@ -293,7 +294,7 @@ fn reads(op: &Op, out: &mut Vec<Reg>) {
             out.push(end);
         }
 
-        Op::IterNext { iter, idx, .. } => {
+        Op::IterNext { iter, idx, .. } | Op::IterNextBack { iter, idx, .. } => {
             out.push(iter);
             out.push(idx);
         }
@@ -374,7 +375,8 @@ fn kills(op: &Op, out: &mut Vec<Reg>) {
         | Op::TestExpect { .. }
         | Op::Dbg { .. }
         | Op::Crash { .. }
-        | Op::IterNext { .. } => {}
+        | Op::IterNext { .. }
+        | Op::IterNextBack { .. } => {}
     }
 }
 

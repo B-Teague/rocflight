@@ -23,6 +23,7 @@
 
 pub mod compile;
 mod liveness;
+mod peephole;
 
 pub use compile::{compile, compile_unit};
 
@@ -372,6 +373,11 @@ pub enum Op {
     /// `for i in 0..<10_000_000` allocates nothing — the tree-walker's own fix for that
     /// was to special-case ranges in `for`, and this is the same idea as an opcode.
     IterNext { dst: Reg, iter: Reg, idx: Reg, to: u32 },
+    /// The same step, run as a loop's BACK EDGE: `to` is the body rather than the exit,
+    /// so an element jumps back into the loop and exhaustion falls through. It replaces
+    /// a `Jump` that only existed to reach an `IterNext`, which is a third of everything
+    /// a `for` loop over a range executes. `vm::peephole` is what proves the shape.
+    IterNextBack { dst: Reg, iter: Reg, idx: Reg, to: u32 },
 }
 
 /// Which construct a conditional jump came from, so its error can say so.
@@ -1417,81 +1423,14 @@ impl Vm {
                     };
                 }
                 Op::IterNext { dst, iter, idx, to } => {
-                    let at = match &regs[base + idx as usize] {
-                        Value::Int(n) => *n,
-                        other => {
-                            return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                message: format!("vm: loop counter held {}", other),
-                            }))
-                        }
-                    };
-                    // A lazy iterator carries its own state, not an index: step it,
-                    // skipping past `Skip`s, and write the rest back for next time.
-                    //
-                    // The iterator is TAKEN out of its register rather than cloned, so
-                    // that `Lazy::step` is its only owner and can advance it in place —
-                    // otherwise a loop over a non-integer range allocates a rest per
-                    // element. The register is rewritten on both paths below, so it
-                    // never stays `Unit`.
-                    if matches!(&regs[base + iter as usize], Value::Iter(_)) {
-                        let taken = std::mem::replace(&mut regs[base + iter as usize], Value::Unit);
-                        let Value::Iter(mut current) = taken else {
-                            return Err(EvalError { message: "vm: iterator vanished".to_string() });
-                        };
-                        let stepped = loop {
-                            match current.step().map_err(|e| locate_error(&program, chunk_id, ip, e))? {
-                                crate::eval::lazy::Step::Done => break None,
-                                crate::eval::lazy::Step::Skip(rest) => current = rest,
-                                crate::eval::lazy::Step::One(item, rest) => break Some((item, rest)),
-                            }
-                        };
-                        match stepped {
-                            None => {
-                                // `Done` consumed the iterator, and an iterator that is
-                                // done is an empty one.
-                                regs[base + iter as usize] =
-                                    Value::Iter(crate::eval::lazy::exhausted());
-                                ip = to as usize;
-                            }
-                            Some((item, rest)) => {
-                                regs[base + dst as usize] = item;
-                                regs[base + iter as usize] = Value::Iter(rest);
-                            }
-                        }
-                        continue;
-                    }
-                    // A nominal iterable — a record or tag with an `iter` method —
-                    // is turned into its iterator once, in place, then looped.
-                    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
-                        if let Some(iterated) = call_iter_method(&program, &regs[base + iter as usize])
-                            .map_err(|e| locate_error(&program, chunk_id, ip, e))?
-                        {
-                            regs[base + iter as usize] = iterated;
-                        }
-                    }
-                    let next = match &regs[base + iter as usize] {
-                        Value::Range { start, end, inclusive, step } => {
-                            let last = if *inclusive { *end } else { *end - 1 };
-                            let current = start + at * i128::from(*step);
-                            (*step > 0 && current <= last).then_some(Value::Int(current))
-                        }
-                        Value::List(items) => items.get(at as usize).cloned(),
-                        other => {
-                            return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                message: format!(
-                                    "`for` needs a List or a range to iterate, got {}",
-                                    other
-                                ),
-                            }))
-                        }
-                    };
-                    match next {
-                        None => ip = to as usize,
-                        Some(value) => {
-                            regs[base + dst as usize] = value;
-                            regs[base + idx as usize] = Value::Int(at + 1);
-                        }
-                    }
+                    ip = iter_step(&program, regs, base, dst, iter, idx, to as usize, ip)
+                        .map_err(|e| locate_error(&program, chunk_id, ip - 1, e))?;
+                }
+                // The same step as a back edge: an element jumps to the BODY and
+                // exhaustion falls through, which is the other way round.
+                Op::IterNextBack { dst, iter, idx, to } => {
+                    ip = iter_step(&program, regs, base, dst, iter, idx, ip, to as usize)
+                        .map_err(|e| locate_error(&program, chunk_id, ip - 1, e))?;
                 }
 
                 // ---- builtins, dispatch, interpolation ----
@@ -1712,6 +1651,100 @@ impl Vm {
 ///
 /// A move rather than a clone: these registers are the aggregate's own arguments and
 /// are dead the instant it is built.
+/// One step of a `for` loop, shared by `IterNext` and `IterNextBack`.
+///
+/// They differ only in which way round the two answers go: `on_item` is where to
+/// continue when the iterator yielded something and `on_done` where to go when it did
+/// not. `IterNext` falls through with an element and jumps out when exhausted;
+/// `IterNextBack` — the fused back edge — jumps back into the body with an element and
+/// falls through when exhausted. One implementation, so there is one place to be right.
+///
+/// Errors come back UNLOCATED; the call site attaches the instruction.
+///
+/// `inline(always)`, and it is load-bearing: left to LLVM this stayed out of line and
+/// `iter_range` — which is the lazy branch below, two million times — cost 10.8% more.
+/// The same trap the `Lazy::advance` split hit, for the same reason.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn iter_step(
+    program: &Rc<Program>,
+    regs: &mut [Value],
+    base: usize,
+    dst: Reg,
+    iter: Reg,
+    idx: Reg,
+    on_done: usize,
+    on_item: usize,
+) -> Result<usize, EvalError> {
+    let at = match &regs[base + idx as usize] {
+        Value::Int(n) => *n,
+        other => {
+            return Err(EvalError { message: format!("vm: loop counter held {}", other) })
+        }
+    };
+    // A lazy iterator carries its own state, not an index: step it, skipping past
+    // `Skip`s, and write the rest back for next time.
+    //
+    // The iterator is TAKEN out of its register rather than cloned, so that
+    // `Lazy::step` is its only owner and can advance it in place — otherwise a loop
+    // over a non-integer range allocates a rest per element. The register is rewritten
+    // on both paths below, so it never stays `Unit`.
+    if matches!(&regs[base + iter as usize], Value::Iter(_)) {
+        let taken = std::mem::replace(&mut regs[base + iter as usize], Value::Unit);
+        let Value::Iter(mut current) = taken else {
+            return Err(EvalError { message: "vm: iterator vanished".to_string() });
+        };
+        let stepped = loop {
+            match current.step()? {
+                crate::eval::lazy::Step::Done => break None,
+                crate::eval::lazy::Step::Skip(rest) => current = rest,
+                crate::eval::lazy::Step::One(item, rest) => break Some((item, rest)),
+            }
+        };
+        return Ok(match stepped {
+            None => {
+                // `Done` consumed the iterator, and an iterator that is done is an
+                // empty one.
+                regs[base + iter as usize] = Value::Iter(crate::eval::lazy::exhausted());
+                on_done
+            }
+            Some((item, rest)) => {
+                regs[base + dst as usize] = item;
+                regs[base + iter as usize] = Value::Iter(rest);
+                on_item
+            }
+        });
+    }
+    // A nominal iterable — a record or tag with an `iter` method — is turned into its
+    // iterator once, in place, then looped.
+    if matches!(&regs[base + iter as usize], Value::Record(_) | Value::Tag(..)) {
+        if let Some(iterated) = call_iter_method(program, &regs[base + iter as usize])? {
+            regs[base + iter as usize] = iterated;
+        }
+    }
+    let next = match &regs[base + iter as usize] {
+        Value::Range { start, end, inclusive, step } => {
+            let last = if *inclusive { *end } else { *end - 1 };
+            let current = start + at * i128::from(*step);
+            (*step > 0 && current <= last).then_some(Value::Int(current))
+        }
+        Value::List(items) => items.get(at as usize).cloned(),
+        other => {
+            return Err(EvalError {
+                message: format!("`for` needs a List or a range to iterate, got {}", other),
+            })
+        }
+    };
+    Ok(match next {
+        None => on_done,
+        Some(value) => {
+            regs[base + dst as usize] = value;
+            regs[base + idx as usize] = Value::Int(at + 1);
+            on_item
+        }
+    })
+}
+
 fn collect(regs: &mut [Value], from: usize, n: u16) -> Vec<Value> {
     (0..n as usize)
         .map(|i| std::mem::replace(&mut regs[from + i], Value::Unit))
