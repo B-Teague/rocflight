@@ -1614,7 +1614,14 @@ impl Parser {
         // The constraint is the compiler's to verify — all the interpreter takes from
         // it is permission to dispatch those methods on an unresolved variable.
         // The clause may sit on the signature's own line or on the next one.
-        let clause_region: String = self.input[self.pos..].chars().take(400).collect();
+        // A window, not a copy. This used to `collect()` 400 chars into a `String` for
+        // every annotation line in the file, and `Builtin.roc` is mostly annotations.
+        let region = &self.input[self.pos..];
+        let window = region
+            .char_indices()
+            .nth(400)
+            .map_or(region.len(), |(at, _)| at);
+        let clause_region = &region[..window];
         let promised: Vec<String> = match clause_region.find("where [").map(|i| {
             let tail = &clause_region[i..];
             tail.find(']').map(|end| &tail[..end]).unwrap_or(tail)
@@ -2902,17 +2909,11 @@ impl Parser {
 
         self.skip_whitespace();
         if content.contains("${") {
-            let parts =
-                {
-                    let (nominals, defaults) =
-                        (self.nominals.clone(), self.nominal_defaults.clone());
-                    parse_interpolation_parts(
-                        &content,
-                        &nominals,
-                        &defaults,
-                        &mut self.nominal_literals,
-                    )?
-                };
+            // Named rather than cloned, for the reason `parse_string` gives.
+            let parts = {
+                let Parser { nominals, nominal_defaults, nominal_literals, .. } = self;
+                parse_interpolation_parts(&content, nominals, nominal_defaults, nominal_literals)?
+            };
             return Ok(Expr::StrInterp(parts, self.node()));
         }
         Ok(Expr::Str(string_pool::intern(&content), self.node()))
@@ -5119,19 +5120,26 @@ impl Parser {
 
     /// Parse string literal: "..."
     fn parse_string(&mut self) -> Result<Expr, ParseError> {
-        let rest = &self.input[self.pos..];
         // The sub-parser for each `${...}` needs the nominal declarations too, or
         // `Animal.Dog(x)` inside an interpolation parses as a qualified CALL instead of
         // a tag. Any parser state a nested expression depends on has to be passed down.
-        let (nominals, defaults) = (self.nominals.clone(), self.nominal_defaults.clone());
-        match parse_string_literal(rest, &nominals, &defaults, &mut self.nominal_literals) {
+        //
+        // Destructured rather than cloned. `nominals` and `nominal_defaults` were copied
+        // for EVERY string literal in the file, only because `nominal_literals` is
+        // borrowed mutably alongside them and `&self` cannot do both at once — and a
+        // `Type` is a tree, so each copy walked every declaration. 800 string literals
+        // cost 0.97ms with no nominals in scope and 5.82ms with twenty of them:
+        // quadratic in (literals x declarations). Naming the fields splits the borrow.
+        let Parser { input, pos, nominals, nominal_defaults, nominal_literals, .. } = self;
+        let rest = &input[*pos..];
+        match parse_string_literal(rest, nominals, nominal_defaults, nominal_literals) {
             Ok((remaining, expr)) => {
-                self.pos += rest.len() - remaining.len();
+                *pos += rest.len() - remaining.len();
                 Ok(expr)
             }
             Err(e) => Err(ParseError {
                 message: e.message,
-                position: self.pos + e.position,
+                position: *pos + e.position,
             }),
         }
     }
@@ -5890,8 +5898,12 @@ enum Accessor {
 }
 
 /// Leak a field name so it lives as long as the AST.
+/// A field name as a `&'static str`.
+///
+/// Interned rather than leaked outright — which is what this did — so the same field
+/// name written in twenty record literals is one allocation instead of twenty.
 fn leak_field(name: &str) -> &'static str {
-    Box::leak(name.to_string().into_boxed_str())
+    string_pool::intern(name)
 }
 
 /// One step of a file's statement chain, for `Parser::parse_let_or_expr`.

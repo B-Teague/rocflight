@@ -387,36 +387,108 @@ regeneration discipline. Come back here only if the parser work stalls.
 
 ---
 
-## Phase 3 — the parser
+## Phase 3 — the parser — **the cheap items done; the lexer is a decision, not a task**
 
-~1.2–2.5µs per line, or ~100ns per byte. That is the floor under every module a user
-imports, every platform module, `Builtin.roc` if Phase 2 is skipped, and the app itself.
-No sampler on this machine can break it down, so this phase is a sequence of guarded
-experiments, each measured on its own.
+~1.4µs per line of ordinary source. No sampler on this machine can break that down, so
+this phase was a sequence of guarded experiments. Three landed, one was refused on
+arithmetic, and the biggest win was not on the list at all.
 
-In the order they are worth trying:
+Parse time is **linear** in input size — 100/200/400/800/1600 lines of the same shape
+give 0.24/0.46/0.88/1.71/3.43ms — so there was no quadratic in the general path. There
+was one in a specific path, and finding it was the whole of this phase's value.
 
-- **`Parser::input: String` → `&'a str`.** `Parser::new` does `input.to_string()`,
-  copying every source it is handed. One lifetime parameter, a copy removed, nothing
-  semantic. Cheapest thing in the phase; may well be noise, which is worth knowing.
-- **The string pool takes a global `Mutex` and a SipHash per identifier.**
-  `string_pool::intern` locks `GLOBAL_POOL` for every name in every file. The process is
-  single-threaded, so the lock is uncontended but not free, and the default hasher is
-  the slow one. A thread-local pool with a fast hasher is a contained change.
-- **One lexer pass instead of 269 `self.input[self.pos..].starts_with(…)` sites.** This
-  is the big one and the risky one: the parser is 5,903 lines of char-level recursive
-  descent, the desugarer feeds it, and 13 places save and restore `pos`. Behaviour must
-  not move a millimetre — the golden-pair gate and 1,953 eval tests are what say so. Do
-  it only if the two cheap items above show the throughput is in tokenizing rather than
-  in allocation.
-- **Allocation per AST node.** `Expr` boxes its children, so a member's parse is
-  thousands of small allocations. An arena would fix it and would touch every file in
-  the crate. Measure first: if swapping in a bump allocator behind a feature flag for
-  one experiment does not move the parse time, the cost is elsewhere and this is a
-  refactor for nothing.
+### Where parse time goes, per construct
 
-**Do not start here.** Phase 1 is bigger, cheaper and safer, and after Phase 1 the
-parser's share of a typical program is much easier to read.
+Measured at 800 lines of each shape, which is how the items below were chosen:
+
+| 800 lines of… | before | after |
+|---|---|---|
+| bare bindings, `f = 1` | 0.690ms | 0.646ms |
+| annotated bindings, `f : U64` then `f = 1` | 1.451ms | **1.253ms** |
+| string literals, no nominals in scope | 0.819ms | 0.723ms |
+| string literals, **20 nominals in scope** | 5.585ms | **0.784ms** |
+
+A minimal top-level binding costs ~0.65µs on its own; a binop adds ~0.25µs and a lambda
+~0.66µs. That is where the remaining time is — diffuse, not in a hot spot.
+
+### Done: the nominal table was deep-copied per string literal — −86%
+
+`parse_string` cloned `self.nominals` and `self.nominal_defaults` for **every string
+literal in the file**, for no reason but the borrow checker: `nominal_literals` is
+borrowed mutably alongside them, and `&mut self` cannot hand out both at once. A `Type`
+is a tree, so each copy walked every declaration — quadratic in (literals × nominals).
+Naming the fields (`let Parser { nominals, nominal_literals, .. } = self`) splits the
+borrow and the clones go away.
+
+This is the kind of thing the per-construct table above exists to find: nothing in the
+profile of a *typical* program pointed at it, because the cost only appears when a file
+has both many nominals and many strings.
+
+### Done: the string pool — −4% to −6% everywhere
+
+`string_pool::intern` took a global `Mutex` and hashed with SipHash, once per identifier,
+string literal and field name in every file. It is now a thread-local pool with a
+ten-line FNV-1a hasher — the keys are identifiers of a few bytes, where SipHash's setup
+costs more than its hashing, and the standard library ships nothing faster.
+
+Single-threaded is safe by construction here: `vm::RUNNING` and the AST's node table are
+thread-locals already, so the only other threads are the test harness's and each parses
+its own source. Two threads interning the same text would get two pointers, which costs a
+leak and never an answer — every comparison of a name in the interpreter is by content,
+and nothing outside the pool's own tests looks at an address. The `StringPool` struct was
+dead outside its module and went with the rewrite, as did `leak_field`'s body, which
+leaked a fresh copy of every field name rather than interning it.
+
+### Done: a 400-character `String` per annotation line
+
+`capture_type_annotation` collected a 400-char window into a `String` to look for a
+`where` clause, on every annotation line, and `Builtin.roc` is mostly annotation lines.
+It is a borrowed slice now.
+
+### Refused: `Parser::input: String` → `&'a str`
+
+This was the plan's first item, on the theory that `Parser::new` copies every source it
+is handed. It does — and the copy is one ~20kB memcpy, about 0.7µs, against 646µs of
+parsing the same file. 0.1%, in exchange for a lifetime parameter through 134 call sites.
+Priced, not attempted.
+
+### What it bought where it matters
+
+| | before | after |
+|---|---|---|
+| `Dict` member parse | 0.667ms | 0.638ms |
+| `(low level)` member parse | 0.641ms | 0.601ms |
+| `builtin::load`, whole | 1.971ms | 1.901ms |
+| `signatures_for(List)` | 0.525ms | 0.497ms |
+| `Json` example, end to end | 2062µs | 1959µs |
+| `GraphTraversal` example | 8492µs | 8319µs |
+| `Parser` example | 7188µs | 7048µs |
+
+### Still open: the lexer, which is a decision and not a task
+
+What is left is ~200ns per token spread evenly across the per-statement and
+per-construct paths. There is no remaining hot spot to shave — the table above is what
+says so — and the way to cut it is to tokenize once instead of probing the source at 269
+`self.input[self.pos..].starts_with(…)` sites.
+
+That is a rewrite across 5,903 lines with 13 places that save and restore `pos`, and the
+behaviour may not move by a millimetre: 1,953 eval tests and 99 golden pairs compare
+exact output, and the desugarer feeds this parser. It is a multi-session commitment with
+a real chance of a subtle divergence, for a prize of perhaps 40% of parse time — which is
+~0.7ms on a `Dict` program and ~1µs on a small one.
+
+**Do not start it as a side quest.** If it is worth doing, it is worth doing as its own
+piece of work, behind the differential suite, with the golden pairs run on every commit.
+
+### Not attempted: AST node allocation
+
+`Expr` boxes its children, so a member's parse is thousands of small allocations, and
+`fresh_node` costs a thread-local access and a `RefCell` borrow apiece. Bounding it by
+stubbing `fresh_node` out failed — node identity is load-bearing for annotations and
+nominal literals, so a program with every id equal to zero does not parse — and the
+indirect evidence is weak: adding a single `env::var_os` check inside `fresh_node` cost
+44%, which says only that it is called about three times per line. An arena would touch
+every file in the crate. Measure it properly before anyone tries.
 
 ---
 
@@ -651,9 +723,11 @@ Worth one afternoon, after everything above:
 4. ~~**Phase 4.1b**~~ — done: the wrapping iterators advance in place too, so a chain is
    ~20% faster and allocates nothing per element. Getting there needed two corrections
    that only an A/B against the pre-change binary exposed; see 4.1b.
-5. **Phase 3**, the parser: 1.4µs a line of ordinary source and 2.7µs a line of
-   annotations, which is 59% of what is left of a `Dict` program *and* the floor under
-   every module a user imports. Start with the two cheap experiments, not the lexer.
+5. ~~**Phase 3**~~ — the cheap items done: a quadratic that deep-copied the nominal
+   table per string literal (−86% where it bites), the string pool (−4% to −6%
+   everywhere), a 400-char copy per annotation line. The plan's own first item was
+   refused on arithmetic. What is left is the lexer, which is its own piece of work —
+   see the phase.
 6. **Phase 5**, one method per commit — speed *and* a bound removed.
 7. **Phase 4.2**, `Dec` arithmetic — smaller than it looked before 4.1 measured it.
 8. **Phase 4.3–4.5**, the general per-op work, each item measured on its own.

@@ -4,4 +4,4 @@
 
 pub mod string_pool;
 
-pub use string_pool::StringPool;
+// `string_pool::intern` is the whole of the interning API; the pool itself is private.
