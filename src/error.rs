@@ -1,10 +1,16 @@
 //! Error types for the Roc interpreter
+//!
+//! The three `Display` impls below were a `thiserror` derive. They are written out
+//! because `thiserror` is a PROC MACRO, and a proc macro in the dependency graph is
+//! what stopped `-C target-feature=+crt-static` from being set for this crate — it
+//! cannot be built for a statically linked target. Static linking is worth ~200µs on
+//! every single run (see `.cargo/config.toml`); three `write!` calls are not worth
+//! a dependency in the first place.
 
-use thiserror::Error;
+use std::fmt;
 
 /// Parse errors from the pure functional parser
-#[derive(Error, Debug, Clone)]
-#[error("Parse error at position {position}: {message}")]
+#[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
     pub position: usize,
@@ -48,9 +54,16 @@ impl ParseError {
     }
 }
 
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Parse error at position {}: {}", self.position, self.message)
+    }
+}
+
+impl std::error::Error for ParseError {}
+
 /// Type checking errors
-#[derive(Error, Debug, Clone)]
-#[error("Type error at {line}:{col}\n  Expected: {expected}\n  Actual: {actual}\n  {message}")]
+#[derive(Debug, Clone)]
 pub struct TypeError {
     pub message: String,
     pub expected: String,
@@ -78,9 +91,20 @@ impl TypeError {
     }
 }
 
+impl fmt::Display for TypeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Type error at {}:{}\n  Expected: {}\n  Actual: {}\n  {}",
+            self.line, self.col, self.expected, self.actual, self.message
+        )
+    }
+}
+
+impl std::error::Error for TypeError {}
+
 /// Runtime/evaluation errors
-#[derive(Error, Debug, Clone)]
-#[error("Runtime error: {message}")]
+#[derive(Debug, Clone)]
 pub struct EvalError {
     pub message: String,
 }
@@ -130,3 +154,11 @@ impl EvalError {
         }
     }
 }
+
+impl fmt::Display for EvalError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Runtime error: {}", self.message)
+    }
+}
+
+impl std::error::Error for EvalError {}

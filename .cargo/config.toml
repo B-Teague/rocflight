@@ -1,0 +1,15 @@
+# Link libc statically on x86_64 Linux.
+#
+# A dynamically linked Rust binary — even `fn main() { println!("hi") }` — costs ~200µs
+# before it reaches `main`, all of it the dynamic loader. Measured: a static hello is
+# 997µs of wall against 1189µs dynamic and 1060µs for `/bin/true`, so the loader is the
+# whole of it. rocflight's own startup on top of that floor is ~20µs, which is why
+# Phase 6 found nothing to fix INSIDE the program: it was never the program.
+#
+# Statically linking glibc costs `dlopen` and NSS (`getaddrinfo`, `getpwnam`). rocflight
+# uses neither — it reads files, writes stdout, reads the clock and forks a compiler —
+# so this is free here and would not be in a program that resolves hosts or users.
+#
+# Scoped to the one triple, so every other platform builds exactly as before.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
