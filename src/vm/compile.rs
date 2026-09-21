@@ -1596,19 +1596,21 @@ impl Compiler {
             for (name, reg) in params.iter().zip(&args_for) {
                 self.st().locals.push(Local { name, reg: *reg, is_var: false, captured: false, boxed: false });
             }
+            let body_at = self.here();
             let out = self.expr(&body)?;
             self.st().locals.truncate(locals_before);
-            decided = self.finish_element(shape, dst, item, out, base, top, spares)?;
+            decided = self.finish_element(shape, dst, item, out, base, body_at, top, spares)?;
         } else {
             let argc = args_for.len() as u16;
             self.reserve(base + argc - 1)?;
+            let body_at = self.here();
             for (i, src) in args_for.iter().enumerate() {
                 self.emit(Op::Move { dst: base + i as Reg, src: *src });
             }
             // The result lands where the first argument was: the callee's frame is dead
             // by then.
             self.emit(Op::Call { dst: base, func, base, argc });
-            decided = self.finish_element(shape, dst, item, base, base, top, spares)?;
+            decided = self.finish_element(shape, dst, item, base, base, body_at, top, spares)?;
         }
         self.emit(Op::Jump { to: top });
         self.patch_to_here(top);
@@ -1638,12 +1640,17 @@ impl Compiler {
         item: Reg,
         out: Reg,
         base: Reg,
+        body_at: u32,
         top: u32,
         spares: Spares,
     ) -> Result<Option<u32>, String> {
         match shape {
             Shape::Fold | Shape::FoldIndex => {
-                if out != dst {
+                // The accumulator is where the body's answer has to end up, so let the
+                // body's last instruction write it there — the same destination hint
+                // Phase 4.3 gave an assignment, which the lowered loops never got. It
+                // was a third of everything `iter_range` executed.
+                if out != dst && !self.wrote_directly(body_at, out, dst, base) {
                     self.emit(Op::Move { dst, src: out });
                 }
                 Ok(None)
@@ -3157,9 +3164,21 @@ impl Compiler {
                 *d = dst;
                 true
             }
-            // `CallFn`/`Call`/`DispatchMethod` are deliberately absent: their `dst` is
-            // written after a frame that starts at `base` has been torn down, and
-            // redirecting it onto a live local would need that overlap reasoned about.
+            // A call writes its `dst` AFTER the frame starting at `base` has been torn
+            // down, so redirecting it onto a local is safe exactly when the local sits
+            // BELOW that frame and the call cannot have scribbled on it. Arguments are
+            // always allocated above every live local, so it always does — but the
+            // overlap is what made these three unsafe to touch before, so it is checked
+            // rather than argued. `p = step(p)` is this case, and it was a `Move` of a
+            // whole record per iteration.
+            Op::CallFn { dst: d, base: arg_base, .. }
+            | Op::Call { dst: d, base: arg_base, .. }
+            | Op::DispatchMethod { dst: d, base: arg_base, .. }
+                if *d == src && dst < *arg_base =>
+            {
+                *d = dst;
+                true
+            }
             _ => false,
         }
     }
