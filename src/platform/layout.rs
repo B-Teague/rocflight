@@ -195,7 +195,7 @@ fn layout_at(ty: &Type, decls: &Declarations, depth: u32) -> Result<Layout, Stri
         Type::Record { fields, .. } => {
             let mut laid = Vec::with_capacity(fields.len());
             for (name, field) in fields {
-                laid.push((name.clone(), layout_at(field, decls, depth + 1)?));
+                laid.push(((*name).to_string(), layout_at(field, decls, depth + 1)?));
             }
             structure(laid, false)
         }
@@ -220,19 +220,19 @@ fn layout_at(ty: &Type, decls: &Declarations, depth: u32) -> Result<Layout, Stri
                         structure(laid, true)
                     }
                 };
-                variants.push(Variant { name: name.clone(), arity: args.len(), payload });
+                variants.push(Variant { name: (*name).to_string(), arity: args.len(), payload });
             }
             union(variants)
         }
         Type::Nominal { name, backing } => {
-            if name == "Box" {
+            if *name == "Box" {
                 Layout { size: WORD, align: WORD, class: Class::Pointer, shape: Shape::Box }
             } else if matches!(**backing, Type::TypeVar(u32::MAX)) {
                 // The parser names a type it has not seen and drops its arguments; the
                 // platform's own declaration says what it is.
                 let declared = decls
                     .0
-                    .get(name)
+                    .get(*name)
                     .ok_or_else(|| format!("`{}` is not a type this platform declares", name))?;
                 layout_at(declared, decls, depth + 1)?
             } else {
@@ -310,15 +310,15 @@ mod tests {
     use super::*;
 
     fn union_ty(tags: &[(&str, &[Type])]) -> Type {
-        let mut tags: Vec<(String, Vec<Type>)> =
-            tags.iter().map(|(n, a)| (n.to_string(), a.to_vec())).collect();
+        let mut tags: Vec<(&'static str, Vec<Type>)> =
+            tags.iter().map(|(n, a)| (crate::memory::string_pool::intern(n), a.to_vec())).collect();
         tags.sort_by(|a, b| a.0.cmp(&b.0));
         Type::TagUnion { tags, open: false }
     }
 
     fn record(fields: &[(&str, Type)]) -> Type {
-        let mut fields: Vec<(String, Type)> =
-            fields.iter().map(|(n, t)| (n.to_string(), t.clone())).collect();
+        let mut fields: Vec<(&'static str, Type)> =
+            fields.iter().map(|(n, t)| (crate::memory::string_pool::intern(n), t.clone())).collect();
         fields.sort_by(|a, b| a.0.cmp(&b.0));
         Type::closed_record(fields)
     }

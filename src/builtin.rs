@@ -442,7 +442,7 @@ fn annotations_only<'a>(lines: impl Iterator<Item = &'a str>) -> String {
 fn normalise(ty: &crate::types::Type) -> crate::types::Type {
     use crate::types::Type;
     match ty {
-        Type::Nominal { name, backing } => match name.as_str() {
+        Type::Nominal { name, backing } => match *name {
             "Str" => Type::Str,
             "Bool" => Type::Bool,
             "U8" => Type::U8, "U16" => Type::U16, "U32" => Type::U32,
@@ -453,7 +453,7 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
             // `List(_item) :: [ProvidedByCompiler]` erases the element, so the most
             // that can be said is "a list of something".
             "List" => Type::List(Box::new(Type::TypeVar(u32::MAX))),
-            _ => Type::Nominal { name: name.clone(), backing: Box::new(normalise(backing)) },
+            _ => Type::Nominal { name: *name, backing: Box::new(normalise(backing)) },
         },
         Type::Function(a, b) => {
             Type::Function(Box::new(normalise(a)), Box::new(normalise(b)))
@@ -462,13 +462,13 @@ fn normalise(ty: &crate::types::Type) -> crate::types::Type {
         Type::Optional(inner) => Type::Optional(Box::new(normalise(inner))),
         Type::Tuple(items) => Type::Tuple(items.iter().map(normalise).collect()),
         Type::Record { fields, open } => Type::Record {
-            fields: fields.iter().map(|(f, t)| (f.clone(), normalise(t))).collect(),
+            fields: fields.iter().map(|(f, t)| (*f, normalise(t))).collect(),
             open: *open,
         },
         Type::TagUnion { tags, open } => Type::TagUnion {
             tags: tags
                 .iter()
-                .map(|(t, args)| (t.clone(), args.iter().map(normalise).collect()))
+                .map(|(t, args)| (*t, args.iter().map(normalise).collect()))
                 .collect(),
             open: *open,
         },

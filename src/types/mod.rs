@@ -11,6 +11,14 @@ pub mod checker;
 pub use checker::TypeChecker;
 
 /// Type representation
+///
+/// Every NAME in here — a record's fields, a union's tags, a nominal — is an interned
+/// `&'static str` from `memory::string_pool`, not a `String`. Two reasons, both
+/// measured: building a record type allocated one `String` per field while parsing, and
+/// `Builtin.roc` is a file of type annotations; and a `Type` is CLONED constantly —
+/// every nominal lookup in the parser deep-copies one, which cost 0.69µs per reference
+/// to a nominal with a moderate backing type, and the checker has 135 clone sites.
+/// Interned, a clone copies the spine and none of the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Type {
     /// String type
@@ -37,7 +45,7 @@ pub enum Type {
     /// the same fields in different source order unify.
     /// Record type. `open` means "at least these fields" — `{ name: Str, .. }` — so
     /// a record carrying extras still fits. A closed record is exactly its fields.
-    Record { fields: Vec<(String, Type)>, open: bool },
+    Record { fields: Vec<(&'static str, Type)>, open: bool },
     /// An OPTIONAL record field, declared `name ?: Type`.
     ///
     /// The field may genuinely be absent, so a record without it still matches. Read
@@ -52,7 +60,7 @@ pub enum Type {
     /// that distinctness is the whole point. It is not opaque, though: roc accepts the
     /// backing type where the nominal is expected (`f({ x: 1 })` for `f : Point -> _`),
     /// so unification falls through to the backing when only one side is nominal.
-    Nominal { name: String, backing: Box<Type> },
+    Nominal { name: &'static str, backing: Box<Type> },
     /// The type of a range expression. Opaque, like roc's.
     /// A numeric range, `1..=n`; the element is what iterating it yields.
     Range(Box<Type>),
@@ -69,7 +77,7 @@ pub enum Type {
     /// * **open** (`open: true`) — inferred from a tag expression, or written with a
     ///   trailing `..`. More tags may be added by unification, and a `match` needs a
     ///   wildcard to be exhaustive.
-    TagUnion { tags: Vec<(String, Vec<Type>)>, open: bool },
+    TagUnion { tags: Vec<(&'static str, Vec<Type>)>, open: bool },
 }
 
 impl Type {
@@ -82,7 +90,7 @@ impl Type {
 
     /// A record whose fields are exactly these. The common case — an open record only
     /// comes from an annotation that writes `..`.
-    pub fn closed_record(fields: Vec<(String, Type)>) -> Type {
+    pub fn closed_record(fields: Vec<(&'static str, Type)>) -> Type {
         Type::Record { fields, open: false }
     }
 
@@ -126,7 +134,7 @@ impl fmt::Display for Type {
                     .iter()
                     .map(|(name, payload)| {
                         if payload.is_empty() {
-                            name.clone()
+                            (*name).to_string()
                         } else {
                             let args: Vec<String> =
                                 payload.iter().map(|t| t.to_string()).collect();
@@ -233,17 +241,17 @@ impl Substitution {
             Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.apply(t)).collect()),
             Type::Optional(inner) => Type::Optional(Box::new(self.apply(inner))),
             Type::Nominal { name, backing } => Type::Nominal {
-                name: name.clone(),
+                name: *name,
                 backing: Box::new(self.apply(backing)),
             },
             Type::Record { fields, open } => Type::Record {
-                fields: fields.iter().map(|(n, t)| (n.clone(), self.apply(t))).collect(),
+                fields: fields.iter().map(|(n, t)| (*n, self.apply(t))).collect(),
                 open: *open,
             },
             Type::TagUnion { tags, open } => Type::TagUnion {
                 tags: tags
                     .iter()
-                    .map(|(n, args)| (n.clone(), args.iter().map(|t| self.apply(t)).collect()))
+                    .map(|(n, args)| (*n, args.iter().map(|t| self.apply(t)).collect()))
                     .collect(),
                 open: *open,
             },

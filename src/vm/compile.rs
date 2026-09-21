@@ -644,7 +644,7 @@ struct Compiler {
     nominal_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)>,
     /// Each default-site nominal's backing fields, so the compiler knows which omitted
     /// fields are optional (fill `<missing>`) versus defaulted (fill the default).
-    nominal_records: std::collections::HashMap<&'static str, Vec<(String, crate::types::Type)>>,
+    nominal_records: std::collections::HashMap<&'static str, Vec<(&'static str, crate::types::Type)>>,
     /// The parameter conversions of the lambda about to be compiled; `function` takes
     /// them.
     pending_coerce: Option<Vec<(usize, &'static str)>>,
@@ -3386,7 +3386,7 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
                     .iter()
                     .map(|(name, field)| {
                         Value::tuple(vec![
-                            crate::eval::str_value(name.clone()),
+                            crate::eval::str_value(*name),
                             type_descriptor(field),
                         ])
                     })
@@ -3398,10 +3398,10 @@ fn type_descriptor(ty: &crate::types::Type) -> Value {
         // delegate to.
         Type::Nominal { name, backing } => Value::tag(
             "Nominal",
-            vec![crate::eval::str_value(name.clone()), wrapped_descriptor(backing)],
+            vec![crate::eval::str_value(*name), wrapped_descriptor(backing)],
         ),
         // `Try(a, e)` is how a parse result is written, and the `a` is what to read.
-        Type::TagUnion { tags, .. } => match tags.iter().find(|(tag, _)| tag == "Ok") {
+        Type::TagUnion { tags, .. } => match tags.iter().find(|(tag, _)| *tag == "Ok") {
             Some((_, payload)) if payload.len() == 1 => type_descriptor(&payload[0]),
             _ => Value::Unit,
         },

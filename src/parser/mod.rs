@@ -711,7 +711,7 @@ impl Parser {
     /// crossing a newline here cannot run into the next declaration.
     fn parse_record_type(&mut self) -> Result<Type, ParseError> {
         self.pos += 1; // Skip '{'
-        let mut fields: Vec<(String, Type)> = Vec::new();
+        let mut fields: Vec<(&'static str, Type)> = Vec::new();
         let mut open = false;
 
         loop {
@@ -758,7 +758,7 @@ impl Parser {
             let (remaining, ident) = parse_identifier(rest)?;
             self.pos += rest.len() - remaining.len();
             let field = match ident {
-                Expr::Ident(n, _) => n.to_string(),
+                Expr::Ident(n, _) => n,
                 other => {
                     return Err(ParseError {
                         message: format!("Expected a field name in a record type, got {}", other),
@@ -793,10 +793,10 @@ impl Parser {
                 self.pos += 2;
                 self.skip_whitespace();
                 let default = self.parse_or_expr()?;
-                self.field_defaults.push((field.clone(), default));
+                self.field_defaults.push((field.to_string(), default));
             }
             if optional {
-                self.optional_fields.push(field.clone());
+                self.optional_fields.push(field.to_string());
                 fields.push((field, Type::Optional(Box::new(field_type))));
             } else {
                 fields.push((field, field_type));
@@ -832,7 +832,7 @@ impl Parser {
     /// it needs a wildcard. Without it the union is closed.
     fn parse_tag_union_type(&mut self) -> Result<Type, ParseError> {
         self.pos += 1; // Skip '['
-        let mut tags: Vec<(String, Vec<Type>)> = Vec::new();
+        let mut tags: Vec<(&'static str, Vec<Type>)> = Vec::new();
         let mut open = false;
 
         loop {
@@ -870,7 +870,7 @@ impl Parser {
             let (remaining, ident) = parse_identifier(rest)?;
             self.pos += rest.len() - remaining.len();
             let tag = match ident {
-                Expr::Ident(n, _) => n.to_string(),
+                Expr::Ident(n, _) => n,
                 other => {
                     return Err(ParseError {
                         message: format!("Expected a tag name, got {}", other),
@@ -1152,7 +1152,7 @@ impl Parser {
         let slot = self.nominals.len();
         self.nominals.push((
             name_owned,
-            Type::Nominal { name: name.clone(), backing: Box::new(Type::TypeVar(u32::MAX)) },
+            Type::Nominal { name: name_owned, backing: Box::new(Type::TypeVar(u32::MAX)) },
         ));
         match self.parse_type_operand() {
             Ok(backing) => {
@@ -1161,7 +1161,7 @@ impl Parser {
                 }
                 self.nominals[slot] = (
                     name_owned,
-                    Type::Nominal { name: name.clone(), backing: Box::new(backing) },
+                    Type::Nominal { name: name_owned, backing: Box::new(backing) },
                 );
                 // Defaults belong to THIS nominal; clear the scratch list so the next
                 // declaration starts empty.
@@ -1535,14 +1535,14 @@ impl Parser {
             return;
         };
         let Some((_, argument)) = pairs.iter().find(|(p, _)| *p == id) else { return };
-        let base: Vec<String> = match declared {
-            Type::Record { fields, .. } => fields.iter().map(|(f, _)| f.clone()).collect(),
-            Type::TagUnion { tags, .. } => tags.iter().map(|(t, _)| t.clone()).collect(),
+        let base: Vec<&'static str> = match declared {
+            Type::Record { fields, .. } => fields.iter().map(|(f, _)| *f).collect(),
+            Type::TagUnion { tags, .. } => tags.iter().map(|(t, _)| *t).collect(),
             _ => return,
         };
-        let brought: Vec<String> = match (is_record, argument) {
-            (true, Type::Record { fields, .. }) => fields.iter().map(|(f, _)| f.clone()).collect(),
-            (false, Type::TagUnion { tags, .. }) => tags.iter().map(|(t, _)| t.clone()).collect(),
+        let brought: Vec<&'static str> = match (is_record, argument) {
+            (true, Type::Record { fields, .. }) => fields.iter().map(|(f, _)| *f).collect(),
+            (false, Type::TagUnion { tags, .. }) => tags.iter().map(|(t, _)| *t).collect(),
             // A type variable is still unknown — the alias may yet be applied to a
             // fitting one — so only a CONCRETE mismatch is a problem.
             (_, Type::TypeVar(_)) => return,
@@ -5819,7 +5819,7 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
         Type::List(inner) => Type::List(Box::new(substitute_type_vars(inner, pairs))),
         Type::Optional(inner) => Type::Optional(Box::new(substitute_type_vars(inner, pairs))),
         Type::Nominal { name, backing } => Type::Nominal {
-            name: name.clone(),
+            name: *name,
             backing: Box::new(substitute_type_vars(backing, pairs)),
         },
         // `open` is carried: `R(x) : { a : I64, ..x }` applied to anything produced a
@@ -5827,7 +5827,7 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
         Type::Record { fields, open } => Type::Record {
             fields: fields
                 .iter()
-                .map(|(n, t)| (n.clone(), substitute_type_vars(t, pairs)))
+                .map(|(n, t)| (*n, substitute_type_vars(t, pairs)))
                 .collect(),
             open: *open,
         },
@@ -5842,7 +5842,7 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
             tags: tags
                 .iter()
                 .map(|(n, ts)| {
-                    (n.clone(), ts.iter().map(|t| substitute_type_vars(t, pairs)).collect())
+                    (*n, ts.iter().map(|t| substitute_type_vars(t, pairs)).collect())
                 })
                 .collect(),
             open: *open,
@@ -5866,7 +5866,7 @@ fn named_type(name: &str, args: Vec<Type>, fresh: impl FnMut() -> Type) -> Type 
         // ponytail: the arguments are dropped — `Dict(Str, U64)` and `Dict(I64, Bool)`
         // are the same type here. The NAME is what dispatch needs; carrying the
         // arguments needs a parameterised type, and nothing yet asks for one.
-        Type::Nominal { name: name.to_string(), backing: Box::new(Type::TypeVar(u32::MAX)) },
+        Type::Nominal { name: string_pool::intern(name), backing: Box::new(Type::TypeVar(u32::MAX)) },
     )
 }
 
@@ -5909,7 +5909,7 @@ fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Typ
         // so `range : Range(Distance)` pins the numbers inside a `Range.custom` config
         // to `Distance`. rocflight's own integer ranges never write the name.
         ("Range", 1) => Type::Nominal {
-            name: "Range".to_string(),
+            name: "Range",
             backing: Box::new(args.pop().expect("arity 1")),
         },
         ("Try", 2) => {
@@ -5918,7 +5918,7 @@ fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Typ
             let ok = args.pop().expect("arity 2");
             // Sorted by tag name, like every other union.
             Type::TagUnion {
-                tags: vec![("Err".to_string(), vec![err]), ("Ok".to_string(), vec![ok])],
+                tags: vec![("Err", vec![err]), ("Ok", vec![ok])],
                 open: false,
             }
         }

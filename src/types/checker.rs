@@ -3,6 +3,7 @@
 //! Bidirectional type checking: synthesis (infer) + checking (verify)
 //! Phase 3: Lambdas, calls, let bindings
 
+use crate::memory::string_pool::intern;
 use crate::ast::{Expr, BinOp, Pattern};
 use crate::error::TypeError;
 use super::{Type, Substitution};
@@ -222,13 +223,13 @@ impl TypeChecker {
     fn converts_literals(&self, ty: &Type) -> bool {
         !self.conversion_nominals.is_empty()
             && matches!(ty, Type::Nominal { name, .. }
-                if self.conversion_nominals.contains(name)
+                if self.conversion_nominals.contains(*name)
                     || self.conversion_nominals.contains(name.rsplit('.').next().unwrap_or(name)))
     }
 
     /// The nominal a suffix names, as the program declared it.
     fn nominal_named(&self, name: &str) -> Type {
-        self.apply(&Type::Nominal { name: name.to_string(), backing: Box::new(Type::TypeVar(u32::MAX)) })
+        self.apply(&Type::Nominal { name: intern(name), backing: Box::new(Type::TypeVar(u32::MAX)) })
     }
 
     /// What `Name.from_interpolation` gives back, where it is declared.
@@ -258,7 +259,7 @@ impl TypeChecker {
             // app's own `Nominal { ThingAlias, ? }` stand-in.
             let placeholder = |t: &Type| {
                 matches!(t, Type::Nominal { name: n, backing }
-                    if n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
+                    if *n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
             };
             match self.declared_types.get(name) {
                 Some(existing) if placeholder(existing) && !placeholder(&ty) => {
@@ -317,7 +318,7 @@ impl TypeChecker {
             // `ThingAlias : ThingMod.Thing`, has a different name and does resolve:
             // one more expansion reaches `Thing`'s declaration.
             Type::Nominal { name: n, backing }
-                if matches!(**backing, Type::TypeVar(_)) && (n == name || n == bare) => None,
+                if matches!(**backing, Type::TypeVar(_)) && (*n == name || *n == bare) => None,
             _ => Some(declared),
         }
     }
@@ -325,19 +326,19 @@ impl TypeChecker {
     fn expand(&self, ty: &Type, seen: &mut Vec<String>) -> Type {
         match ty {
             Type::Nominal { name, backing } => {
-                if matches!(**backing, Type::TypeVar(_)) && !seen.iter().any(|s| s == name) {
+                if matches!(**backing, Type::TypeVar(_)) && !seen.iter().any(|s| s == *name) {
                     if let Some(target) = self.placeholder_target(name) {
                         let target = target.clone();
-                        seen.push(name.clone());
+                        seen.push((*name).to_string());
                         let expanded = self.expand(&target, seen);
                         seen.pop();
                         return expanded;
                     }
                 }
-                seen.push(name.clone());
+                seen.push((*name).to_string());
                 let backing = self.expand(backing, seen);
                 seen.pop();
-                Type::Nominal { name: name.clone(), backing: Box::new(backing) }
+                Type::Nominal { name: *name, backing: Box::new(backing) }
             }
             Type::List(inner) => Type::List(Box::new(self.expand(inner, seen))),
             Type::Range(inner) => Type::Range(Box::new(self.expand(inner, seen))),
@@ -345,13 +346,13 @@ impl TypeChecker {
             Type::Function(a, b) => Type::Function(Box::new(self.expand(a, seen)), Box::new(self.expand(b, seen))),
             Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.expand(t, seen)).collect()),
             Type::Record { fields, open } => Type::Record {
-                fields: fields.iter().map(|(n, t)| (n.clone(), self.expand(t, seen))).collect(),
+                fields: fields.iter().map(|(n, t)| (*n, self.expand(t, seen))).collect(),
                 open: *open,
             },
             Type::TagUnion { tags, open } => Type::TagUnion {
                 tags: tags
                     .iter()
-                    .map(|(n, args)| (n.clone(), args.iter().map(|t| self.expand(t, seen)).collect()))
+                    .map(|(n, args)| (*n, args.iter().map(|t| self.expand(t, seen)).collect()))
                     .collect(),
                 open: *open,
             },
@@ -563,7 +564,7 @@ impl TypeChecker {
             Type::Record { fields, open } => Type::Record {
                 fields: fields
                     .iter()
-                    .map(|(n, t)| (n.clone(), Self::substitute_vars(t, mapping)))
+                    .map(|(n, t)| (*n, Self::substitute_vars(t, mapping)))
                     .collect(),
                 open: *open,
             },
@@ -575,7 +576,7 @@ impl TypeChecker {
                     .iter()
                     .map(|(n, payload)| {
                         (
-                            n.clone(),
+                            *n,
                             payload.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
                         )
                     })
@@ -583,7 +584,7 @@ impl TypeChecker {
                 open: *open,
             },
             Type::Nominal { name, backing } => Type::Nominal {
-                name: name.clone(),
+                name: *name,
                 backing: Box::new(Self::substitute_vars(backing, mapping)),
             },
             other => other.clone(),
@@ -639,7 +640,7 @@ impl TypeChecker {
         // nominal: roc builds it by calling `from_quote`, and so does the compiler.
         if let (Expr::Str(_, id), Type::Nominal { name, .. }) = (expr, &resolved) {
             if self.has_method(name, "from_quote") {
-                self.converted.insert(*id, (name.clone(), "from_quote"));
+                self.converted.insert(*id, ((*name).to_string(), "from_quote"));
                 return Ok(());
             }
         }
@@ -647,9 +648,9 @@ impl TypeChecker {
         // — or a `Try` of one, when that is what the method returns — is that call.
         if let Expr::StrInterp(parts, id) = expr {
             let target = match &resolved {
-                Type::Nominal { name, .. } => Some(name.clone()),
-                Type::TagUnion { tags, .. } => tags.iter().find(|(t, _)| t == "Ok").and_then(|(_, p)| match p.as_slice() {
-                    [Type::Nominal { name, .. }] => Some(name.clone()),
+                Type::Nominal { name, .. } => Some(*name),
+                Type::TagUnion { tags, .. } => tags.iter().find(|(t, _)| *t == "Ok").and_then(|(_, p)| match p.as_slice() {
+                    [Type::Nominal { name, .. }] => Some(*name),
                     _ => None,
                 }),
                 _ => None,
@@ -662,7 +663,7 @@ impl TypeChecker {
                 }
                 let result = self.interpolation_result(&name).unwrap_or_else(|| resolved.clone());
                 self.unify(&result, &resolved)?;
-                self.converted.insert(*id, (name, "from_interpolation"));
+                self.converted.insert(*id, ((*name).to_string(), "from_interpolation"));
                 return Ok(());
             }
         }
@@ -718,7 +719,7 @@ impl TypeChecker {
                 if matches!(&resolved, Type::Nominal { .. }) =>
             {
                 let Type::Nominal { name, .. } = &resolved else { unreachable!("matched") };
-                self.collect_targets.insert(*id, name.clone());
+                self.collect_targets.insert(*id, (*name).to_string());
                 let actual = self.synth(expr)?;
                 let _ = self.unify(&actual, &resolved);
                 Ok(())
@@ -785,7 +786,7 @@ impl TypeChecker {
                         // run time, and the conversion happens at this node.
                         if let Type::Nominal { name, .. } = &resolved {
                             if self.converts_literals(&resolved) {
-                                self.coerce_values.insert(expr.id(), name.clone());
+                                self.coerce_values.insert(expr.id(), (*name).to_string());
                             }
                         }
                         Ok(())
@@ -881,18 +882,18 @@ impl TypeChecker {
                     let omitted_ok = declared.iter().all(|(field, ty)| {
                         written.iter().any(|(w, _)| w == field)
                             || matches!(ty, Type::Optional(_))
-                            || self.defaulted.get(name).is_some_and(|d| d.contains(field))
+                            || self.defaulted.get(*name).is_some_and(|d| d.iter().any(|x| x == field))
                     });
                     if omitted_ok {
-                        self.default_sites.insert(*id, name.clone());
+                        self.default_sites.insert(*id, (*name).to_string());
                     }
                 }
                 let left_out: Vec<String> = declared
                     .iter()
                     .filter(|(name, ty)| {
-                        matches!(ty, Type::Optional(_)) && !written.iter().any(|(w, _)| w == name)
+                        matches!(ty, Type::Optional(_)) && !written.iter().any(|(w, _)| *w == *name)
                     })
-                    .map(|(name, _)| name.clone())
+                    .map(|(name, _)| (*name).to_string())
                     .collect();
                 if !left_out.is_empty() {
                     self.missing_fields.insert(*id, left_out);
@@ -910,7 +911,7 @@ impl TypeChecker {
                         None if open => {
                             let extra = self.synth(value)?;
                             let mut grown = declared.clone();
-                            grown.push((name.to_string(), extra));
+                            grown.push((intern(name), extra));
                             grown.sort_by(|a, b| a.0.cmp(&b.0));
                             let grown = Type::Record { fields: grown, open: true };
                             self.subst.rebind(&resolved, grown);
@@ -928,7 +929,7 @@ impl TypeChecker {
                     }
                 }
                 let nominal_name = match &resolved {
-                    Type::Nominal { name, .. } => Some(name.clone()),
+                    Type::Nominal { name, .. } => Some(*name),
                     _ => None,
                 };
                 for (field, ty) in &declared {
@@ -937,7 +938,7 @@ impl TypeChecker {
                     }
                     // A DEFAULTED field of a nominal may be omitted — it materializes
                     // at construction; only a genuinely required field is an error.
-                    if nominal_name.as_ref().is_some_and(|n| self.defaulted.get(n).is_some_and(|d| d.contains(field))) {
+                    if nominal_name.as_ref().is_some_and(|n| self.defaulted.get(*n).is_some_and(|d| d.iter().any(|x| x == field))) {
                         continue;
                     }
                     return Err(TypeError {
@@ -1039,7 +1040,7 @@ impl TypeChecker {
                             .enumerate()
                             .filter(|(_, t)| self.converts_literals(&self.apply(t)))
                             .map(|(i, t)| match self.apply(t) {
-                                Type::Nominal { name, .. } => (i, name),
+                                Type::Nominal { name, .. } => (i, name.to_string()),
                                 _ => unreachable!("filtered"),
                             })
                             .collect();
@@ -1094,7 +1095,7 @@ impl TypeChecker {
                     if self.converts_literals(&resolved)
                         && !matches!(expr, Expr::Int(..) | Expr::Float(..) | Expr::Str(..) | Expr::StrInterp(..))
                     {
-                        self.coerce_values.insert(expr.id(), name.clone());
+                        self.coerce_values.insert(expr.id(), (*name).to_string());
                     }
                 }
                 Ok(())
@@ -1143,7 +1144,7 @@ impl TypeChecker {
             let expanded = self.expand(&decl, &mut Vec::new());
             let Type::Nominal { backing, .. } = &expanded else { continue };
             let Type::TagUnion { tags, .. } = &**backing else { continue };
-            if !tags.iter().any(|(n, payload)| n == tag && payload.len() == arity) {
+            if !tags.iter().any(|(n, payload)| *n == tag && payload.len() == arity) {
                 continue;
             }
             if found.is_some() {
@@ -1164,7 +1165,7 @@ impl TypeChecker {
     /// declares `method`: the nominal an imported or bare-tag constructor stands for.
     fn nominal_for_tags(&mut self, ty: &Type, method: &str) -> Option<Type> {
         let Type::TagUnion { tags, .. } = ty else { return None };
-        let names: Vec<&str> = tags.iter().map(|(n, _)| n.as_str()).collect();
+        let names: Vec<&str> = tags.iter().map(|(n, _)| *n).collect();
         let candidates: Vec<Type> = self
             .declared_types
             .values()
@@ -1176,7 +1177,7 @@ impl TypeChecker {
             let expanded = self.expand(&decl, &mut Vec::new());
             let backing_tags = match &expanded {
                 Type::Nominal { backing, .. } => match &**backing {
-                    Type::TagUnion { tags, .. } => tags.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                    Type::TagUnion { tags, .. } => tags.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
                     _ => continue,
                 },
                 _ => continue,
@@ -1214,7 +1215,7 @@ impl TypeChecker {
                 None => declared.clone(),
             };
             return Some(Type::TagUnion {
-                tags: vec![("Err".to_string(), vec![self.fresh_var()]), ("Ok".to_string(), vec![ok])],
+                tags: vec![("Err", vec![self.fresh_var()]), ("Ok", vec![ok])],
                 open: true,
             });
         }
@@ -1299,13 +1300,13 @@ impl TypeChecker {
                 Box::new(self.default_numerals(b, numerals)),
             ),
             Type::Nominal { name, backing } => Type::Nominal {
-                name: name.clone(),
+                name: *name,
                 backing: Box::new(self.default_numerals(backing, numerals)),
             },
             Type::Record { fields, open } => Type::Record {
                 fields: fields
                     .iter()
-                    .map(|(n, t)| (n.clone(), self.default_numerals(t, numerals)))
+                    .map(|(n, t)| (*n, self.default_numerals(t, numerals)))
                     .collect(),
                 open: *open,
             },
@@ -1313,7 +1314,7 @@ impl TypeChecker {
                 tags: tags
                     .iter()
                     .map(|(n, args)| {
-                        (n.clone(), args.iter().map(|t| self.default_numerals(t, numerals)).collect())
+                        (*n, args.iter().map(|t| self.default_numerals(t, numerals)).collect())
                     })
                     .collect(),
                 open: *open,
@@ -1330,7 +1331,7 @@ impl TypeChecker {
 
     /// Tell the checker which record literals were written as a nominal construction.
     /// A record type, or a nominal over one, as `(fields, open)`.
-    fn record_backing(&self, ty: &Type) -> Option<(Vec<(String, Type)>, bool)> {
+    fn record_backing(&self, ty: &Type) -> Option<(Vec<(&'static str, Type)>, bool)> {
         match ty {
             Type::Record { fields, open } => Some((fields.clone(), *open)),
             Type::Nominal { backing, .. } => match &**backing {
@@ -1353,13 +1354,13 @@ impl TypeChecker {
             Type::Nominal { name, .. } => {
                 let ok = fields.iter().all(|(field, t)| {
                     matches!(t, Type::Optional(_))
-                        || self.defaulted.get(name).is_some_and(|d| d.contains(field))
+                        || self.defaulted.get(*name).is_some_and(|d| d.iter().any(|x| x == field))
                 });
                 ok.then(|| (Some(crate::memory::string_pool::intern(name)), Vec::new()))
             }
             _ => {
                 let all_optional = fields.iter().all(|(_, t)| matches!(t, Type::Optional(_)));
-                all_optional.then(|| (None, fields.iter().map(|(n, _)| n.clone()).collect()))
+                all_optional.then(|| (None, fields.iter().map(|(n, _)| (*n).to_string()).collect()))
             }
         }
     }
@@ -1405,28 +1406,28 @@ impl TypeChecker {
         // an integer range still fall through to `List`.
         if module == "Range" && !self.declared_types.contains_key("Range") {
             let num = self.fresh_var();
-            let range = Type::Nominal { name: "Range".to_string(), backing: Box::new(num.clone()) };
-            let closed = |tags: Vec<(String, Vec<Type>)>| Type::TagUnion { tags, open: false };
+            let range = Type::Nominal { name: "Range", backing: Box::new(num.clone()) };
+            let closed = |tags: Vec<(&'static str, Vec<Type>)>| Type::TagUnion { tags, open: false };
             let len_hint = closed(vec![
-                ("Known".to_string(), vec![Type::U64]),
-                ("Unknown".to_string(), vec![]),
+                ("Known", vec![Type::U64]),
+                ("Unknown", vec![]),
             ]);
             match method {
                 "custom" => {
                     let config = Type::Record {
                         fields: vec![
-                            ("lower".to_string(), num.clone()),
-                            ("upper".to_string(), num.clone()),
-                            ("step".to_string(), num.clone()),
-                            ("upper_bound".to_string(), closed(vec![
-                                ("Exclusive".to_string(), vec![]),
-                                ("Inclusive".to_string(), vec![]),
+                            ("lower", num.clone()),
+                            ("upper", num.clone()),
+                            ("step", num.clone()),
+                            ("upper_bound", closed(vec![
+                                ("Exclusive", vec![]),
+                                ("Inclusive", vec![]),
                             ])),
-                            ("direction".to_string(), closed(vec![
-                                ("From".to_string(), vec![]),
-                                ("To".to_string(), vec![]),
+                            ("direction", closed(vec![
+                                ("From", vec![]),
+                                ("To", vec![]),
                             ])),
-                            ("len_if_known".to_string(), len_hint.clone()),
+                            ("len_if_known", len_hint.clone()),
                         ],
                         open: false,
                     };
@@ -1710,9 +1711,9 @@ impl TypeChecker {
                 Type::Nominal { backing, .. } => &**backing,
                 other => other,
             };
-            let names: Vec<&String> = match backing {
-                Type::TagUnion { tags, .. } => tags.iter().map(|(t, _)| t).collect(),
-                Type::Record { fields, .. } => fields.iter().map(|(f, _)| f).collect(),
+            let names: Vec<&'static str> = match backing {
+                Type::TagUnion { tags, .. } => tags.iter().map(|(t, _)| *t).collect(),
+                Type::Record { fields, .. } => fields.iter().map(|(f, _)| *f).collect(),
                 _ => continue,
             };
             let mut seen = std::collections::HashSet::new();
@@ -2019,7 +2020,7 @@ impl TypeChecker {
                                 && arm.patterns.iter().any(|p| matches!(base(p), Pattern::Tag { name, .. } if name == tag))
                         })
                     })
-                    .map(|(tag, _)| tag.as_str())
+                    .map(|(tag, _)| *tag)
                     .collect();
                 if !uncovered.is_empty() && self.lambda_depth > 0 {
                     return Err(TypeError {
@@ -2051,7 +2052,7 @@ impl TypeChecker {
                 // and the literal defaulted to `Dec`.
                 let declared = match &declared {
                     Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(u32::MAX)) => {
-                        self.declared_types.get(name).cloned().unwrap_or_else(|| declared.clone())
+                        self.declared_types.get(*name).cloned().unwrap_or_else(|| declared.clone())
                     }
                     _ => declared,
                 };
@@ -2106,7 +2107,7 @@ impl TypeChecker {
                 }
                 let name = self.suffixed_nominals[id].clone();
                 let ty = self.interpolation_result(&name).unwrap_or_else(|| self.nominal_named(&name));
-                self.converted.insert(*id, (name, "from_interpolation"));
+                self.converted.insert(*id, ((*name).to_string(), "from_interpolation"));
                 Ok(ty)
             }
             // A string literal is polymorphic where the program declares a
@@ -2183,9 +2184,9 @@ impl TypeChecker {
                         Some((_, declared)) => {
                             let declared = declared.clone();
                             self.check(value, &declared)?;
-                            updated.push((name.to_string(), declared));
+                            updated.push((intern(name), declared));
                         }
-                        None => updated.push((name.to_string(), self.synth(value)?)),
+                        None => updated.push((intern(name), self.synth(value)?)),
                     }
                 }
 
@@ -2196,7 +2197,7 @@ impl TypeChecker {
                 let base_was_open = known.is_empty() && matches!(self.apply(&base_type), Type::TypeVar(_));
                 if base_was_open {
                     let shape = Type::Record {
-                        fields: updated.iter().map(|(n, t)| (n.clone(), t.clone())).collect(),
+                        fields: updated.iter().map(|(n, t)| (*n, t.clone())).collect(),
                         open: true,
                     };
                     for (_, ty) in &updated {
@@ -2223,7 +2224,7 @@ impl TypeChecker {
                         for (name, ty) in updated {
                             match result.iter_mut().find(|(field, _)| *field == name) {
                                 Some(slot) => slot.1 = ty,
-                                None if open => result.push((name, ty)),
+                                None if open => result.push((intern(&name), ty)),
                                 None => {
                                     return Err(TypeError {
                                         message: format!(
@@ -2231,7 +2232,7 @@ impl TypeChecker {
                                             name
                                         ),
                                         expected: Type::closed_record(known).to_string(),
-                                        actual: name,
+                                        actual: name.to_string(),
                                         line: 0,
                                         col: 0,
                                     })
@@ -2638,11 +2639,11 @@ impl TypeChecker {
                 };
                 Ok(Type::TagUnion {
                     tags: vec![
-                        ("Err".to_string(), vec![Type::TagUnion {
-                            tags: vec![("MissingField".to_string(), Vec::new())],
+                        ("Err", vec![Type::TagUnion {
+                            tags: vec![("MissingField", Vec::new())],
                             open: false,
                         }]),
-                        ("Ok".to_string(), vec![value]),
+                        ("Ok", vec![value]),
                     ],
                     open: false,
                 })
@@ -2665,7 +2666,7 @@ impl TypeChecker {
                     {
                         let field_type = self.fresh_var();
                         let mut grown = fields.clone();
-                        grown.push((field.to_string(), field_type.clone()));
+                        grown.push((intern(field), field_type.clone()));
                         let grown = Type::Record { fields: grown, open: true };
                         match record_type {
                             Type::TypeVar(v) => self.subst.insert(v, grown),
@@ -2692,7 +2693,7 @@ impl TypeChecker {
                     Type::TypeVar(_) => {
                         let field_type = self.fresh_var();
                         let shape = Type::Record {
-                            fields: vec![(field.to_string(), field_type.clone())],
+                            fields: vec![(intern(field), field_type.clone())],
                             open: true,
                         };
                         let _ = self.unify(&record_type, &shape);
@@ -2710,7 +2711,7 @@ impl TypeChecker {
                 // produce the same type and therefore unify.
                 let mut typed = Vec::with_capacity(fields.len());
                 for (name, value) in fields {
-                    typed.push((name.to_string(), self.synth(value)?));
+                    typed.push((intern(name), self.synth(value)?));
                 }
                 typed.sort_by(|a, b| a.0.cmp(&b.0));
                 Ok(Type::closed_record(typed))
@@ -2740,7 +2741,7 @@ impl TypeChecker {
                     payload.push(self.synth(arg)?);
                 }
                 Ok(Type::TagUnion {
-                    tags: vec![(name.to_string(), payload)],
+                    tags: vec![(intern(name), payload)],
                     open: true,
                 })
             }
@@ -3069,11 +3070,11 @@ impl TypeChecker {
                                 }
                                 return Ok(Type::TagUnion {
                                     tags: vec![
-                                        ("Err".to_string(), vec![Type::TagUnion {
-                                            tags: vec![("InvalidNumeral".to_string(), vec![Type::Str])],
+                                        ("Err", vec![Type::TagUnion {
+                                            tags: vec![("InvalidNumeral", vec![Type::Str])],
                                             open: false,
                                         }]),
-                                        ("Ok".to_string(), vec![declared]),
+                                        ("Ok", vec![declared]),
                                     ],
                                     open: false,
                                 });
@@ -3081,8 +3082,8 @@ impl TypeChecker {
                             "from_str" => {
                                 return Ok(Type::TagUnion {
                                     tags: vec![
-                                        ("Err".to_string(), vec![self.fresh_var()]),
-                                        ("Ok".to_string(), vec![declared]),
+                                        ("Err", vec![self.fresh_var()]),
+                                        ("Ok", vec![declared]),
                                     ],
                                     open: true,
                                 })
@@ -3328,7 +3329,7 @@ impl TypeChecker {
             "U64x2" => Type::U64, "I64x2" => Type::I64,
             _ => Type::I64,
         };
-        let vector = Type::Nominal { name: module.to_string(), backing: Box::new(Type::U128) };
+        let vector = Type::Nominal { name: intern(module), backing: Box::new(Type::U128) };
         match method {
             "get_lane" => elem,
             "to_u128_bits" => Type::U128,
@@ -3343,8 +3344,8 @@ impl TypeChecker {
     /// it reaches `builtin_result`.
     fn crypto_nominal(name: &str) -> Type {
         Type::Nominal {
-            name: name.to_string(),
-            backing: Box::new(Type::closed_record(vec![("bytes".to_string(), Type::List(Box::new(Type::U8)))])),
+            name: intern(name),
+            backing: Box::new(Type::closed_record(vec![("bytes", Type::List(Box::new(Type::U8)))])),
         }
     }
 
@@ -3357,8 +3358,8 @@ impl TypeChecker {
         let digest = Self::crypto_nominal("CryptoDigest");
         let try_digest = Type::TagUnion {
             tags: vec![
-                ("Err".to_string(), vec![Type::TypeVar(u32::MAX)]),
-                ("Ok".to_string(), vec![digest.clone()]),
+                ("Err", vec![Type::TypeVar(u32::MAX)]),
+                ("Ok", vec![digest.clone()]),
             ],
             open: true,
         };
@@ -3383,12 +3384,12 @@ impl TypeChecker {
         // A SIMD vector answers its methods in method syntax too.
         if let Some(Type::Nominal { name, .. }) = receiver {
             if crate::eval::simd_kind(name).is_some() {
-                return self.simd_result(&name.clone(), method);
+                return self.simd_result(&*name, method);
             }
         }
         // A crypto digest/hasher answers its methods in method syntax too.
         if let Some(Type::Nominal { name, .. }) = receiver {
-            if name == "CryptoDigest" || name == "CryptoHasher" {
+            if *name == "CryptoDigest" || *name == "CryptoHasher" {
                 if let Some(result) = Self::crypto_result(name, method) {
                     return result;
                 }
@@ -3439,13 +3440,13 @@ impl TypeChecker {
             "split_first" | "split_last" => Type::TagUnion {
                 tags: vec![
                     (
-                        "Ok".to_string(),
+                        "Ok",
                         vec![Type::closed_record(vec![
-                            ("after".to_string(), Type::Str),
-                            ("before".to_string(), Type::Str),
+                            ("after", Type::Str),
+                            ("before", Type::Str),
                         ])],
                     ),
-                    ("Err".to_string(), vec![self.fresh_var()]),
+                    ("Err", vec![self.fresh_var()]),
                 ],
                 open: true,
             },
@@ -3487,25 +3488,25 @@ impl TypeChecker {
             }
             "split_at" => {
                 let list = self.list_like(receiver);
-                Type::closed_record(vec![("before".to_string(), list.clone()), ("others".to_string(), list)])
+                Type::closed_record(vec![("before", list.clone()), ("others", list)])
             }
             "next" if self.is_list_like(receiver) => {
                 let item = self.element_of(receiver);
                 let rest = self.list_like(receiver);
                 Type::TagUnion {
                     tags: vec![
-                        ("Done".to_string(), vec![]),
+                        ("Done", vec![]),
                         (
-                            "One".to_string(),
-                            vec![Type::closed_record(vec![("item".to_string(), item), ("rest".to_string(), rest.clone())])],
+                            "One",
+                            vec![Type::closed_record(vec![("item", item), ("rest", rest.clone())])],
                         ),
-                        ("Skip".to_string(), vec![Type::closed_record(vec![("rest".to_string(), rest)])]),
+                        ("Skip", vec![Type::closed_record(vec![("rest", rest)])]),
                     ],
                     open: true,
                 }
             }
             "size_hint" if self.is_list_like(receiver) => Type::TagUnion {
-                tags: vec![("Known".to_string(), vec![Type::U64]), ("Unknown".to_string(), vec![])],
+                tags: vec![("Known", vec![Type::U64]), ("Unknown", vec![])],
                 open: true,
             },
             // `n.range_exclusive_to(m)` in method syntax builds a range of the
@@ -3558,7 +3559,7 @@ impl TypeChecker {
     /// `Try(ok, _)`: an open union of `Ok(ok)` and an `Err` of anything.
     fn try_of(&mut self, ok: Type) -> Type {
         Type::TagUnion {
-            tags: vec![("Err".to_string(), vec![self.fresh_var()]), ("Ok".to_string(), vec![ok])],
+            tags: vec![("Err", vec![self.fresh_var()]), ("Ok", vec![ok])],
             open: true,
         }
     }
@@ -3622,11 +3623,11 @@ impl TypeChecker {
                     let ty = match ty {
                         Type::Optional(inner) => Type::TagUnion {
                             tags: vec![
-                                ("Err".to_string(), vec![Type::TagUnion {
-                                    tags: vec![("MissingField".to_string(), vec![])],
+                                ("Err", vec![Type::TagUnion {
+                                    tags: vec![("MissingField", vec![])],
                                     open: true,
                                 }]),
-                                ("Ok".to_string(), vec![*inner]),
+                                ("Ok", vec![*inner]),
                             ],
                             open: true,
                         },
@@ -3725,7 +3726,7 @@ impl TypeChecker {
                 for arg in args {
                     payload.push(self.pattern_type(arg)?);
                 }
-                Type::TagUnion { tags: vec![(name.to_string(), payload)], open: true }
+                Type::TagUnion { tags: vec![(intern(name), payload)], open: true }
             }
             Pattern::Tuple(items) => {
                 let mut types = Vec::with_capacity(items.len());
@@ -3737,7 +3738,7 @@ impl TypeChecker {
             Pattern::Record { fields, rest } => {
                 let mut types = Vec::with_capacity(fields.len());
                 for (name, pattern) in fields {
-                    types.push((name.to_string(), self.pattern_type(pattern)?));
+                    types.push((intern(name), self.pattern_type(pattern)?));
                 }
                 types.sort_by(|a, b| a.0.cmp(&b.0));
                 // With `..rest` the pattern matches a record with MORE fields than it
@@ -3788,7 +3789,7 @@ impl TypeChecker {
             let mut merged = a_tags.clone();
             for (name, payload) in b_tags {
                 if !merged.iter().any(|(n, _)| n == name) {
-                    merged.push((name.clone(), payload.clone()));
+                    merged.push((*name, payload.clone()));
                 }
             }
             merged.sort_by(|x, y| x.0.cmp(&y.0));
@@ -3964,7 +3965,7 @@ impl TypeChecker {
             // bind the element, while the nominal identity still routes `Range.custom`.
             (Type::Nominal { name, backing }, Type::List(elem) | Type::Range(elem))
             | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing })
-                if name == "Range" =>
+                if *name == "Range" =>
             {
                 let (backing, elem) = ((**backing).clone(), (**elem).clone());
                 self.unify(&backing, &elem)
@@ -4035,13 +4036,13 @@ impl TypeChecker {
                 // A CLOSED union may not gain tags. This is what makes
                 // `c : [Red, Green]` reject `c = Blue` — the check that was impossible
                 // while annotations never reached the AST.
-                let missing = |closed: &[(String, Vec<Type>)],
-                               other: &[(String, Vec<Type>)]|
+                let missing = |closed: &[(&'static str, Vec<Type>)],
+                               other: &[(&'static str, Vec<Type>)]|
                  -> Option<String> {
                     other
                         .iter()
                         .find(|(n, _)| !closed.iter().any(|(c, _)| c == n))
-                        .map(|(n, _)| n.clone())
+                        .map(|(n, _)| (*n).to_string())
                 };
 
                 if !a_open {
@@ -4098,7 +4099,7 @@ impl TypeChecker {
             // `True` and `False` are the booleans spelled as tags: a `True` pattern
             // against a `Bool` scrutinee, or a `Bool` where `[True, False]` is wanted.
             (Type::Bool, Type::TagUnion { tags, .. }) | (Type::TagUnion { tags, .. }, Type::Bool)
-                if tags.iter().all(|(t, p)| matches!(t.as_str(), "True" | "False") && p.is_empty()) =>
+                if tags.iter().all(|(t, p)| matches!(*t, "True" | "False") && p.is_empty()) =>
             {
                 Ok(())
             }

@@ -646,10 +646,10 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
     use crate::types::Type;
     match ty {
         Type::TagUnion { tags, .. } => {
-            NominalShape::Tags(tags.iter().map(|(name, _)| name.clone()).collect())
+            NominalShape::Tags(tags.iter().map(|(name, _)| (*name).to_string()).collect())
         }
         Type::Record { fields, .. } => {
-            NominalShape::Fields(fields.iter().map(|(name, ty)| (name.clone(), FieldKind::of(ty))).collect())
+            NominalShape::Fields(fields.iter().map(|(name, ty)| ((*name).to_string(), FieldKind::of(ty))).collect())
         }
         Type::Tuple(items) => NominalShape::Tuple(items.len()),
         Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
