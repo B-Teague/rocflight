@@ -165,22 +165,121 @@ pub struct Loaded {
 /// checking is unaffected either way because these names reach it as builtins already.
 /// `ponytail: trusted input, checked upstream; revisit when P3 makes the annotations
 /// the type table.`
+/// `Builtin.roc`, parsed at build time. See `crate::artifact` and `build.rs`.
+static ARTIFACT_BYTES: &[u8] = include_bytes!("roc/Builtin.artifact");
+
+fn artifact() -> Option<&'static crate::artifact::Artifact> {
+    static OPENED: std::sync::OnceLock<Option<crate::artifact::Artifact>> =
+        std::sync::OnceLock::new();
+    OPENED.get_or_init(|| crate::artifact::Artifact::open(ARTIFACT_BYTES)).as_ref()
+}
+
+/// How a member is named in the artifact.
+///
+/// Every member but one parses the same however it was reached. The low-level section
+/// does not: it is cut down to what the OTHER selected members use, so `Dict` alone and
+/// `Dict` beside `Stream` are two different parses. There are only four ways it can be
+/// reached — `needed_by` adds it with `Dict` and `Set`, and `Box` and `Stream` may join
+/// them — so it is stored once per way, under a key that names them.
+pub fn artifact_key_for(member: &str, selected: &[&str]) -> String {
+    artifact_key(member, selected)
+}
+
+fn artifact_key(member: &str, selected: &[&str]) -> String {
+    if member != "(low level)" {
+        return member.to_string();
+    }
+    let mut key = String::from(member);
+    for other in ["Box", "Dict", "Set", "Stream"] {
+        if selected.contains(&other) {
+            key.push('|');
+            key.push_str(other);
+        }
+    }
+    key
+}
+
+/// Every selection `needed_by` can produce that includes the low-level section, so the
+/// generator knows which cut-downs to store.
+pub fn artifact_selections() -> Vec<Vec<&'static str>> {
+    let mut all = Vec::new();
+    for box_ in [false, true] {
+        for stream in [false, true] {
+            let mut one = vec!["(low level)", "Dict", "Set"];
+            if box_ {
+                one.push("Box");
+            }
+            if stream {
+                one.push("Stream");
+            }
+            all.push(one);
+        }
+    }
+    // The members that can be reached without the low-level section at all.
+    all.push(vec!["Box"]);
+    all.push(vec!["Stream"]);
+    all
+}
+
+/// Parse the named members from source, keeping each one's node range so an artifact
+/// can be written. `gen-artifact` and the round-trip test are the only callers;
+/// `load` reads the artifact and only falls back to this.
+pub fn parse_members(selected: &[&str]) -> Result<Vec<(Loaded, u32, Vec<u32>)>, String> {
+    parse_from_source(selected)
+}
+
 pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
     // Loading nothing must touch nothing: `SOURCE` is 700kB of the binary, and merely
     // scanning it faults those pages in on every run of every program.
     if selected.is_empty() {
         return Ok(Vec::new());
     }
-    // Per-member timing, when `ROCFLIGHT_TIME` asks for it. Which member's parse costs
-    // what is the whole question this phase of `OPTIMIZATION_PLAN.md` is about, and the
-    // first `members_where` also pays for `index`'s one scan of all 700kB.
+    let mut step = std::time::Instant::now();
+    // The artifact holds these trees already. Every name in them is a slice of the
+    // binary, so this reads the tree and allocates no text at all.
+    if let Some(artifact) = artifact() {
+        let keys: Vec<String> =
+            selected.iter().map(|name| artifact_key(name, selected)).collect();
+        if keys.iter().all(|key| artifact.has(key)) {
+            let mut loaded = Vec::with_capacity(selected.len());
+            for (name, key) in selected.iter().zip(&keys) {
+                let member = artifact.member(key).ok_or_else(|| {
+                    format!("builtin artifact: `{}` vanished between checks", key)
+                })?;
+                loaded.push(Loaded {
+                    // The KEY names the cut-down; the member keeps its own name.
+                    name: interned_member_name(name),
+                    ast: member.ast,
+                    intrinsics: member.intrinsics,
+                    signatures: member.signatures,
+                    nominals: member.nominals,
+                });
+                crate::tick(format_args!("  {} from artifact", name), &mut step);
+            }
+            return Ok(loaded);
+        }
+    }
+    let parsed = parse_from_source(selected)?;
+    Ok(parsed.into_iter().map(|(loaded, _, _)| loaded).collect())
+}
+
+/// The `&'static str` the compiled tables key a member by.
+fn interned_member_name(name: &str) -> &'static str {
+    MEMBERS
+        .iter()
+        .find(|slice| slice.name == name)
+        .map_or_else(|| crate::memory::string_pool::intern(name), |slice| slice.name)
+}
+
+fn parse_from_source(selected: &[&str]) -> Result<Vec<(Loaded, u32, Vec<u32>)>, String> {
+    // Per-member timing, when `ROCFLIGHT_TIME` asks for it.
     let mut step = std::time::Instant::now();
     let mut sliced = members_where(|name| selected.contains(&name));
     crate::tick("slice + index", &mut step);
     // Whether any OTHER member is loaded, which is all the low-level section is cut
     // down for: on its own, every declaration of it is wanted.
     let alone = sliced.iter().all(|m| m.name == "(low level)");
-    let mut loaded = Vec::new();
+    let mut loaded = Vec::with_capacity(selected.len());
     for name in selected {
         let at = sliced
             .iter()
@@ -194,9 +293,10 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
         let desugared = Desugarer::new(member.source)
             .desugar()
             .map_err(|e| format!("builtin `{}`: {}", name, e))?;
-        crate::tick(format_args!("  {} DESUGAR", name), &mut step);
+        let first = crate::ast::node_count() as u32;
         let mut parser = Parser::new(&desugared);
         let ast = parser.parse_expr().map_err(|e| format!("builtin `{}`: {}", name, e))?;
+        let last = crate::ast::node_count() as u32;
         crate::tick(format_args!("  {} parse", name), &mut step);
         let intrinsics = parser
             .intrinsics()
@@ -206,7 +306,11 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
             .collect();
         let signatures = parser.signatures().to_vec();
         let nominals = parser.nominals().to_vec();
-        loaded.push(Loaded { name: member.name, ast, intrinsics, signatures, nominals });
+        loaded.push((
+            Loaded { name: member.name, ast, intrinsics, signatures, nominals },
+            first,
+            crate::ast::offsets_between(first, last),
+        ));
     }
     Ok(loaded)
 }

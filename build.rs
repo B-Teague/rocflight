@@ -12,6 +12,7 @@
 use std::path::PathBuf;
 
 fn main() {
+    check_artifact(include_str!("src/roc/Builtin.roc"));
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let lib = std::env::var_os("ROCFLIGHT_HOST_LIB")
@@ -195,4 +196,48 @@ fn low_level_reach(source: &str, rows: &[(String, usize, usize, bool)]) -> Strin
     }
     out.push_str("];\n");
     out
+}
+
+/// The artifact must match the source it was made from.
+///
+/// `src/roc/Builtin.artifact` is `Builtin.roc` already parsed (see `src/artifact.rs`),
+/// and a build script cannot call the crate it is building — so it cannot be generated
+/// here. What CAN be done here is refuse to build a binary whose artifact has drifted,
+/// which turns "a stale artifact silently answers wrongly" into a compile error. The
+/// alternative, checking at run time, means hashing 700kB on every startup, which is
+/// most of what the artifact saves.
+fn check_artifact(source: &str) {
+    println!("cargo:rerun-if-changed=src/roc/Builtin.artifact");
+    let path = std::path::Path::new("src/roc/Builtin.artifact");
+    // FNV-1a, the same as `artifact::source_hash`. Duplicated rather than shared
+    // because this file cannot call the crate; the round-trip is that both read the
+    // same eight lines.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    let blob = match std::fs::read(path) {
+        Ok(blob) => blob,
+        Err(_) => {
+            // First build in a fresh tree: leave an empty one, which `load` reads as
+            // "no members" and falls back to parsing. Correct, just slower.
+            let mut empty = Vec::from(*b"ROCFLT02");
+            empty.extend_from_slice(&hash.to_le_bytes());
+            empty.extend_from_slice(&0u32.to_le_bytes());
+            empty.push(0);
+            std::fs::write(path, empty).expect("writing the placeholder artifact");
+            println!("cargo:warning=no builtin artifact; run `cargo run --release --bin gen-artifact`");
+            return;
+        }
+    };
+    let stale = blob.len() < 16
+        || &blob[..8] != b"ROCFLT02"
+        || u64::from_le_bytes(blob[8..16].try_into().expect("16 bytes")) != hash;
+    if stale {
+        panic!(
+            "src/roc/Builtin.artifact is stale (or from another format version).\n\
+             Regenerate it:  cargo run --release --bin gen-artifact"
+        );
+    }
 }

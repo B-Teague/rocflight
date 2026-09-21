@@ -151,6 +151,23 @@ pub fn fresh_node_like(other: &Expr) -> NodeId {
     fresh_node(offset as usize)
 }
 
+/// Install a run of nodes whose offsets are already known, answering the id of the
+/// first. What `artifact::Artifact::member` uses: the ids inside a pre-parsed tree are
+/// relative to its own first node, so loading pushes the offsets and adds this base.
+pub fn push_nodes(offsets: &[u32]) -> u32 {
+    NODES.with(|n| {
+        let mut n = n.borrow_mut();
+        let base = n.offsets.len() as u32;
+        n.offsets.extend_from_slice(offsets);
+        base
+    })
+}
+
+/// The offsets of the nodes in `first..last`, for writing an artifact.
+pub fn offsets_between(first: u32, last: u32) -> Vec<u32> {
+    NODES.with(|n| n.borrow().offsets[first as usize..last as usize].to_vec())
+}
+
 /// How many nodes exist so far: a watermark, so nodes made after a point — another
 /// file's — can be told from the ones before it.
 pub fn node_count() -> usize {
