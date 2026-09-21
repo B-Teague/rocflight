@@ -370,41 +370,59 @@ not re-deriving tables. That is the hand-off to Phase 2 and Phase 3.
 
 ---
 
-## Phase 2 — parse `Builtin.roc` once, not once per process
+## Phase 2 — parse `Builtin.roc` once, not once per process — **next, and now ready**
 
-Phase 1 leaves 1.70ms of parsing three members and 0.35ms of compiling them on a `Dict`
-program — 59% and 12% of what is left. Same observation as Phase 1, the input is a
-constant, but the output is an AST with node identity, interned `&'static str` and source
-offsets, so this one is real work rather than a table.
+This is the largest remaining number in the document and the only phase left with a
+number at all. After Phase 6 removed the process startup and Phase 3 took a sixth off
+the parse, a four-line program that names a `Dict` is **2.59ms of rocflight** and
+`builtin::load` is **1.82ms of it**:
 
-**And it cannot be done in `build.rs`.** Phase 1.3b found the reason the hard way: a
-build script cannot call the crate it is building, so nothing that needs rocflight's own
-parser or `types::Type` can run there. Every option below therefore needs a *checked-in*
-artifact produced by a tool that links the crate — `cargo run --bin <gen>` — plus a test
-that regenerates it and compares, so a re-sync of `Builtin.roc` cannot leave the artifact
-stale. That shape is the real cost of this phase, not the loading code.
+```
+[time]            slice + index    0.173ms
+[time]    (low level) reachable    0.135ms
+[time]        (low level) parse    0.586ms
+[time]               Dict parse    0.577ms
+[time]                Set parse    0.222ms
+[time]            builtin::load    1.821ms     <- 70% of the program's own time
+[time]                  compile    0.616ms
+[time]                      run    0.050ms
+```
 
-- **2a — a generated Rust file that builds the AST.** Fastest possible load: no parsing,
-  no deserializing. Inflates `cargo build`, and the file is large. Try it on `Set` (230
-  lines) alone and measure both the load win and the build cost before going further.
-- **2b — a serialized AST, deserialized per member on demand.** Smaller build impact and
-  lazy per member. Costs a serializer, a deserializer and a format that has to stay in
-  step with `ast::Expr` — the most code of the three.
-- **2c — cache the compiled `Program` under `.rocflight/`, keyed by the hash of
-  `Builtin.roc` and the member set.** Least code, needs no generation step, but every
-  process still pays a deserialize and correctness rests on a cache-invalidation rule.
+An artifact removes the three parses and the two steps that prepare their text: call it
+**~1.5ms of 2.59ms**, on every program that names a `Dict`, a `Set`, a `Box` or a
+`Stream`.
 
-Awkward either way: `NodeId` carries a source offset for error locations, and a
-pre-built AST has no offset into the *user's* file. That is fine — a runtime error inside
-`Dict.insert` should point at the vendored source, which is what it does today — but it
-has to be deliberate, because `ast::locate` silently returns `None` and the error just
-loses its location.
+### What makes it ready now, which it was not before
 
-**Prefer Phase 3 first.** Phase 3 attacks the same 1.70ms through the parser, helps every
-module a user imports and every annotation they write, and needs no generated artifact or
-regeneration discipline. Come back here only if the parser work stalls.
+- **Every name in both trees is already an interned `&'static str`.** `ast::Expr` always
+  was; `types::Type` is as of Phase 3. That is ONE rule for the serializer — write the
+  text, `string_pool::intern` it on read — where before it would have needed two.
+- **`Loaded::intrinsics` is a list of names**, not `(name, Type)`, so there is one less
+  tree to write out.
+- **Desugaring is measured and negligible** (0.008–0.049ms a member), so the artifact can
+  be the parse of the DESUGARED text and the desugarer stays out of the format.
+- **Node identity is a rebasing problem, not an identity problem.** `NodeTable.offsets`
+  is a `Vec<u32>` and an id is its index, so loading means: note `node_count()`, push
+  each stored offset in order, and add that base to every id in the tree. `open_source`
+  /`close_source` still bracket it with the member's text, so an error in a builtin keeps
+  its line.
 
----
+### What it still costs, unchanged
+
+A build script cannot call the crate it is building, so the artifact has to be generated
+by a binary or a test and **checked in**, with a regeneration gate beside
+`tests/check_builtin.sh` so it cannot rot against `Builtin.roc` or against the AST. That
+is the price, it has not got smaller, and it is why this waited behind Phase 3 — which
+needed no artifact and sped up the user's own file too.
+
+### Do these first, they are cheap and they are in the same code
+
+- `slice + index` (0.173ms) builds a `String` per member to strip one tab from each
+  line. The low-level section is not inside the nominal and needs no stripping at all.
+- `reachable` (0.135ms) builds another `String` for the pruned low-level text.
+
+Both disappear into the artifact anyway if Phase 2 lands, which is an argument for doing
+Phase 2 rather than them.
 
 ## Phase 3 — the parser — **the cheap items done; the lexer is a decision, not a task**
 
@@ -483,21 +501,70 @@ Priced, not attempted.
 | `GraphTraversal` example | 8492µs | 8319µs |
 | `Parser` example | 7188µs | 7048µs |
 
-### Still open: the lexer, which is a decision and not a task
+### Done instead of the lexer: the TYPE parser — **−6.6% on a `Dict` program**
 
-What is left is ~200ns per token spread evenly across the per-statement and
-per-construct paths. There is no remaining hot spot to shave — the table above is what
-says so — and the way to cut it is to tokenize once instead of probing the source at 269
-`self.input[self.pos..].starts_with(…)` sites.
+This phase said the way forward was to tokenize once instead of probing at 269
+`starts_with` sites, on a finding of "~200ns per token spread evenly, no hot spot".
+**The premise does not hold.** Same line count, different content, 40,000 lines each:
 
-That is a rewrite across 5,903 lines with 13 places that save and restore `pos`, and the
-behaviour may not move by a millimetre: 1,953 eval tests and 99 golden pairs compare
-exact output, and the desugarer feeds this parser. It is a multi-session commitment with
-a real chance of a subtle divergence, for a prize of perhaps 40% of parse time — which is
-~0.7ms on a `Dict` program and ~1µs on a small one.
+| what each line is | cost per line |
+|---|---|
+| `f0 = 0 + 0` | 1.11µs |
+| `h0 = \|x\| x + 0` | 1.85µs |
+| `f0 : I64` | **0.48µs** |
+| `f0 : I64, Str -> Try(List(U64), [Bad(Str)])` | **3.00µs** |
 
-**Do not start it as a side quest.** If it is worth doing, it is worth doing as its own
-piece of work, behind the differential suite, with the golden pairs run on every commit.
+An annotation with a real type costs six times the same annotation with a bare one, and
+`Builtin.roc` is a file of annotations — a four-line `Dict` program parses 1,358 lines
+of it. The cost is `parse_type` and what it ALLOCATES, not the lexing: a counting
+allocator put `Try(List(U64), [Bad(Str)])` at **48 heap allocations**.
+
+None of what followed was a rewrite.
+
+**The allocations, in order of what they were worth:**
+
+- `builtin_type` took its arguments by value, so its one caller cloned — a deep copy of
+  every argument type for every type atom, thrown away whenever the name was not a
+  builtin. It borrows now.
+- `claim_intrinsics` deep-cloned a `Type` per intrinsic into a list that **nothing reads
+  it from**: every reader of `intrinsics` takes the name. It is a list of names now.
+  The low-level section is 454 lines of nothing but intrinsics.
+- The type-name scan allocated a `String` per atom to ask whether it contained a dot.
+- `named_type` built its fallback with `unwrap_or`, so a `String` and a `Box` per atom,
+  discarded whenever `builtin_type` answered.
+- `Type.method` was formatted and leaked twice for the same text.
+- The `where [` window was "the next 400 characters", and finding where 400 characters
+  end means decoding 400 characters — on every annotation, looking for something almost
+  none of them have. It is this line and the next now, which is what the comment above
+  it already said the rule was. **15.8% on its own.**
+
+**And then the structural half: a type's names are interned.** `types::Type` named every
+record field, union tag and nominal with a `String`, which cost twice — an allocation
+per name while parsing, and a copy of every name on a clone. A `Type` is cloned
+constantly: the parser deep-copies a nominal's whole type on every reference to it.
+Measured at 0.69µs per reference to a nominal over a five-field record. All three fields
+are `&'static str` from `memory::string_pool` now.
+
+That was 189 construction and match sites, 131 of them in the checker — and every one a
+compile error until it was answered, which is what made a change that wide tractable at
+all.
+
+| | |
+|---|---|
+| nominal references | **−33.2%** |
+| `Try(List(U64), [Bad(Str)])` | −11.3% |
+| `{ x: I64, y: Str }` | −10.4% |
+| 40,000 annotations | 137ms → 84ms, **−39%** |
+| a `Dict` program, end to end | **−6.6%** |
+| `builtin::load` | 1.951ms → 1.821ms |
+
+### The tokenizer is still not written, and is no longer obviously next
+
+Nothing here touched the lexing. The per-token probing is real, but it was never what
+`Builtin.roc` was spending its time on, and the table at the top of this section is why
+the estimate of "perhaps 40% of parse time" was aimed at the wrong thing. If the
+tokenizer is ever written it should be measured against the annotation-heavy case first,
+because that is the case that matters to every program that names a `Dict`.
 
 ### Not attempted: AST node allocation
 
@@ -1292,69 +1359,27 @@ itself — see Phase 4.
 
 ---
 
-## Where the time goes now — **re-measured after Phases 4.6, 6, 7, 8 and 1.3b**
+## Where the time goes now — **re-measured after Phase 3**
 
-Everything this document was chasing at the run end is gone or measured away. What is
-left is one number, and it is the front end again — but a different part of it, and for
-a different reason: **process startup used to hide it.**
+A four-line program that names a `Dict`, with its own fork/exec taken off: **2.59ms**,
+of which `builtin::load` is **1.82ms**. Everything at the run end is done; the front end
+is what is left, and within the front end it is parsing `Builtin.roc` — source the user
+did not write.
 
-A four-line program that names a `Dict`, in process:
+That is Phase 2, and it is the only item in this document with a number attached to it.
+See that phase for what makes it ready.
 
-```
-[time]                  desugar    0.012ms
-[time]                    parse    0.065ms   <- the USER's four lines
-[time]            slice + index    0.172ms
-[time]    (low level) reachable    0.132ms
-[time]        (low level) parse    0.617ms   <- 454 lines of Builtin.roc
-[time]               Dict parse    0.693ms   <- 674 lines
-[time]                Set parse    0.318ms   <- 230 lines
-[time]            builtin::load    2.003ms
-[time]               type check    0.061ms
-[time]                  compile    0.629ms
-[time]                      run    0.045ms
-```
+### The one cheap shortcut past the parser, refused
 
-Its whole wall is 4.2ms of which 1.0ms is the shell's own fork/exec, so **rocflight is
-~3.2ms and `builtin::load` is two thirds of it.** 1,358 lines of `Builtin.roc` parsed at
-~1.2µs a line, so a program can name a `Dict` and spend all of its time on source it did
-not write.
-
-That is Phase 2 and Phase 3, and they are the same 1.66ms seen from two sides: don't
-parse it, or parse it faster. Both are large, and neither is started here.
-
-### Why Phase 3 is still not a side quest
-
-The parser has no hot spot — ~200ns a token, spread evenly, measured before any of this
-and unchanged since. The one cheap idea left was tried this round and refused:
-
-**Refused: only look for line-shaped constructs at a line start.** `skip_trivia` runs
-between every token and asks `capture_nominal_declaration` and
-`capture_type_annotation`, each of which scans to the end of the line and searches it
-for `:=`, `::` or `:`; the second then builds two `String`s. Both constructs read to the
-next `\n`, so guarding them on "the cursor is at the start of a line" looks free, and it
-is worth **−4.2%** on a `Dict` program, −3.2% on `strings` and −2.7% on a
-2,000-declaration file.
+`skip_trivia` runs between every token and asks `capture_nominal_declaration` and
+`capture_type_annotation`, each of which scans to the end of the line and searches it.
+Both constructs read to the next `\n`, so guarding them on "the cursor is at the start
+of a line" looks free, and it is worth **−4.2%** on a `Dict` program.
 
 It reads **1881 of 1953**. Annotations reach `skip_trivia` mid-line often enough to
 break 72 eval tests — and `tests/check_roc.sh` (99 golden pairs) and
-`tests/check_examples.sh` both stayed green while they did, which is the sharpest
-reminder yet of which gate is load-bearing. Anything cheaper than the full tokenizer has
-to understand WHICH mid-line positions matter first.
-
-So Phase 3 remains what it was: tokenize once instead of probing at 183 slice sites,
-across 5,915 lines with 13 save/restore points. It is the right fix and it is a project.
-
-### Why Phase 2 got bigger, not smaller
-
-Phase 2 now targets the single largest remaining number. It also still needs what it
-always needed: `Expr`, `Pattern` and `types::Type` serialized into a checked-in artifact
-(a build script cannot call the crate it is building), with node identity reproduced —
-`fresh_node` is load-bearing for annotations and nominal literals — and a regeneration
-gate so the artifact cannot rot. Worth roughly 1.5ms on any program naming a `Dict`,
-against a format that has to be kept fresh forever.
-
-Phase 3 needs no artifact and speeds up the user's own file too, which is why it is
-still ahead of Phase 2 in the order below.
+`tests/check_examples.sh` both stayed GREEN while they did. That is the sharpest
+reminder in this document of which gate is load-bearing.
 
 ### The VM's per-op floor — measured, and there is nothing to shrink
 
@@ -1441,11 +1466,14 @@ spent its effort removing) and putting `Tag`'s payload back behind a `Vec` (undo
 12. ~~**Phase 6**~~ — done, and the answer was that the startup was never rocflight's:
    ~200µs of it is the dynamic loader, which a static link removes. `--version` is now
    two microseconds over `/bin/true`. Fat LTO measured and kept.
-13. **Phase 3**, the lexer — now the largest number in this document, because Phase 6
-   stopped hiding it. Still a project and still not a side quest; the one cheap
-   shortcut was tried this round and reads 1881 of 1953.
-14. **Phase 2**, only after 3 stalls, and for the reason it always had: an artifact that
-   must be kept fresh forever, against a fix that needs none.
+13. ~~**Phase 3**~~ — done, and it was not the lexer. The premise was wrong: an
+   annotation with a real type costs six times a bare one, and `Builtin.roc` is a file
+   of annotations, so the cost was `parse_type`'s allocations. −39% on annotation-heavy
+   parsing, −6.6% on a `Dict` program, and `types::Type`'s names are interned. The
+   tokenizer is still unwritten and is no longer obviously next.
+14. **Phase 2** — the last number left, and ready: 1.82ms of a `Dict` program's 2.59ms.
+   Phase 3 made it readier by giving both trees one naming rule. Still wants a
+   checked-in artifact and a regeneration gate.
 15. ~~**Phase 8**~~ — done, all three items, and an opcode histogram picked every one
    of them over what this list had queued: a `for` loop's back edge, a literal operand,
    and Phase 4.3's destination hint reaching calls and the lowered loops. `calls`
