@@ -147,13 +147,10 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // `Builtin.roc` already COMPILED, when the artifact carries it for this selection.
     // Then nothing needs the builtin trees — only their declared types — and their
     // chunks are not rebuilt at all. See `artifact::Prefix`.
-    // `emit_prefix` is generating the prefix, so it must not use one.
-    let prefix = if emit_prefix { None } else { crate::builtin::compiled_prefix(&needed) };
+    let prefix = crate::builtin::compiled_prefix(&needed);
     let nodes_before = crate::ast::node_count() as u32;
     let builtins = match prefix.as_ref().and(crate::builtin::load_tables(&needed)) {
         Some(tables) => tables,
-        // Generating the artifact reads none of it — see `load_from_source`.
-        None if emit_prefix => crate::builtin::load_from_source(&needed)?,
         None => crate::builtin::load(&needed)?,
     };
     // The checker will ask for these modules' declared types; `load` has just parsed

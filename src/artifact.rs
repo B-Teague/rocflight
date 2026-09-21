@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT03";
+pub const MAGIC: &[u8; 8] = b"ROCFLT05";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -67,6 +67,17 @@ impl Writer {
 
     fn tag(&mut self, t: u8) {
         self.out.push(t);
+    }
+
+    /// Fixed width, for BYTECODE. A varint costs a loop and a branch per byte to
+    /// decode, and an opcode field is read once per instruction in the chunk — the
+    /// artifact is bigger this way and that is the trade this section wants.
+    fn w16(&mut self, n: u16) {
+        self.out.extend_from_slice(&n.to_le_bytes());
+    }
+
+    fn w32(&mut self, n: u32) {
+        self.out.extend_from_slice(&n.to_le_bytes());
     }
 
     fn i128(&mut self, n: i128) {
@@ -152,6 +163,23 @@ impl<'a> Reader<'a> {
         let t = self.blob[self.at];
         self.at += 1;
         t
+    }
+
+    fn r16(&mut self) -> u16 {
+        let n = u16::from_le_bytes([self.blob[self.at], self.blob[self.at + 1]]);
+        self.at += 2;
+        n
+    }
+
+    fn r32(&mut self) -> u32 {
+        let n = u32::from_le_bytes([
+            self.blob[self.at],
+            self.blob[self.at + 1],
+            self.blob[self.at + 2],
+            self.blob[self.at + 3],
+        ]);
+        self.at += 4;
+        n
     }
 
     fn i128(&mut self) -> i128 {
@@ -888,30 +916,30 @@ use crate::eval::Value;
 
 /// Reg, u16, u32 and u8 all go out as one varint; the rest have their own byte.
 macro_rules! put_scalar {
-    ($w:expr, r, $v:expr) => { $w.u(u64::from($v)) };
-    ($w:expr, u16, $v:expr) => { $w.u(u64::from($v)) };
-    ($w:expr, u32, $v:expr) => { $w.u(u64::from($v)) };
-    ($w:expr, u8, $v:expr) => { $w.u(u64::from($v)) };
+    ($w:expr, r, $v:expr) => { $w.w16($v) };
+    ($w:expr, u16, $v:expr) => { $w.w16($v) };
+    ($w:expr, u32, $v:expr) => { $w.w32($v) };
+    ($w:expr, u8, $v:expr) => { $w.tag($v) };
     ($w:expr, bool, $v:expr) => { $w.bool($v) };
     ($w:expr, binop, $v:expr) => { $w.tag(binop_tag($v)) };
     ($w:expr, cond, $v:expr) => { $w.tag(cond_tag($v)) };
     ($w:expr, optchunk, $v:expr) => {
         match $v {
             None => $w.tag(0),
-            Some(id) => { $w.tag(1); $w.u(u64::from(id)); }
+            Some(id) => { $w.tag(1); $w.w32(id); }
         }
     };
 }
 
 macro_rules! get_scalar {
-    ($r:expr, r) => { $r.u() as u16 };
-    ($r:expr, u16) => { $r.u() as u16 };
-    ($r:expr, u32) => { $r.u() as u32 };
-    ($r:expr, u8) => { $r.u() as u8 };
+    ($r:expr, r) => { $r.r16() };
+    ($r:expr, u16) => { $r.r16() };
+    ($r:expr, u32) => { $r.r32() };
+    ($r:expr, u8) => { $r.tag() };
     ($r:expr, bool) => { $r.bool() };
     ($r:expr, binop) => { binop_of($r.tag()) };
     ($r:expr, cond) => { cond_of($r.tag()) };
-    ($r:expr, optchunk) => { if $r.tag() == 0 { None } else { Some($r.u() as u32) } };
+    ($r:expr, optchunk) => { if $r.tag() == 0 { None } else { Some($r.r32()) } };
 }
 
 /// One table, both directions.
@@ -1138,8 +1166,8 @@ fn field_kind_of(t: u8) -> crate::vm::FieldKind {
 
 fn put_chunk(w: &mut Writer, chunk: &Chunk, node_base: u32, node_end: u32) {
     w.s(chunk.name);
-    w.u(u64::from(chunk.n_regs));
-    w.u(u64::from(chunk.arity));
+    w.w16(chunk.n_regs);
+    w.w16(chunk.arity);
     w.seq(&chunk.params, |w, p| w.s(p));
     w.seq(&chunk.names, |w, n| w.s(n));
     w.seq(&chunk.consts, |w, v| put_value(w, v));
@@ -1155,17 +1183,17 @@ fn put_chunk(w: &mut Writer, chunk: &Chunk, node_base: u32, node_end: u32) {
     w.seq(&chunk.spans, |w, id| {
         let at = id.index() as u32;
         if at < node_base || at >= node_end {
-            w.u(0);
+            w.w32(0);
         } else {
-            w.u(u64::from(at - node_base) + 1);
+            w.w32(at - node_base + 1);
         }
     });
 }
 
 fn get_chunk(r: &mut Reader, id: u32, node_base: u32) -> Chunk {
     let name = r.s();
-    let n_regs = r.u() as u16;
-    let arity = r.u() as u16;
+    let n_regs = r.r16();
+    let arity = r.r16();
     let params: std::rc::Rc<[&'static str]> = r.seq(0, |r, _| r.s()).into();
     Chunk {
         name,
@@ -1181,9 +1209,9 @@ fn get_chunk(r: &mut Reader, id: u32, node_base: u32) -> Chunk {
         consts: r.seq(0, |r, _| get_value(r)),
         pats: r.seq(0, |r, _| get_pattern(r)),
         code: r.seq(0, |r, _| get_op(r)),
-        spans: r.seq(node_base, |r, base| match r.u() {
+        spans: r.seq(node_base, |r, base| match r.r32() {
             0 => crate::ast::fresh_node_unlocated(),
-            at => NodeId(base + at as u32 - 1),
+            at => NodeId(base + at - 1),
         }),
     }
 }
@@ -1220,21 +1248,34 @@ pub fn put_member(
     let length_at = w.out.len();
     w.out.extend_from_slice(&0u32.to_le_bytes());
     let body_at = w.out.len();
-    w.u(offsets.len() as u64);
-    for offset in offsets {
-        w.u(u64::from(*offset));
-    }
-    // The TABLES first and the tree last: when the bytecode prefix is in play nothing
-    // needs the tree, and this is what lets `member_tables` stop before it.
+    // Ordered by who wants what, cheapest first, each expensive run behind a length so
+    // it can be stepped over rather than decoded:
+    //
+    //   intrinsics | signatures | nominals | node offsets | tree
+    //
+    // Only `Dict` is ever asked for its SIGNATURES — `signatures_for` serves four
+    // modules and `Set`'s must be re-parsed beside `Dict`'s — so the low-level
+    // section's 153 and `Set`'s 32 were decoded into nothing. The TREE and the node
+    // offsets are wanted only when there is no compiled prefix. What is left, and what
+    // every run does read, is the intrinsics and the nominals.
     w.seq(intrinsics, |w, s| w.s(s));
+    let sig_at = w.out.len();
+    w.out.extend_from_slice(&0u32.to_le_bytes());
+    let sig_from = w.out.len();
     w.seq(signatures, |w, (n, t)| {
         w.s(n);
         put_type(w, t);
     });
+    let sig_len = (w.out.len() - sig_from) as u32;
+    w.out[sig_at..sig_at + 4].copy_from_slice(&sig_len.to_le_bytes());
     w.seq(nominals, |w, (n, t)| {
         w.s(n);
         put_type(w, t);
     });
+    w.u(offsets.len() as u64);
+    for offset in offsets {
+        w.u(u64::from(*offset));
+    }
     put_expr(w, ast, base);
     let length = (w.out.len() - body_at) as u32;
     w.out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
@@ -1306,8 +1347,11 @@ impl Artifact {
     /// Decode one member, installing its nodes in the table first so the ids in the
     /// tree can be rebased onto them.
     pub fn member(&self, name: &str) -> Option<Member> {
-        let (_, at) = self.members.iter().find(|(n, _)| *n == name)?;
+        let (found, at) = self.members.iter().find(|(n, _)| *n == name)?;
         let mut r = Reader { blob: self.blob, at: *at, strings: &self.strings };
+        let intrinsics = r.seq(0, |r, _| r.s());
+        let signatures = self.read_signatures(&mut r)?;
+        let nominals = r.seq(0, |r, _| (r.s(), get_type(r)));
         let n_offsets = r.u() as usize;
         let mut offsets = Vec::with_capacity(n_offsets);
         for _ in 0..n_offsets {
@@ -1315,33 +1359,51 @@ impl Artifact {
         }
         let base = crate::ast::push_nodes(&offsets);
         Some(Member {
-            name: self.members.iter().find(|(n, _)| *n == name)?.0,
-            intrinsics: r.seq(base, |r, _| r.s()),
-            signatures: r.seq(base, |r, _| (r.s(), get_type(r))),
-            nominals: r.seq(base, |r, _| (r.s(), get_type(r))),
+            name: found,
+            intrinsics,
+            signatures,
+            nominals,
             ast: Some(get_expr(&mut r, base)),
         })
     }
 
-    /// The same member WITHOUT its tree, and without installing its nodes.
+    /// The tables every run needs, and only those: the intrinsic names and the declared
+    /// nominals. Not the signatures, not the node offsets, not the tree.
     ///
-    /// What the checker needs — declared types and intrinsic names — when the compiled
-    /// prefix means nobody will walk the tree. Skipping it is 0.33ms on a `Dict`
-    /// program, because the tree is almost all of the member.
+    /// Signatures are asked for by module and only for four of them, so decoding all of
+    /// a member's is decoding into nothing — see `signatures_of`, which reads one
+    /// member's on demand.
     pub fn member_tables(&self, name: &str) -> Option<Member> {
         let (found, at) = self.members.iter().find(|(n, _)| *n == name)?;
         let mut r = Reader { blob: self.blob, at: *at, strings: &self.strings };
-        let n_offsets = r.u() as usize;
-        for _ in 0..n_offsets {
-            r.u();
-        }
+        let intrinsics = r.seq(0, |r, _| r.s());
+        self.skip_signatures(&mut r)?;
         Some(Member {
             name: found,
-            intrinsics: r.seq(0, |r, _| r.s()),
-            signatures: r.seq(0, |r, _| (r.s(), get_type(r))),
+            intrinsics,
+            signatures: Vec::new(),
             nominals: r.seq(0, |r, _| (r.s(), get_type(r))),
             ast: None,
         })
+    }
+
+    /// One member's declared signatures, decoded on demand.
+    pub fn signatures_of(&self, name: &str) -> Option<Vec<(&'static str, Type)>> {
+        let (_, at) = self.members.iter().find(|(n, _)| *n == name)?;
+        let mut r = Reader { blob: self.blob, at: *at, strings: &self.strings };
+        let _ = r.seq(0, |r, _| r.s());
+        self.read_signatures(&mut r)
+    }
+
+    fn read_signatures(&self, r: &mut Reader) -> Option<Vec<(&'static str, Type)>> {
+        r.at += 4;
+        Some(r.seq(0, |r, _| (r.s(), get_type(r))))
+    }
+
+    fn skip_signatures(&self, r: &mut Reader) -> Option<()> {
+        let len = u32::from_le_bytes(self.blob.get(r.at..r.at + 4)?.try_into().ok()?) as usize;
+        r.at += 4 + len;
+        Some(())
     }
 }
 
@@ -1510,11 +1572,16 @@ mod tests {
         let after = blank_ids(&format!("{:?}", back.ast.expect("the tree")));
         assert_eq!(before, after, "round trip changed the tree");
 
-        // And the tables come back without decoding the tree at all.
+        // The tables come back without the tree — and without the signatures, which
+        // are read by module on demand and are the bulk of what a member declares.
         let tables = artifact.member_tables("Box").expect("tables");
-        assert!(tables.ast.is_none());
+        assert!(tables.ast.is_none(), "member_tables decoded the tree");
+        assert!(tables.signatures.is_empty(), "member_tables decoded the signatures");
         assert_eq!(tables.intrinsics, loaded.intrinsics);
-        assert_eq!(format!("{:?}", tables.signatures), format!("{:?}", loaded.signatures));
+        assert_eq!(format!("{:?}", tables.nominals), format!("{:?}", loaded.nominals));
+        // And asking for them by name gets exactly what went in.
+        let signatures = artifact.signatures_of("Box").expect("signatures");
+        assert_eq!(format!("{:?}", signatures), format!("{:?}", loaded.signatures));
     }
 
     /// `NodeId(17)` -> `NodeId(_)`, so a rebased tree prints the same as its original.

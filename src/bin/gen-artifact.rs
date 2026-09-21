@@ -15,6 +15,8 @@
 use rocflight::artifact::{put_member, put_prefix, source_hash, Writer};
 
 fn main() {
+    // Nothing below reads the artifact it is about to replace.
+    rocflight::builtin::generating(true);
     let mut writer = Writer::default();
     let mut written = 0usize;
     let mut seen: Vec<String> = Vec::new();

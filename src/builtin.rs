@@ -169,7 +169,24 @@ pub struct Loaded {
 /// `Builtin.roc`, parsed at build time. See `crate::artifact` and `build.rs`.
 static ARTIFACT_BYTES: &[u8] = include_bytes!("roc/Builtin.artifact");
 
+/// While GENERATING an artifact, there is no artifact.
+///
+/// Every reader below goes through `artifact()`, so one switch covers all of them —
+/// the trees, the signatures and the bytecode. Without it, generation reads the
+/// previous artifact and the next one is built from the last: circular, and not
+/// reproducible, because a table read back installs no nodes where parsing it would
+/// have, so every node id after it shifts. `tests/check_artifact.sh` caught that twice,
+/// once per reader that was added.
+static GENERATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn generating(yes: bool) {
+    GENERATING.store(yes, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn artifact() -> Option<&'static crate::artifact::Artifact> {
+    if GENERATING.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     static OPENED: std::sync::OnceLock<Option<crate::artifact::Artifact>> =
         std::sync::OnceLock::new();
     OPENED.get_or_init(|| crate::artifact::Artifact::open(ARTIFACT_BYTES)).as_ref()
@@ -237,9 +254,12 @@ pub fn compiled_prefix(selected: &[&str]) -> Option<crate::artifact::Prefix> {
     if selected.is_empty() {
         return None;
     }
+    let mut step = std::time::Instant::now();
     let artifact = artifact()?;
     let key = prefix_key(selected);
-    artifact.has_prefix(&key).then(|| artifact.prefix(&key))?
+    let found = artifact.has_prefix(&key).then(|| artifact.prefix(&key))?;
+    crate::tick("builtin bytecode", &mut step);
+    found
 }
 
 /// A selection names one compiled prefix, whatever order it arrived in.
@@ -275,16 +295,6 @@ pub fn load_tables(selected: &[&str]) -> Option<Vec<Loaded>> {
         });
     }
     Some(out)
-}
-
-/// `load`, but always from SOURCE.
-///
-/// What `gen-artifact` uses. Reading the artifact while writing one would generate the
-/// next artifact from the last, which is both circular and not reproducible: the trees
-/// come back with their nodes already installed, so the node ids differ and the bytes
-/// do — `tests/check_artifact.sh` caught exactly that.
-pub fn load_from_source(selected: &[&str]) -> Result<Vec<Loaded>, String> {
-    Ok(parse_from_source(selected)?.into_iter().map(|(loaded, _, _)| loaded).collect())
 }
 
 pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
@@ -465,6 +475,31 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     if let Some(found) = cache.lock().expect("signature cache").get(module) {
         return found;
     }
+    // The artifact holds these already, parsed at build time with the whole member in
+    // scope — which is strictly more than the annotations-only re-parse below sees.
+    // Read on DEMAND: only four modules are ever asked, so decoding every loaded
+    // member's signatures up front decoded most of them into nothing.
+    //
+    // `Set` is the exception, and it is the reason this is not simply "read the
+    // artifact": `Set(item) :: Dict(item, {})`, and the artifact's `Set` was parsed
+    // with its own `Parser`, so its `Dict` is an unparameterised placeholder and `item`
+    // is dropped. `parse_signatures` prepends `Dict`'s annotations for exactly that.
+    if module != "Set" {
+        if let Some(found) = artifact().and_then(|a| a.signatures_of(module)) {
+            let table: Box<[(&'static str, crate::types::Type)]> = found
+                .into_iter()
+                .filter(|(name, _)| {
+                    name.len() > module.len()
+                        && name.starts_with(module)
+                        && name.as_bytes()[module.len()] == b'.'
+                })
+                .map(|(name, ty)| (name, normalise(&ty)))
+                .collect();
+            let parsed: &'static [(&'static str, crate::types::Type)] = Box::leak(table);
+            cache_signatures(module, parsed);
+            return parsed;
+        }
+    }
     // Timed because this RE-PARSES a member `load` may already have parsed — the
     // measured 0.4ms of a `Dict` program and 1.4ms of a program that merely calls
     // `.map`. See `OPTIMIZATION_PLAN.md`, phase 1.3.
@@ -493,6 +528,13 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
 /// Seeding only, never overwriting: whatever asked first wins, as it did before.
 pub fn seed_signatures(loaded: &[Loaded]) {
     for member in loaded {
+        // Nothing to seed from a member read by `load_tables`, which does not decode
+        // signatures — `signatures_for` reads that member's from the artifact on
+        // demand. Seeding an empty table here would WIN, because the cache is
+        // first-writer, and the checker would then believe `Dict` declares nothing.
+        if member.signatures.is_empty() {
+            continue;
+        }
         if member.name == "Set" || !TYPED_MEMBERS.contains(&member.name) {
             continue;
         }
