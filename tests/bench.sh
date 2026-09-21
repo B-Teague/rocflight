@@ -93,7 +93,7 @@ for file in tests/bench/*.roc; do
 
   # Correctness first: a faster interpreter that prints something else is not faster.
   expected=$(grep -oP '(?<=^# expect: ).*' "$file" || true)
-  actual=$("$ROCFLIGHT" "$file" 2>&1 | grep -v '^\[Desugaring\]')
+  actual=$("$ROCFLIGHT" "$file" 2>&1 | grep -v '^\[\(Desugaring\|time\)\]')
   if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then
     printf '  %s %-18s wrong output: %s (wanted %s)\n' "$(red FAIL)" "$name" "$actual" "$expected"
     fail=$((fail+1)); continue
