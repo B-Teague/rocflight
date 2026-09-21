@@ -1094,6 +1094,117 @@ Every benchmark faster, none regressed, 1953 of 1953 throughout.
 
 ---
 
+## Phase 8 — instructions, now that the allocations are gone — **done, −1.4% to −20.8%**
+
+Phase 7 took the allocations out. What was left is dispatches, so the question became
+"which instructions does a program actually execute", and the answer came from an
+**opcode histogram** — a throwaway build, ten lines counting in `exec`, never kept,
+because counting in the dispatch loop costs what it measures. Rebuild it whenever this
+area is reopened; it is what picked all three of these, and none of them was the item
+this document had queued next.
+
+| | `loop` | `records_tail` | `calls` | `iter_range` | `records` |
+|---|---|---|---|---|---|
+| `Jump` (a loop's back edge) | 33.3% | — | — | 25.0% | 10.0% |
+| `LoadK` (a literal operand) | — | 30.8% | 26.7% | — | — |
+| `Move`/`MoveTake` | — | — | — | 25.0% | 20.0% |
+
+Those three rows are 8.1, 8.2 and 8.3.
+
+### 8.1 — a `for` loop's back edge does the step itself — **done**
+
+The compiler lays a loop out as `IterNext { to: exit }`, the body, `Jump { to: head }`,
+`exit:`. The `Jump` exists only to reach the `IterNext`, so `vm::peephole` replaces it
+with `IterNextBack`, which jumps to the BODY when there is an element and falls through
+when there is not. All three facts it relies on — back edge, target is an `IterNext`,
+`exit == jump + 1` — are checked, and a `Jump` something else targets is left alone
+because a `continue` lands there and must still mean "go round again".
+
+A rewrite **in place**: no instruction added or removed, so nothing is renumbered. That
+is why this fusion exists and a more general one does not.
+
+`IterNext` and `IterNextBack` share `iter_step`, and **`#[inline(always)]` on it is
+load-bearing**: the first cut left it to LLVM, it stayed out of line, and `iter_range`
+read **+10.8%**. Same trap as the `Lazy::advance` split. `loop` −11.8%, `iter_range`
+−4.7%, `records_tail` −5.5%.
+
+### 8.2 — a literal operand is read from the constant table — **done**
+
+`x + 1` was a `LoadK` into a register and a `BinInt` reading it back: a whole dispatch,
+a 48-byte copy and the drop glue on whatever the register held. `BinK`/`BinIntK` take
+the constant index in place of the second register.
+
+The compiler folds them when the last instruction emitted is a `LoadK` into the right
+operand **and** that register is a temporary the operands' own compilation allocated
+(`b >= save`, the `next_reg` watermark from before they compiled). The second test is
+the whole safety argument:
+
+```roc
+y = 5
+x + y
+```
+
+matches the first test — `y`'s own `LoadK` is the previous instruction and `y`'s
+register is the operand — and fusing there deletes the binding, leaving every later read
+of `y` empty. Verified by hand on exactly that program.
+
+The `LoadK` is **replaced**, not removed, so nothing is renumbered — which matters,
+because a `while` loop's head is the first instruction of its condition and for
+`while i < 10` that *is* this `LoadK`. The back edge now lands on the fused instruction,
+which is still where the condition starts. The span moves to the operator so an overflow
+reports at the operator.
+
+`BinInt`'s body moved into `bin_int` so `BinIntK` cannot drift from it. `wrote_directly`
+had to learn the two new opcodes or it put the `Move` back — `go` was 13 instructions
+per iteration, then 12, and only then 10. `records_tail` −15.6%, `calls` −15.4%,
+`closure_in_loop` −14.3%.
+
+### 8.3 — the destination hint reaches calls and the lowered loops — **done**
+
+Phase 4.3's hint never reached two places, and once 8.1 and 8.2 had gone they were what
+was left.
+
+`wrote_directly` listed `CallFn`/`Call`/`DispatchMethod` as deliberately absent, because
+their `dst` is written after a frame starting at `base` is torn down and the overlap had
+not been reasoned about. It has been: redirecting onto a local is safe exactly when the
+local sits below that frame, and arguments are always allocated above every live local
+— so it always does, and the code checks `dst < arg_base` rather than arguing it.
+
+`finish_element` emitted `Move { dst: accumulator, src: body }` unconditionally; the
+lowered loops arrived in Phase 5, after 4.3 was written, and never got the hint. Now the
+body's last instruction writes the accumulator.
+
+`iter_range`'s loop body is **two** instructions where it was four, `records`' is three
+where it was five. `iter_range` −8.7%, `loop` −4.9%, `records` −4.3%. `calls` reads
++0.9% and stays there at 25 runs; its bytecode was diffed and the only change is one
+instruction removed from `main!`, which runs once — layout, not work.
+
+### What Phase 8 came to
+
+Against the pre-phase binary, interleaved, median of 15:
+
+| | | | |
+|---|---|---|---|
+| `calls` −20.8% | `records_tail` −17.9% | `iter_range` −13.5% | `loop` −13.2% |
+| `closure_in_loop` −11.5% | `records` −8.6% | `matching_tail` −7.2% | `closure_capture` −5.1% |
+| `list_ops` −3.9% | `strings` −3.9% | `list_pass` −2.0% | `matching` −1.4% |
+
+Every benchmark faster, none regressed, 1953 of 1953 throughout. `loop.roc` is now two
+instructions per iteration and `iter_range` two; there is no third to remove.
+
+### What the histogram says is left
+
+Re-measured after all three. `matching` is `TestTag` 18.2% and `BinInt` 18.2% — a match
+arm's test and its arithmetic, both real work. `list_pass` is `DispatchMethod` 21.4% and
+`Move` 21.4%, and those Moves are argument setup for a receiver read three times, so
+only the last can be a take. `records` is `GetField` 22.2%, which Phase 4.5 already
+measured is an instruction count and not a lookup cost.
+
+There is no obvious fourth fusion. The next question about the VM is the per-op floor
+itself — see Phase 4.
+
+---
+
 ## Not doing
 
 - **A JIT.** The measured problem is a front end re-parsing a constant, not a slow inner
@@ -1160,7 +1271,12 @@ Every benchmark faster, none regressed, 1953 of 1953 throughout.
    needed to). 7.5 is the one to be careful around: a liveness pass whose failure mode
    is a wrong answer with no crash, kept safe by matching every opcode with no wildcard
    arm.
-11. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
+11. ~~**Phase 8**~~ — done, all three items, and an opcode histogram picked every one
+   of them over what this list had queued: a `for` loop's back edge, a literal operand,
+   and Phase 4.3's destination hint reaching calls and the lowered loops. `calls`
+   −20.8%, `records_tail` −17.9%, `iter_range` −13.5%, nothing regressed. `loop.roc` is
+   two instructions per iteration now.
+12. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
    `/bin/true`, which is 0.7s of the suite's 13.0s.
 
 Every phase, the same gates, and the eval suite at 1953 of 1953. A phase that cannot
