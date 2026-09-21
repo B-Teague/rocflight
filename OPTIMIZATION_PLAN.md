@@ -370,59 +370,73 @@ not re-deriving tables. That is the hand-off to Phase 2 and Phase 3.
 
 ---
 
-## Phase 2 — parse `Builtin.roc` once, not once per process — **next, and now ready**
+## Phase 2 — parse `Builtin.roc` once, not once per process — **done, −39.7%**
 
-This is the largest remaining number in the document and the only phase left with a
-number at all. After Phase 6 removed the process startup and Phase 3 took a sixth off
-the parse, a four-line program that names a `Dict` is **2.59ms of rocflight** and
-`builtin::load` is **1.82ms of it**:
+`src/artifact.rs` writes the parsed trees out at build time and reads them back.
 
 ```
-[time]            slice + index    0.173ms
-[time]    (low level) reachable    0.135ms
-[time]        (low level) parse    0.586ms
-[time]               Dict parse    0.577ms
-[time]                Set parse    0.222ms
-[time]            builtin::load    1.821ms     <- 70% of the program's own time
-[time]                  compile    0.616ms
-[time]                      run    0.050ms
+builtin::load   1.821ms -> 0.339ms        a Dict program   -39.7%
 ```
 
-An artifact removes the three parses and the two steps that prepare their text: call it
-**~1.5ms of 2.59ms**, on every program that names a `Dict`, a `Set`, a `Box` or a
-`Stream`.
+A four-line `Dict` program is **1.14ms of rocflight** now, against 3.5ms when this
+document was rewritten and 2.59ms before this phase.
 
-### What makes it ready now, which it was not before
+### What made it fast, which is not "it is a binary format"
 
-- **Every name in both trees is already an interned `&'static str`.** `ast::Expr` always
-  was; `types::Type` is as of Phase 3. That is ONE rule for the serializer — write the
-  text, `string_pool::intern` it on read — where before it would have needed two.
-- **`Loaded::intrinsics` is a list of names**, not `(name, Type)`, so there is one less
-  tree to write out.
-- **Desugaring is measured and negligible** (0.008–0.049ms a member), so the artifact can
-  be the parse of the DESUGARED text and the desugarer stays out of the format.
-- **Node identity is a rebasing problem, not an identity problem.** `NodeTable.offsets`
-  is a `Vec<u32>` and an id is its index, so loading means: note `node_count()`, push
-  each stored offset in order, and add that base to every id in the tree. `open_source`
-  /`close_source` still bracket it with the member's text, so an error in a builtin keeps
-  its line.
+**Every name is borrowed from the blob, not interned.** The strings live in the binary's
+read-only data, so reading one is a slice — no allocation, no hashing, nothing on the
+heap. That is sound because every comparison of a name in the interpreter is by content,
+which `memory::string_pool` already documents, and it is the single biggest reason this
+beats parsing rather than merely differing from it. Phase 3 is what made it uniform:
+`ast::Expr` and `types::Type` both name everything with a `&'static str`.
 
-### What it still costs, unchanged
+**Opening the artifact reads no trees.** The first cut decoded all eight bodies just to
+find where each began — 0.737ms for the first member, which was most of what the phase
+saves. Each body carries a fixed-width length now and the header steps over it; the same
+member costs 0.103ms.
 
-A build script cannot call the crate it is building, so the artifact has to be generated
-by a binary or a test and **checked in**, with a regeneration gate beside
-`tests/check_builtin.sh` so it cannot rot against `Builtin.roc` or against the AST. That
-is the price, it has not got smaller, and it is why this waited behind Phase 3 — which
-needed no artifact and sped up the user's own file too.
+### The three things that were not obvious
 
-### Do these first, they are cheap and they are in the same code
+- **Node identity is a rebase, not a reproduction.** `NodeTable.offsets` is a `Vec<u32>`
+  and an id is its index, so a member stores its offsets and its ids relative to its own
+  first node; `ast::push_nodes` installs the offsets and answers the base to add. A test
+  checks the offsets come back identical, not just the tree.
+- **The low-level section is stored four times.** Every other member parses the same
+  however it was reached. That one is cut down to what the OTHER selected members use,
+  so `Dict` alone and `Dict` beside `Stream` are different trees. `needed_by` can reach
+  it exactly four ways, so it is keyed by which.
+- **`StrPart::Expr` is a leaked `&'static Expr`**, so decoding one leaks as the parser
+  does. Anything else would have changed a lifetime the AST depends on.
 
-- `slice + index` (0.173ms) builds a `String` per member to strip one tab from each
-  line. The low-level section is not inside the nominal and needs no stripping at all.
-- `reachable` (0.135ms) builds another `String` for the pruned low-level text.
+### Staleness is a build error, never a wrong answer
 
-Both disappear into the artifact anyway if Phase 2 lands, which is an argument for doing
-Phase 2 rather than them.
+The artifact records an FNV-1a of the source it was made from. `build.rs` hashes
+`src/roc/Builtin.roc` and **refuses to compile** if they differ, naming the command to
+regenerate. Checking at run time would mean hashing 700kB on every startup, which is
+most of what this saves. `tests/check_artifact.sh` is the other half — it regenerates
+and diffs, which catches a change to the AST or the parser that leaves `Builtin.roc`
+untouched. A MISSING artifact is not an error: `build.rs` leaves an empty one and `load`
+falls back to parsing, correct and slow.
+
+Two tests hold the format together: a member round-trips to the same tree (compared with
+the node numbers blanked, since the rebase is exactly what should differ), and its node
+offsets survive.
+
+### What is left of a `Dict` program
+
+```
+[time]            parse    0.077ms   <- the user's four lines
+[time]    builtin::load    0.339ms   <- eight trees decoded, no text read
+[time]       type check    0.058ms
+[time]          compile    0.655ms   <- now the largest single number
+[time]              run    0.052ms
+```
+
+`compile` is next if anyone reopens this, and it is the same question in a new place:
+1,443 definitions from `Builtin.roc` are compiled into chunks whether the program calls
+them or not. Pruning that needs the per-declaration reachability `build.rs` already
+computes for the low-level section, generalised — and the same care, because a
+declaration wrongly pruned is an unknown name at run time, not a slow one.
 
 ## Phase 3 — the parser — **the cheap items done; the lexer is a decision, not a task**
 
@@ -1359,15 +1373,37 @@ itself — see Phase 4.
 
 ---
 
-## Where the time goes now — **re-measured after Phase 3**
+## Where the time goes now — **every phase is done**
 
-A four-line program that names a `Dict`, with its own fork/exec taken off: **2.59ms**,
-of which `builtin::load` is **1.82ms**. Everything at the run end is done; the front end
-is what is left, and within the front end it is parsing `Builtin.roc` — source the user
-did not write.
+A four-line program that names a `Dict`, with its own fork/exec taken off: **1.14ms**,
+against 3.5ms when this document was rewritten. Nothing in it is a re-derivation any
+more — the front end reads trees instead of building them, and startup is the operating
+system's.
 
-That is Phase 2, and it is the only item in this document with a number attached to it.
-See that phase for what makes it ready.
+```
+parse 0.077ms | builtin::load 0.339ms | type check 0.058ms | compile 0.655ms | run 0.052ms
+```
+
+`compile` is the largest single number left and it is the same question in a new place:
+every definition `Builtin.roc` declares is compiled whether the program calls it or not.
+See the end of Phase 2.
+
+### The gates, and which one is load-bearing
+
+```bash
+cargo build --release              # refuses a stale Builtin.artifact
+tests/check_eval.sh --strict       # 1953 of 1953 — the hard requirement
+tests/check_roc.sh --strict        # 99 golden pairs
+tests/check_examples.sh            # 20 matching examples
+tests/check_artifact.sh            # the artifact regenerates byte-identical
+tests/check_host.sh                # the platform host, built for musl
+cargo test --quiet                 # the Rust suite
+tests/bench.sh                     # A/B, interleaved, against a copied binary
+```
+
+**The eval suite is the one that catches parser changes.** Two refusals in this document
+were found by it while `check_roc.sh` and `check_examples.sh` both stayed green — the
+`skip_trivia` guard (1881 of 1953) and narrowing `needed_by` (1949 of 1953).
 
 ### The one cheap shortcut past the parser, refused
 
@@ -1471,9 +1507,9 @@ spent its effort removing) and putting `Tag`'s payload back behind a `Vec` (undo
    of annotations, so the cost was `parse_type`'s allocations. −39% on annotation-heavy
    parsing, −6.6% on a `Dict` program, and `types::Type`'s names are interned. The
    tokenizer is still unwritten and is no longer obviously next.
-14. **Phase 2** — the last number left, and ready: 1.82ms of a `Dict` program's 2.59ms.
-   Phase 3 made it readier by giving both trees one naming rule. Still wants a
-   checked-in artifact and a regeneration gate.
+14. ~~**Phase 2**~~ — done, −39.7% on a `Dict` program. `builtin::load` 1.821ms →
+   0.339ms, and the strings are read out of the binary's rodata rather than allocated,
+   which is most of why. A stale artifact is a build error.
 15. ~~**Phase 8**~~ — done, all three items, and an opcode histogram picked every one
    of them over what this list had queued: a `for` loop's back edge, a literal operand,
    and Phase 4.3's destination hint reaching calls and the lowered loops. `calls`
