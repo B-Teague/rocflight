@@ -497,7 +497,8 @@ over the rest. `signatures_of` reads one member's when `signatures_for` asks, at
 once and only for `Dict`.
 
 ```
-builtin::load   0.235ms -> 0.018ms        a Dict program  -9.6%
+builtin::load, not counting the bytecode decode:  0.235ms -> 0.027ms
+a Dict program:                                             -9.6%
 ```
 
 The bytecode section is FIXED-WIDTH rather than varint, since binary size is not the
@@ -516,13 +517,17 @@ the argument for a gate that REGENERATES rather than one that trusts.
 ### What is left of a `Dict` program
 
 ```
-[time]            parse    0.058ms   <- the user's four lines
-[time] builtin bytecode    0.133ms   <- 99 chunks materialised, not compiled
-[time]    builtin::load    0.018ms
-[time]       type check    0.104ms   <- including Dict's 36 signatures, read on demand
-[time]          compile    0.093ms   <- the app only
-[time]              run    0.041ms
+[time]            parse    0.068ms   <- the user's four lines
+[time] builtin bytecode    0.126ms   <- 99 chunks materialised, not compiled
+[time]    builtin::load    0.153ms   <- the line above is INSIDE this one; the tables
+[time]                                  are the 0.027ms difference
+[time]       type check    0.096ms   <- including Dict's 36 signatures, read on demand
+[time]          compile    0.100ms   <- the app only
+[time]              run    0.052ms
 ```
+
+(`builtin bytecode` nests inside `builtin::load`: the ticks are deltas and the inner one
+has its own clock. Adding them would double-count.)
 
 **0.46ms in process, against 3.5ms when this document was rewritten.** Nothing left is a
 re-derivation: the two largest numbers are materialising bytecode that cannot be shared
