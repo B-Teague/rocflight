@@ -644,6 +644,13 @@ impl NominalShape {
     }
 }
 
+/// Could `value` be the nominal that owns `qualified`? A shape that is not known
+/// admits anything, so this only ever rules a method OUT.
+fn admits_receiver(program: &Program, qualified: &str, value: &Value) -> bool {
+    let owner = qualified.split('.').next().unwrap_or(qualified);
+    program.nominal_shapes.get(owner).is_none_or(|shape| shape.admits(value))
+}
+
 /// The shape of a type, for `NominalShape`.
 pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
     use crate::types::Type;
@@ -1473,7 +1480,15 @@ impl Vm {
                         // time. If exactly one type defines the method, that is the one
                         // meant; if several do, only the checker could have known.
                         None => match program.methods_by_name.get(method) {
-                            Some(defined) if defined.len() == 1 => Some(defined[0].1),
+                            // ... unless the value's SHAPE rules that one out. A record
+                            // matches the pattern `Ok(_)` at run time, so a lone
+                            // `Try.is_eq` answered `==` on a record by calling ITSELF on
+                            // the same record a million frames deep before failing —
+                            // 130ms per comparison, thrown away for the structural answer.
+                            Some(defined) if defined.len() == 1 => {
+                                admits_receiver(&program, defined[0].0, &regs[base + b as usize])
+                                    .then_some(defined[0].1)
+                            }
                             // Several types define it. The value's SHAPE can still say
                             // which nominal it is — `Key.{ value: n }` is a record of
                             // exactly `Key`'s fields — so the candidates whose nominal
