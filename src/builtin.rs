@@ -112,7 +112,7 @@ pub fn read() -> Vec<Read> {
                         Ok(ast) => {
                             read.defined = definitions(&ast);
                             read.intrinsics =
-                                parser.intrinsics().iter().map(|(name, _)| *name).collect();
+                                parser.intrinsics().to_vec();
                         }
                     }
                 }
@@ -194,13 +194,14 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
         let desugared = Desugarer::new(member.source)
             .desugar()
             .map_err(|e| format!("builtin `{}`: {}", name, e))?;
+        crate::tick(format_args!("  {} DESUGAR", name), &mut step);
         let mut parser = Parser::new(&desugared);
         let ast = parser.parse_expr().map_err(|e| format!("builtin `{}`: {}", name, e))?;
         crate::tick(format_args!("  {} parse", name), &mut step);
         let intrinsics = parser
             .intrinsics()
             .iter()
-            .map(|(name, _)| *name)
+            .copied()
             .filter(|name| !name.contains('.'))
             .collect();
         let signatures = parser.signatures().to_vec();

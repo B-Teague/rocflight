@@ -66,7 +66,8 @@ pub struct Parser {
     /// `LowLevel` op, and rocflight has to supply each one from Rust. They fall out of
     /// the annotation bookkeeping for free — an annotation a binding claims is a
     /// definition, and whatever is left over when the block closes is an intrinsic.
-    intrinsics: Vec<(&'static str, Type)>,
+    /// Names only: nothing reads an intrinsic's declared type, `signatures` does.
+    intrinsics: Vec<&'static str>,
     /// EVERY method-block annotation, `Type.method` to its declared type, whether or
     /// not a body claimed it. This is the type table `Builtin.roc` is really for: the
     /// signatures are already written, module-qualified and arity-correct, so the
@@ -572,10 +573,16 @@ impl Parser {
         // The last segment is the name: nested nominals are registered flat, so
         // `Str :: […].{ Utf8Problem := […] }` puts `Utf8Problem` in scope, not
         // `Str.Utf8Problem`.
-        let qualified: String = rest
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
-            .collect();
+        // A WINDOW, not a `String`. Every type atom took this path and allocated its
+        // own name on the heap just to ask whether it contains a dot — and `Builtin.roc`
+        // is a file of annotations, each with several atoms in it. Nothing below needs
+        // it owned: `contains`, `starts_with`, `ends_with`, `rsplit` and `len` all read
+        // a borrowed slice.
+        let end = rest
+            .char_indices()
+            .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '.'))
+            .map_or(rest.len(), |(i, _)| i);
+        let qualified: &str = &rest[..end];
         let name = if qualified.contains('.')
             && qualified.starts_with(char::is_uppercase)
             && !qualified.ends_with('.')
@@ -657,7 +664,7 @@ impl Parser {
         // then that record — with its `next` field and method block — is what the
         // annotation means, not a list.
         if !(name == "Iter" && self.nominal("Iter").is_some()) {
-            if let Some(builtin) = builtin_type(name, args.clone(), || Type::TypeVar(u32::MAX)) {
+            if let Some(builtin) = builtin_type(name, &mut args, || Type::TypeVar(u32::MAX)) {
                 return Ok(builtin);
             }
         }
@@ -1403,16 +1410,16 @@ impl Parser {
             // Claimed before parsing the value: `skip_trivia` above already read the
             // annotation line into `pending_annotations`.
             let annotation = self.claim_annotation(method);
+            // ONE `Type.method` string: it was built, formatted and leaked twice, once
+            // for the signature and once for the method, and they are the same text.
+            let qualified: &'static str =
+                Box::leak(format!("{}.{}", type_name, method).into_boxed_str());
             if let Some(ty) = &annotation {
-                let qualified: &'static str =
-                    Box::leak(format!("{}.{}", type_name, method).into_boxed_str());
                 self.signatures.push((qualified, ty.clone()));
             }
 
             match self.parse_or_expr() {
                 Ok(value) => {
-                    let qualified: &'static str =
-                        Box::leak(format!("{}.{}", type_name, method).into_boxed_str());
                     if self.block_depth > 0 {
                         self.local_methods.push((self.block_depth, qualified, annotation, value));
                     } else {
@@ -1440,13 +1447,17 @@ impl Parser {
             } else {
                 Box::leak(format!("{}.{}", type_name, name).into_boxed_str())
             };
-            self.signatures.push((qualified, ty.clone()));
-            self.intrinsics.push((qualified, ty));
+            // The type goes to `signatures`, which is the only place anything reads
+            // it. `intrinsics` is a list of NAMES — every reader takes `.0` and throws
+            // the type away — so it used to cost a deep `Type` clone apiece, and the
+            // low-level section is 454 lines of nothing else.
+            self.intrinsics.push(qualified);
+            self.signatures.push((qualified, ty));
         }
     }
 
     /// Members declared with a type but no body: what Rust has to supply.
-    pub fn intrinsics(&self) -> &[(&'static str, Type)] {
+    pub fn intrinsics(&self) -> &[&'static str] {
         &self.intrinsics
     }
 
@@ -1462,7 +1473,7 @@ impl Parser {
             s.borrow()
                 .iter()
                 .filter_map(|(id, name)| {
-                    Some((*id, builtin_type(name, Vec::new(), || Type::TypeVar(u32::MAX))?))
+                    Some((*id, builtin_type(name, &mut Vec::new(), || Type::TypeVar(u32::MAX))?))
                 })
                 .collect()
         })
@@ -1627,11 +1638,16 @@ impl Parser {
         // The clause may sit on the signature's own line or on the next one.
         // A window, not a copy. This used to `collect()` 400 chars into a `String` for
         // every annotation line in the file, and `Builtin.roc` is mostly annotations.
+        //
+        // The window is THIS LINE AND THE NEXT, which is what the sentence above says a
+        // clause may occupy. It was "the next 400 characters", and finding where 400
+        // characters end means decoding 400 characters — on every annotation, to look
+        // for something almost none of them have. That one `char_indices().nth(400)`
+        // was **15.8%** of the time to parse a file of annotations, and `Builtin.roc`
+        // is a file of annotations. Two `find('\n')` instead, which are memchr.
         let region = &self.input[self.pos..];
-        let window = region
-            .char_indices()
-            .nth(400)
-            .map_or(region.len(), |(at, _)| at);
+        let first = region.find('\n').map_or(region.len(), |i| i + 1);
+        let window = region[first..].find('\n').map_or(region.len(), |i| first + i);
         let clause_region = &region[..window];
         let promised: Vec<String> = match clause_region.find("where [").map(|i| {
             let tail = &clause_region[i..];
@@ -5836,8 +5852,12 @@ fn substitute_type_vars(ty: &Type, pairs: &[(u32, Type)]) -> Type {
 }
 
 fn named_type(name: &str, args: Vec<Type>, fresh: impl FnMut() -> Type) -> Type {
-    let name_owned = name.to_string();
-    builtin_type(name, args, fresh).unwrap_or(
+    let mut args = args;
+    // `unwrap_or_ELSE`: the fallback was built eagerly, so every type atom in the file
+    // allocated a `String` for its name and a `Box` for a placeholder backing, and then
+    // threw both away the moment `builtin_type` answered — which for `I64`, `Str`,
+    // `List` and friends is every time.
+    builtin_type(name, &mut args, fresh).unwrap_or_else(||
         // Every other name is a TYPE, not an unknown: a user's own nominal has already
         // been resolved by its declaration before this is reached. Answering a fresh
         // variable threw the name away, which is what left `fruit_dict : Dict(Str, U64)`
@@ -5846,12 +5866,19 @@ fn named_type(name: &str, args: Vec<Type>, fresh: impl FnMut() -> Type) -> Type 
         // ponytail: the arguments are dropped — `Dict(Str, U64)` and `Dict(I64, Bool)`
         // are the same type here. The NAME is what dispatch needs; carrying the
         // arguments needs a parameterised type, and nothing yet asks for one.
-        Type::Nominal { name: name_owned, backing: Box::new(Type::TypeVar(u32::MAX)) },
+        Type::Nominal { name: name.to_string(), backing: Box::new(Type::TypeVar(u32::MAX)) },
     )
 }
 
 /// The types Roc names and rocflight models directly. `None` for anything else.
-fn builtin_type(name: &str, args: Vec<Type>, mut fresh: impl FnMut() -> Type) -> Option<Type> {
+/// `args` is borrowed and only emptied when a builtin actually MATCHES.
+///
+/// It used to be taken by value, so the one caller cloned — deep-copying every argument
+/// type, `String` field names and all, for every type atom in every annotation, and
+/// throwing the copy away whenever the name was not a builtin. A file of annotations is
+/// what `Builtin.roc` is: `Try(List(U64), [Bad(Str)])` cost 38 heap allocations and
+/// this was most of them.
+fn builtin_type(name: &str, args: &mut Vec<Type>, mut fresh: impl FnMut() -> Type) -> Option<Type> {
     let _ = &mut fresh;
     Some(match (name, args.len()) {
         ("Str", 0) => Type::Str,
@@ -5869,26 +5896,26 @@ fn builtin_type(name: &str, args: Vec<Type>, mut fresh: impl FnMut() -> Type) ->
         ("F32", 0) => Type::F32,
         ("F64", 0) => Type::F64,
         ("Dec", 0) => Type::Dec,
-        ("List", 1) => Type::List(Box::new(args.into_iter().next().expect("arity 1"))),
+        ("List", 1) => Type::List(Box::new(args.pop().expect("arity 1"))),
         // A boxed value is the value here — `Box.box` and `Box.unbox` are the identity
         // at run time — so `Box(I64 -> I64)` types as the function it holds.
-        ("Box", 1) => args.into_iter().next().expect("arity 1"),
+        ("Box", 1) => args.pop().expect("arity 1"),
         // An iterator is walked with the List methods, so it IS the list it behaves
         // like here. As a nameless nominal its element was dropped, and a lambda
         // handed to `.iter().map(..)` was checked against nothing — `x * 2` never
         // learnt it was an I64 and printed `4.0`.
-        ("Iter", 1) => Type::List(Box::new(args.into_iter().next().expect("arity 1"))),
+        ("Iter", 1) => Type::List(Box::new(args.pop().expect("arity 1"))),
         // `Range(num)` over a third-party numeric type keeps its element in the backing,
         // so `range : Range(Distance)` pins the numbers inside a `Range.custom` config
         // to `Distance`. rocflight's own integer ranges never write the name.
         ("Range", 1) => Type::Nominal {
             name: "Range".to_string(),
-            backing: Box::new(args.into_iter().next().expect("arity 1")),
+            backing: Box::new(args.pop().expect("arity 1")),
         },
         ("Try", 2) => {
-            let mut it = args.into_iter();
-            let ok = it.next().expect("arity 2");
-            let err = it.next().expect("arity 2");
+            // `pop` takes from the END, so the error type comes off first.
+            let err = args.pop().expect("arity 2");
+            let ok = args.pop().expect("arity 2");
             // Sorted by tag name, like every other union.
             Type::TagUnion {
                 tags: vec![("Err".to_string(), vec![err]), ("Ok".to_string(), vec![ok])],
