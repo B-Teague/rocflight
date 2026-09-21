@@ -132,6 +132,9 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // the module is part of the interpreter, so asking for a different set of it would
     // only be a way to run a program against a runtime that is not the real one.
     let builtins = crate::builtin::load(&needed)?;
+    // The checker will ask for these modules' declared types; `load` has just parsed
+    // them with more context than a re-parse would have. See `seed_signatures`.
+    crate::builtin::seed_signatures(&builtins);
 
     crate::tick("builtin::load", &mut phase);
     // Step 2c: Local modules — `import Hello exposing [hello]`.

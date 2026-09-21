@@ -275,6 +275,20 @@ const TYPED_MEMBERS: &[&str] = &["Dict", "Set", "Str", "List"];
 /// The module name is the member name here, which holds for everything in
 /// `TYPED_MEMBERS`. It does not in general — `Json` lives in `Encoding` and `Try` in
 /// `Box` — so widening that list means indexing modules to members first.
+type SignatureTable =
+    std::collections::HashMap<String, &'static [(&'static str, crate::types::Type)]>;
+static CACHE: std::sync::OnceLock<std::sync::Mutex<SignatureTable>> = std::sync::OnceLock::new();
+
+/// Remember a module's signatures, if nothing has answered for it yet.
+fn cache_signatures(module: &str, table: &'static [(&'static str, crate::types::Type)]) {
+    CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .expect("signature cache")
+        .entry(module.to_string())
+        .or_insert(table);
+}
+
 pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Type)] {
     // Checked before the cache, because the checker asks this of EVERY qualified name
     // it meets and most of them are not a member at all. Taking a lock to be told so
@@ -282,8 +296,6 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     if !TYPED_MEMBERS.contains(&module) {
         return &[];
     }
-    type Table = std::collections::HashMap<String, &'static [(&'static str, crate::types::Type)]>;
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Table>> = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
 
     if let Some(found) = cache.lock().expect("signature cache").get(module) {
@@ -296,8 +308,39 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     let parsed: &'static [(&'static str, crate::types::Type)] =
         Box::leak(parse_signatures(module));
     crate::tick(format_args!("signatures_for({})", module), &mut step);
-    cache.lock().expect("signature cache").insert(module.to_string(), parsed);
+    cache_signatures(module, parsed);
     parsed
+}
+
+/// Hand `signatures_for` what `load` has already parsed, so it does not parse it again.
+///
+/// `signatures_for` re-parses a member's annotation lines to answer the checker, and on
+/// a `Dict` program that is 0.35ms of a 3.1ms run — a second parse of a member `load`
+/// parsed moments earlier. `load` sees strictly MORE than the re-parse does: the whole
+/// member, with its own declarations in scope.
+///
+/// Strictly more for every member but one. `Set(item) :: Dict(item, {})`, and `load`
+/// gives each member its own `Parser`, so `Set`'s `Dict` is an unparameterised
+/// placeholder and `item` is dropped — `Set.from_list([...U64]).to_list()` came back a
+/// list of unconstrained numbers when that was got wrong. That is exactly why
+/// `parse_signatures` prepends `Dict`'s annotations for `Set`, so `Set` is left to it
+/// and everything else is taken from here.
+///
+/// Seeding only, never overwriting: whatever asked first wins, as it did before.
+pub fn seed_signatures(loaded: &[Loaded]) {
+    for member in loaded {
+        if member.name == "Set" || !TYPED_MEMBERS.contains(&member.name) {
+            continue;
+        }
+        let prefix = format!("{}.", member.name);
+        let table: Box<[(&'static str, crate::types::Type)]> = member
+            .signatures
+            .iter()
+            .filter(|(name, _)| name.starts_with(&prefix))
+            .map(|(name, ty)| (*name, normalise(ty)))
+            .collect();
+        cache_signatures(member.name, Box::leak(table));
+    }
 }
 
 fn parse_signatures(module: &str) -> Box<[(&'static str, crate::types::Type)]> {
@@ -477,6 +520,13 @@ pub fn needed_by(source: &str) -> Vec<&'static str> {
     let mut wanted = Vec::new();
     // `Dict` and `Set` are inseparable — `Set(item) :: Dict(item, {})` — and both are
     // built out of the low-level section.
+    //
+    // Loading `Set` only when the source names it was tried, for the 0.35ms it costs a
+    // `Dict` program, and REVERTED: it reads 1949 of 1953, failing the four
+    // `issue 9725: … as a Dict key round-trips` tests. `Dict`'s own source never writes
+    // the word `Set`, so the coupling is not textual — a structural key reaches `Set`'s
+    // declarations some other way. Whatever that way is has to be understood before
+    // this is narrowed, and understanding it is worth more than the 0.35ms.
     if source.contains("Dict") || source.contains("Set") {
         wanted.extend(["(low level)", "Dict", "Set"]);
     }
