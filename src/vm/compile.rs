@@ -344,28 +344,29 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
             .collect(),
         states: Vec::new(),
         node: ast.id(),
-        integer_binops: unit.integer_binops.clone(),
-        dispatch_modules: unit.dispatch_modules.clone(),
-        binop_modules: unit.binop_modules.clone(),
-        dec_literals: unit.dec_literals.clone(),
-        f32_literals: unit.f32_literals.clone(),
-        u128_literals: unit.u128_literals.clone(),
-        conversions: unit.conversions.clone(),
-        numeral_texts: unit.numeral_texts.clone(),
+        integer_binops: &unit.integer_binops,
+        dispatch_modules: &unit.dispatch_modules,
+        binop_modules: &unit.binop_modules,
+        dec_literals: &unit.dec_literals,
+        f32_literals: &unit.f32_literals,
+        u128_literals: &unit.u128_literals,
+        conversions: &unit.conversions,
+        numeral_texts: &unit.numeral_texts,
         coerce_values: unit.coerce_values.clone(),
-        coerce_params: unit.coerce_params.clone(),
+        coerce_params: &unit.coerce_params,
         zero_sized_capacity: unit.zero_sized_capacity.clone(),
-        match_types: unit.match_types.clone(),
-        default_sites: unit.default_sites.clone(),
-        nominal_defaults: unit.nominal_defaults.clone(),
+        match_types: &unit.match_types,
+        default_sites: &unit.default_sites,
+        nominal_defaults: &unit.nominal_defaults,
         nominal_records: unit
             .nominals
             .iter()
             .filter_map(|(name, backing)| {
-                let fields = match backing {
-                    crate::types::Type::Record { fields, .. } => Some(fields.clone()),
+                // A SLICE of the unit's own type, not a copy of its fields.
+                let fields: &[(&'static str, crate::types::Type)] = match backing {
+                    crate::types::Type::Record { fields, .. } => Some(fields.as_slice()),
                     crate::types::Type::Nominal { backing, .. } => match &**backing {
-                        crate::types::Type::Record { fields, .. } => Some(fields.clone()),
+                        crate::types::Type::Record { fields, .. } => Some(fields.as_slice()),
                         _ => None,
                     },
                     _ => None,
@@ -375,13 +376,13 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
             .collect(),
         pending_coerce: None,
         literal_coercions: Vec::new(),
-        missing_fields: unit.missing_fields.clone(),
-        fractional_literals: unit.fractional_literals.clone(),
-        parse_targets: unit.parse_targets.clone(),
-        collect_targets: unit.collect_targets.clone(),
+        missing_fields: &unit.missing_fields,
+        fractional_literals: &unit.fractional_literals,
+        parse_targets: &unit.parse_targets,
+        collect_targets: &unit.collect_targets,
         capture_free_methods: Vec::new(),
         global_owner: None,
-        intrinsics: unit.intrinsics.clone(),
+        intrinsics: &unit.intrinsics,
     };
 
     for (name, value) in &bindings {
@@ -622,48 +623,49 @@ struct Local {
     boxed: bool,
 }
 
-struct Compiler {
+struct Compiler<'u> {
     tops: Tops,
     chunks: Vec<Option<Chunk>>,
     states: Vec<FnState>,
     /// The node being compiled, stamped onto every instruction it emits.
     node: crate::ast::NodeId,
     /// Which `BinOp` nodes may use the integer-only opcode.
-    integer_binops: std::collections::HashSet<crate::ast::NodeId>,
+    integer_binops: &'u std::collections::HashSet<crate::ast::NodeId>,
     /// See `Unit::f32_literals`.
-    f32_literals: std::collections::HashSet<crate::ast::NodeId>,
-    u128_literals: std::collections::HashSet<crate::ast::NodeId>,
+    f32_literals: &'u std::collections::HashSet<crate::ast::NodeId>,
+    u128_literals: &'u std::collections::HashSet<crate::ast::NodeId>,
     /// See `Unit::conversions` and the fields after it.
-    conversions: std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)>,
-    numeral_texts: std::collections::HashMap<crate::ast::NodeId, String>,
+    conversions: &'u std::collections::HashMap<crate::ast::NodeId, (&'static str, &'static str)>,
+    numeral_texts: &'u std::collections::HashMap<crate::ast::NodeId, String>,
     coerce_values: std::collections::HashMap<crate::ast::NodeId, &'static str>,
-    coerce_params: std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>>,
+    coerce_params: &'u std::collections::HashMap<crate::ast::NodeId, Vec<(usize, &'static str)>>,
     zero_sized_capacity: std::collections::HashSet<crate::ast::NodeId>,
-    match_types: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
-    default_sites: std::collections::HashMap<crate::ast::NodeId, &'static str>,
-    nominal_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)>,
+    match_types: &'u std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    default_sites: &'u std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    nominal_defaults: &'u Vec<(String, Vec<(String, crate::ast::Expr)>)>,
     /// Each default-site nominal's backing fields, so the compiler knows which omitted
     /// fields are optional (fill `<missing>`) versus defaulted (fill the default).
-    nominal_records: std::collections::HashMap<&'static str, Vec<(&'static str, crate::types::Type)>>,
+    nominal_records:
+        std::collections::HashMap<&'static str, &'u [(&'static str, crate::types::Type)]>,
     /// The parameter conversions of the lambda about to be compiled; `function` takes
     /// them.
     pending_coerce: Option<Vec<(usize, &'static str)>>,
     /// See `Program::literal_coercions`.
     literal_coercions: Vec<(&'static str, Value)>,
     /// See `Unit::missing_fields`.
-    missing_fields: std::collections::HashMap<crate::ast::NodeId, Vec<&'static str>>,
+    missing_fields: &'u std::collections::HashMap<crate::ast::NodeId, Vec<&'static str>>,
     /// See `Unit::dispatch_modules`.
-    dispatch_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    dispatch_modules: &'u std::collections::HashMap<crate::ast::NodeId, &'static str>,
     /// See `Unit::binop_modules`.
-    binop_modules: std::collections::HashMap<crate::ast::NodeId, &'static str>,
+    binop_modules: &'u std::collections::HashMap<crate::ast::NodeId, &'static str>,
     /// See `Unit::dec_literals`.
-    dec_literals: std::collections::HashSet<crate::ast::NodeId>,
+    dec_literals: &'u std::collections::HashSet<crate::ast::NodeId>,
     /// See `Unit::fractional_literals`.
-    fractional_literals: std::collections::HashSet<crate::ast::NodeId>,
+    fractional_literals: &'u std::collections::HashSet<crate::ast::NodeId>,
     /// See `Unit::parse_targets`.
-    parse_targets: std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
+    parse_targets: &'u std::collections::HashMap<crate::ast::NodeId, crate::types::Type>,
     /// See `Unit::collect_targets`.
-    collect_targets: std::collections::HashMap<crate::ast::NodeId, String>,
+    collect_targets: &'u std::collections::HashMap<crate::ast::NodeId, String>,
     /// Block-local nominal methods that captured nothing, added to the runtime
     /// dispatch tables. See `closure`.
     capture_free_methods: Vec<(&'static str, ChunkId)>,
@@ -672,7 +674,7 @@ struct Compiler {
     /// block-local one. See `enclosing_type`.
     global_owner: Option<&'static str>,
     /// Bare low-level names the builtin module declares; see `Unit::intrinsics`.
-    intrinsics: std::collections::HashSet<&'static str>,
+    intrinsics: &'u std::collections::HashSet<&'static str>,
 }
 
 /// Does this instruction move control, or leave the block?
@@ -778,7 +780,7 @@ struct Spares {
     slot: Reg,
 }
 
-impl Compiler {
+impl<'u> Compiler<'u> {
     /// The function being compiled.
     fn st(&mut self) -> &mut FnState {
         self.states.last_mut().expect("a function is always being compiled")
@@ -3005,7 +3007,8 @@ impl Compiler {
     /// the parser could not tell the type at the literal.
     fn build_defaulted_record(&mut self, nominal: &'static str, written: &[(&'static str, Expr)]) -> Result<Reg, String> {
         let defaults = self.nominal_defaults.iter().find(|(n, _)| n == nominal).map(|(_, d)| d.clone()).unwrap_or_default();
-        let all_fields = self.nominal_records.get(nominal).cloned().unwrap_or_default();
+        let all_fields: &[(&'static str, crate::types::Type)] =
+            self.nominal_records.get(nominal).copied().unwrap_or(&[]);
         // Collect the pieces: (field_name, source) where source is a written expr, a
         // default expr, or `<missing>`.
         enum Src<'a> { Expr(&'a Expr), Default(Expr), Missing }
@@ -3013,11 +3016,12 @@ impl Compiler {
         for (name, value) in written {
             pieces.push((*name, Src::Expr(value)));
         }
-        for (field, ty) in &all_fields {
+        for (field, ty) in all_fields {
             if written.iter().any(|(w, _)| w == field) {
                 continue;
             }
-            let field_name = crate::memory::string_pool::intern(field);
+            // Already interned — it came out of the unit's own type.
+            let field_name: &'static str = field;
             if let Some((_, default)) = defaults.iter().find(|(f, _)| f == field) {
                 pieces.push((field_name, Src::Default(default.clone())));
             } else if matches!(ty, crate::types::Type::Optional(_)) {

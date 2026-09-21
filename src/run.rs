@@ -300,7 +300,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
             let text = std::fs::read_to_string(source_dir.join(path))
                 .map_err(|e| format!("cannot ingest `{}`: {}", path, e))?;
             Ok::<_, String>((
-                &*Box::leak(name.clone().into_boxed_str()) as &'static str,
+                crate::memory::string_pool::intern(name),
                 text,
             ))
         })
@@ -336,10 +336,12 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
             .chain(module_asts.iter().map(|(module_ast, type_name, exposed)| {
                 crate::vm::compile::Module {
                     ast: module_ast,
-                    type_name: Box::leak(type_name.clone().into_boxed_str()),
+                    // Through the pool, not `Box::leak`: a name that appears twice is
+                    // one allocation, and a module imported twice leaks nothing.
+                    type_name: crate::memory::string_pool::intern(type_name),
                     exposed: exposed
                         .iter()
-                        .map(|name| &*Box::leak(name.clone().into_boxed_str()) as &'static str)
+                        .map(|name| crate::memory::string_pool::intern(name))
                         .collect(),
                 }
             }))
