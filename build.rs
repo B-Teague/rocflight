@@ -217,24 +217,31 @@ fn check_artifact(source: &str) {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100_0000_01b3);
     }
+    let fresh = |why: &str| {
+        // A placeholder is SAFE: `load` reads it as "no members" and falls back to
+        // parsing. So a missing artifact, or one from an older FORMAT, is a warning and
+        // a rebuild away — where a HASH mismatch below is a hard error, because that is
+        // the case where the trees no longer describe the source.
+        let mut empty = Vec::from(*b"ROCFLT03");
+        empty.extend_from_slice(&hash.to_le_bytes());
+        empty.extend_from_slice(&0u32.to_le_bytes());
+        empty.push(0);
+        empty.push(0);
+        std::fs::write(path, empty).expect("writing the placeholder artifact");
+        println!("cargo:warning={}; run `cargo run --release --bin gen-artifact`", why);
+    };
     let blob = match std::fs::read(path) {
         Ok(blob) => blob,
         Err(_) => {
-            // First build in a fresh tree: leave an empty one, which `load` reads as
-            // "no members" and falls back to parsing. Correct, just slower.
-            let mut empty = Vec::from(*b"ROCFLT02");
-            empty.extend_from_slice(&hash.to_le_bytes());
-            empty.extend_from_slice(&0u32.to_le_bytes());
-            empty.push(0);
-            std::fs::write(path, empty).expect("writing the placeholder artifact");
-            println!("cargo:warning=no builtin artifact; run `cargo run --release --bin gen-artifact`");
+            fresh("no builtin artifact");
             return;
         }
     };
-    let stale = blob.len() < 16
-        || &blob[..8] != b"ROCFLT02"
-        || u64::from_le_bytes(blob[8..16].try_into().expect("16 bytes")) != hash;
-    if stale {
+    if blob.len() < 16 || &blob[..8] != b"ROCFLT03" {
+        fresh("the builtin artifact is from an older format");
+        return;
+    }
+    if u64::from_le_bytes(blob[8..16].try_into().expect("16 bytes")) != hash {
         panic!(
             "src/roc/Builtin.artifact is stale (or from another format version).\n\
              Regenerate it:  cargo run --release --bin gen-artifact"

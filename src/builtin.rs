@@ -15,6 +15,7 @@
 //! real compiler honours — `canonicalize/BuiltinLowLevel.zig` rewrites exactly the
 //! annotation-only members into lambdas running a `LowLevel` op.
 
+use crate::ast::Expr;
 use crate::desugaring::Desugarer;
 use crate::parser::Parser;
 
@@ -228,6 +229,64 @@ pub fn parse_members(selected: &[&str]) -> Result<Vec<(Loaded, u32, Vec<u32>)>, 
     parse_from_source(selected)
 }
 
+/// The compiled builtins for this selection, if the artifact carries them.
+///
+/// When it does, nothing needs the builtin TREES: their bytecode is already made, and
+/// the checker wants only the tables. See `artifact::Prefix`.
+pub fn compiled_prefix(selected: &[&str]) -> Option<crate::artifact::Prefix> {
+    if selected.is_empty() {
+        return None;
+    }
+    let artifact = artifact()?;
+    let key = prefix_key(selected);
+    artifact.has_prefix(&key).then(|| artifact.prefix(&key))?
+}
+
+/// A selection names one compiled prefix, whatever order it arrived in.
+pub fn prefix_key(selected: &[&str]) -> String {
+    let mut key = String::new();
+    for member in ["(low level)", "Box", "Dict", "Set", "Stream"] {
+        if selected.contains(&member) {
+            if !key.is_empty() {
+                key.push('|');
+            }
+            key.push_str(member);
+        }
+    }
+    key
+}
+
+/// The members' TABLES — declared types and intrinsic names — without their trees.
+///
+/// What the checker needs when `compiled_prefix` answered, which is every run that has
+/// an artifact. Decoding the trees as well is 0.33ms on a `Dict` program spent on
+/// something nothing will read.
+pub fn load_tables(selected: &[&str]) -> Option<Vec<Loaded>> {
+    let artifact = artifact()?;
+    let mut out = Vec::with_capacity(selected.len());
+    for name in selected {
+        let member = artifact.member_tables(&artifact_key(name, selected))?;
+        out.push(Loaded {
+            name: interned_member_name(name),
+            ast: Expr::Unit(crate::ast::fresh_node_unlocated()),
+            intrinsics: member.intrinsics,
+            signatures: member.signatures,
+            nominals: member.nominals,
+        });
+    }
+    Some(out)
+}
+
+/// `load`, but always from SOURCE.
+///
+/// What `gen-artifact` uses. Reading the artifact while writing one would generate the
+/// next artifact from the last, which is both circular and not reproducible: the trees
+/// come back with their nodes already installed, so the node ids differ and the bytes
+/// do — `tests/check_artifact.sh` caught exactly that.
+pub fn load_from_source(selected: &[&str]) -> Result<Vec<Loaded>, String> {
+    Ok(parse_from_source(selected)?.into_iter().map(|(loaded, _, _)| loaded).collect())
+}
+
 pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
     // Loading nothing must touch nothing: `SOURCE` is 700kB of the binary, and merely
     // scanning it faults those pages in on every run of every program.
@@ -249,7 +308,7 @@ pub fn load(selected: &[&str]) -> Result<Vec<Loaded>, String> {
                 loaded.push(Loaded {
                     // The KEY names the cut-down; the member keeps its own name.
                     name: interned_member_name(name),
-                    ast: member.ast,
+                    ast: member.ast.expect("`member` always decodes the tree"),
                     intrinsics: member.intrinsics,
                     signatures: member.signatures,
                     nominals: member.nominals,

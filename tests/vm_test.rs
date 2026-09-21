@@ -723,6 +723,7 @@ fn a_top_level_expect_only_runs_under_test_mode() {
     // `roc test` runs it, and that is where the same program fails.
     let ast = parse("expect 1\n\n42");
     let unit = |test_mode| vm::compile::Unit {
+        prefix_modules: 0,
         modules: Vec::new(),
         app: &ast,
         entry: None,
@@ -790,6 +791,7 @@ fn a_module_is_compiled_into_the_same_program() {
     let module = parse("Hello :: {}.{\n\thello = |name| \"Hello ${name}\"\n}\n\n{}");
     let app = parse("hello(\"World\")");
     let unit = vm::compile::Unit {
+        prefix_modules: 0,
         modules: vec![vm::compile::Module {
             ast: &module,
             type_name: "Hello",
@@ -828,6 +830,7 @@ fn a_module_is_compiled_into_the_same_program() {
 
     // A name the module did not expose is not in scope bare.
     let unit = vm::compile::Unit {
+        prefix_modules: 0,
         modules: vec![vm::compile::Module {
             ast: &module,
             type_name: "Hello",
@@ -868,6 +871,7 @@ fn a_module_is_compiled_into_the_same_program() {
 fn an_ingested_file_is_a_top_level_string() {
     let app = parse("text.trim()");
     let unit = vm::compile::Unit {
+        prefix_modules: 0,
         modules: Vec::new(),
         app: &app,
         entry: None,

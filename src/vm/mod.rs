@@ -470,6 +470,9 @@ pub struct Program {
     pub n_globals: usize,
     /// The chunk holding the top level itself.
     pub top: ChunkId,
+    /// The BUILTINS' top level, when they came in already compiled: it binds their
+    /// globals and must run before this program's own. See `artifact::Prefix`.
+    pub prelude: Option<ChunkId>,
     /// The app's entry point, if it declared one, and its arity.
     pub entry: Option<(ChunkId, u16)>,
     /// Top-level methods by `(module, method)` — `("Dict", "insert")`.
@@ -759,6 +762,10 @@ fn run_scoped<R>(
 impl Vm {
     fn run_program(&mut self) -> Result<Value, EvalError> {
         let (top, entry) = (self.program.top, self.program.entry);
+        // The builtins' own top level, binding their globals before anything reads one.
+        if let Some(prelude) = self.program.prelude {
+            self.call_chunk(prelude, Vec::new())?;
+        }
         let value = self.call_chunk(top, Vec::new())?;
         match entry {
             None => Ok(value),

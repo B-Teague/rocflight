@@ -22,7 +22,7 @@ use crate::types::Type;
 
 /// Bumped whenever the FORMAT changes, so an artifact from an older tree is rejected by
 /// `build.rs` rather than decoded as nonsense.
-pub const MAGIC: &[u8; 8] = b"ROCFLT02";
+pub const MAGIC: &[u8; 8] = b"ROCFLT03";
 
 /// FNV-1a of the source an artifact was built from. `build.rs` computes the same thing
 /// over `src/roc/Builtin.roc` and refuses to build if they differ.
@@ -51,6 +51,11 @@ impl Default for Writer {
 }
 
 impl Writer {
+    /// A bare count, for the section boundary the reader expects.
+    pub fn count(&mut self, n: usize) {
+        self.u(n as u64);
+    }
+
     fn u(&mut self, mut n: u64) {
         // LEB128: a length, a node id or a small tag is one byte almost always.
         while n >= 0x80 {
@@ -875,12 +880,321 @@ fn unreachable_tag(what: &str, tag: u8) -> ! {
     panic!("builtin artifact: {} has no variant {} — regenerate it", what, tag)
 }
 
+
+// ---------------------------------------------------------------- bytecode
+
+use crate::vm::{Chunk, Op};
+use crate::eval::Value;
+
+/// Reg, u16, u32 and u8 all go out as one varint; the rest have their own byte.
+macro_rules! put_scalar {
+    ($w:expr, r, $v:expr) => { $w.u(u64::from($v)) };
+    ($w:expr, u16, $v:expr) => { $w.u(u64::from($v)) };
+    ($w:expr, u32, $v:expr) => { $w.u(u64::from($v)) };
+    ($w:expr, u8, $v:expr) => { $w.u(u64::from($v)) };
+    ($w:expr, bool, $v:expr) => { $w.bool($v) };
+    ($w:expr, binop, $v:expr) => { $w.tag(binop_tag($v)) };
+    ($w:expr, cond, $v:expr) => { $w.tag(cond_tag($v)) };
+    ($w:expr, optchunk, $v:expr) => {
+        match $v {
+            None => $w.tag(0),
+            Some(id) => { $w.tag(1); $w.u(u64::from(id)); }
+        }
+    };
+}
+
+macro_rules! get_scalar {
+    ($r:expr, r) => { $r.u() as u16 };
+    ($r:expr, u16) => { $r.u() as u16 };
+    ($r:expr, u32) => { $r.u() as u32 };
+    ($r:expr, u8) => { $r.u() as u8 };
+    ($r:expr, bool) => { $r.bool() };
+    ($r:expr, binop) => { binop_of($r.tag()) };
+    ($r:expr, cond) => { cond_of($r.tag()) };
+    ($r:expr, optchunk) => { if $r.tag() == 0 { None } else { Some($r.u() as u32) } };
+}
+
+/// One table, both directions.
+///
+/// An opcode codec is exactly the place a writer and a reader drift apart, and a drift
+/// here decodes as a DIFFERENT PROGRAM rather than as an error. So neither is written
+/// by hand: this macro generates both from one list, and adding an `Op` variant without
+/// listing it is a non-exhaustive-match error.
+macro_rules! op_codec {
+    ($( $tag:literal $name:ident { $( $field:ident : $kind:ident, )* } , )*) => {
+        fn put_op(w: &mut Writer, op: &Op) {
+            match *op {
+                $( Op::$name { $( $field, )* } => {
+                    w.tag($tag);
+                    $( put_scalar!(w, $kind, $field); )*
+                } )*
+            }
+        }
+        fn get_op(r: &mut Reader) -> Op {
+            match r.tag() {
+                $( $tag => Op::$name { $( $field: get_scalar!(r, $kind), )* }, )*
+                other => unreachable_tag("Op", other),
+            }
+        }
+    };
+}
+
+op_codec! {
+    0 LoadK { dst: r, k: u32, },
+    1 Move { dst: r, src: r, },
+    2 MoveTake { dst: r, src: r, },
+    3 LoadGlob { dst: r, idx: u32, },
+    4 StoreGlob { idx: u32, src: r, },
+    5 LoadCap { dst: r, idx: u16, },
+    6 MakeCell { dst: r, src: r, },
+    7 CellGet { dst: r, cell: r, },
+    8 CellSet { cell: r, src: r, },
+    9 LoadSelf { dst: r, },
+    10 Bin { dst: r, a: r, b: r, op: binop, },
+    11 BinInt { dst: r, a: r, b: r, op: binop, width: u8, },
+    12 BinK { dst: r, a: r, k: u32, op: binop, },
+    13 BinIntK { dst: r, a: r, k: u32, op: binop, width: u8, },
+    14 Jump { to: u32, },
+    15 JumpFalse { cond: r, to: u32, kind: cond, },
+    16 MakeClosure { dst: r, chunk: u32, base: r, n: u16, },
+    17 CallFn { dst: r, chunk: u32, base: r, argc: u16, },
+    18 Call { dst: r, func: r, base: r, argc: u16, },
+    19 TailCall { func: r, chunk: optchunk, base: r, argc: u16, },
+    20 Ret { src: r, },
+    21 MakeList { dst: r, base: r, n: u16, },
+    22 MakeTuple { dst: r, base: r, n: u16, },
+    23 ListPush { list: r, src: r, },
+    24 MakeTag { dst: r, name: u16, base: r, n: u16, },
+    25 MakeRecord { dst: r, name: u16, base: r, n: u16, },
+    26 UpdateRecord { dst: r, obj: r, name: u16, base: r, n: u16, take: bool, },
+    27 GetField { dst: r, obj: r, name: u16, },
+    28 GetOptField { dst: r, obj: r, name: u16, },
+    29 GetIndex { dst: r, obj: r, i: u16, },
+    30 TestLit { obj: r, pat: u16, to: u32, },
+    31 TestLitDyn { obj: r, pat: u16, to: u32, },
+    32 TestStr { obj: r, pat: u16, base: r, to: u32, },
+    33 TestTag { obj: r, name: u16, n: u16, to: u32, },
+    34 TestTuple { obj: r, n: u16, to: u32, },
+    35 TestRecord { obj: r, to: u32, },
+    36 TestList { obj: r, n: u16, exact: bool, to: u32, },
+    37 TestBool { cond: r, want: bool, to: u32, },
+    38 NoMatch { obj: r, },
+    39 GetPayload { dst: r, obj: r, i: u16, },
+    40 GetFieldOr { dst: r, obj: r, name: u16, to: u32, },
+    41 GetRest { dst: r, obj: r, name: u16, n: u16, },
+    42 GetElem { dst: r, obj: r, i: u16, from_end: bool, },
+    43 GetSlice { dst: r, obj: r, front: u16, back: u16, },
+    44 MakeRange { dst: r, start: r, end: r, inclusive: bool, },
+    45 CallBuiltin { dst: r, name: u16, base: r, argc: u16, },
+    46 CallHost { dst: r, name: u16, base: r, argc: u16, },
+    47 MakeBuiltin { dst: r, name: u16, },
+    48 DispatchMethod { dst: r, name: u16, base: r, argc: u16, },
+    49 Interp { dst: r, name: u16, base: r, n: u16, },
+    50 BinDispatch { dst: r, a: r, b: r, op: binop, },
+    51 Expect { cond: r, },
+    52 TestExpect { cond: r, },
+    53 Dbg { src: r, },
+    54 Crash { src: r, },
+    55 IterNext { dst: r, iter: r, idx: r, to: u32, },
+    56 IterNextBack { dst: r, iter: r, idx: r, to: u32, },
+}
+
+fn binop_tag(op: crate::ast::BinOp) -> u8 {
+    use crate::ast::BinOp::*;
+    match op {
+        Add => 0, Sub => 1, Mul => 2, Div => 3, IntDiv => 4, Rem => 5, Eq => 6,
+        Ne => 7, Lt => 8, Le => 9, Gt => 10, Ge => 11, And => 12, Or => 13,
+    }
+}
+
+fn binop_of(t: u8) -> crate::ast::BinOp {
+    use crate::ast::BinOp::*;
+    match t {
+        0 => Add, 1 => Sub, 2 => Mul, 3 => Div, 4 => IntDiv, 5 => Rem, 6 => Eq,
+        7 => Ne, 8 => Lt, 9 => Le, 10 => Gt, 11 => Ge, 12 => And, 13 => Or,
+        other => unreachable_tag("BinOp", other),
+    }
+}
+
+fn cond_tag(k: crate::vm::CondKind) -> u8 {
+    use crate::vm::CondKind::*;
+    match k { If => 0, Guard => 1, While => 2, Operand => 3 }
+}
+
+fn cond_of(t: u8) -> crate::vm::CondKind {
+    use crate::vm::CondKind::*;
+    match t {
+        0 => If, 1 => Guard, 2 => While, 3 => Operand,
+        other => unreachable_tag("CondKind", other),
+    }
+}
+
+/// A chunk constant. Only these can be one: the compiler puts literals in `consts`, and
+/// a closure, an iterator or a cell is made at run time and cannot be written down.
+fn put_value(w: &mut Writer, v: &Value) {
+    match v {
+        Value::Unit => w.tag(0),
+        Value::Missing => w.tag(1),
+        Value::Bool(b) => { w.tag(2); w.bool(*b); }
+        Value::Int(n) => { w.tag(3); w.i128(*n); }
+        Value::Dec(n) => { w.tag(4); w.i128(*n); }
+        Value::U128(n) => { w.tag(5); w.i128(*n as i128); }
+        Value::Float(f) => { w.tag(6); w.f64(*f); }
+        Value::F32(f) => { w.tag(7); w.f64(f64::from(*f)); }
+        Value::Str(s) => { w.tag(8); w.s(s); }
+        Value::Builtin(name, arity) => { w.tag(9); w.s(name); w.u(*arity as u64); }
+        Value::List(items) => { w.tag(10); w.seq(items, |w, v| put_value(w, v)); }
+        Value::Tuple(items) => { w.tag(11); w.seq(items, |w, v| put_value(w, v)); }
+        Value::Record(fields) => {
+            w.tag(12);
+            w.seq(fields, |w, (n, v)| { w.s(n); put_value(w, v); });
+        }
+        Value::Tag(name, payload) => {
+            w.tag(13);
+            w.s(name);
+            w.seq(payload, |w, v| put_value(w, v));
+        }
+        Value::Range { start, end, inclusive, step } => {
+            w.tag(14);
+            w.i128(*start);
+            w.i128(*end);
+            w.bool(*inclusive);
+            w.i128(i128::from(*step));
+        }
+        Value::Simd { kind, bits } => { w.tag(15); w.u(u64::from(*kind)); w.i128(*bits as i128); }
+        other => panic!("a {:?} cannot be a chunk constant", other),
+    }
+}
+
+fn get_value(r: &mut Reader) -> Value {
+    match r.tag() {
+        0 => Value::Unit,
+        1 => Value::Missing,
+        2 => Value::Bool(r.bool()),
+        3 => Value::Int(r.i128()),
+        4 => Value::Dec(r.i128()),
+        5 => Value::U128(r.i128() as u128),
+        6 => Value::Float(r.f64()),
+        7 => Value::F32(r.f64() as f32),
+        8 => Value::Str(std::rc::Rc::from(r.s())),
+        9 => { let name = r.s(); Value::Builtin(name, r.u() as usize) }
+        10 => Value::list(r.seq(0, |r, _| get_value(r))),
+        11 => Value::tuple(r.seq(0, |r, _| get_value(r))),
+        12 => Value::record(r.seq(0, |r, _| (r.s(), get_value(r)))),
+        13 => { let name = r.s(); Value::tag(name, r.seq(0, |r, _| get_value(r))) }
+        14 => {
+            let start = r.i128();
+            let end = r.i128();
+            let inclusive = r.bool();
+            Value::Range { start, end, inclusive, step: r.i128() as i64 }
+        }
+        15 => { let kind = r.u() as u8; Value::Simd { kind, bits: r.i128() as u128 } }
+        other => unreachable_tag("Value", other),
+    }
+}
+
+fn put_shape(w: &mut Writer, shape: &crate::vm::NominalShape) {
+    use crate::vm::NominalShape as S;
+    match shape {
+        S::Unknown => w.tag(0),
+        S::Tuple(n) => { w.tag(1); w.u(*n as u64); }
+        S::Simd(k) => { w.tag(2); w.u(u64::from(*k)); }
+        S::Tags(names) => { w.tag(3); w.seq(names, |w, n| w.s(n)); }
+        S::Fields(fields) => {
+            w.tag(4);
+            w.seq(fields, |w, (n, kind)| { w.s(n); w.tag(field_kind_tag(*kind)); });
+        }
+    }
+}
+
+fn get_shape(r: &mut Reader) -> crate::vm::NominalShape {
+    use crate::vm::NominalShape as S;
+    match r.tag() {
+        0 => S::Unknown,
+        1 => S::Tuple(r.u() as usize),
+        2 => S::Simd(r.u() as u8),
+        3 => S::Tags(r.seq(0, |r, _| r.s().to_string())),
+        4 => S::Fields(r.seq(0, |r, _| (r.s().to_string(), field_kind_of(r.tag())))),
+        other => unreachable_tag("NominalShape", other),
+    }
+}
+
+fn field_kind_tag(k: crate::vm::FieldKind) -> u8 {
+    use crate::vm::FieldKind::*;
+    match k {
+        Any => 0, Int => 1, Float => 2, F32 => 3, Dec => 4, Str => 5,
+        Bool => 6, List => 7, Record => 8, Tag => 9, Tuple => 10,
+    }
+}
+
+fn field_kind_of(t: u8) -> crate::vm::FieldKind {
+    use crate::vm::FieldKind::*;
+    match t {
+        0 => Any, 1 => Int, 2 => Float, 3 => F32, 4 => Dec, 5 => Str,
+        6 => Bool, 7 => List, 8 => Record, 9 => Tag, 10 => Tuple,
+        other => unreachable_tag("FieldKind", other),
+    }
+}
+
+fn put_chunk(w: &mut Writer, chunk: &Chunk, node_base: u32, node_end: u32) {
+    w.s(chunk.name);
+    w.u(u64::from(chunk.n_regs));
+    w.u(u64::from(chunk.arity));
+    w.seq(&chunk.params, |w, p| w.s(p));
+    w.seq(&chunk.names, |w, n| w.s(n));
+    w.seq(&chunk.consts, |w, v| put_value(w, v));
+    w.seq(&chunk.pats, |w, p| put_pattern(w, p));
+    w.seq(&chunk.code, |w, op| put_op(w, op));
+    // Spans are node ids, rebased on load exactly as the AST's are — but not every one
+    // of them is a builtin's. A group's top level begins with the compiler pointing at
+    // the APP's node, and that node means nothing in a prefix reused by another
+    // program. Those are written as 0, "no location", which is the truth; everything
+    // else is `1 + offset`. Getting this wrong is invisible in release — the
+    // subtraction wraps and the span is quietly nonsense — and `tests/check_roc.sh` on
+    // the DEBUG build is what caught it.
+    w.seq(&chunk.spans, |w, id| {
+        let at = id.index() as u32;
+        if at < node_base || at >= node_end {
+            w.u(0);
+        } else {
+            w.u(u64::from(at - node_base) + 1);
+        }
+    });
+}
+
+fn get_chunk(r: &mut Reader, id: u32, node_base: u32) -> Chunk {
+    let name = r.s();
+    let n_regs = r.u() as u16;
+    let arity = r.u() as u16;
+    let params: std::rc::Rc<[&'static str]> = r.seq(0, |r, _| r.s()).into();
+    Chunk {
+        name,
+        n_regs,
+        arity,
+        bare: std::rc::Rc::new(crate::vm::Closure {
+            chunk: id,
+            params: std::rc::Rc::clone(&params),
+            captures: Vec::new(),
+        }),
+        params,
+        names: r.seq(0, |r, _| r.s()),
+        consts: r.seq(0, |r, _| get_value(r)),
+        pats: r.seq(0, |r, _| get_pattern(r)),
+        code: r.seq(0, |r, _| get_op(r)),
+        spans: r.seq(node_base, |r, base| match r.u() {
+            0 => crate::ast::fresh_node_unlocated(),
+            at => NodeId(base + at as u32 - 1),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------- members
 
 /// One member, as `builtin::load` wants it back.
 pub struct Member {
     pub name: &'static str,
-    pub ast: Expr,
+    /// `None` when read by `member_tables`, which does not decode the tree.
+    pub ast: Option<Expr>,
     pub intrinsics: Vec<&'static str>,
     pub signatures: Vec<(&'static str, Type)>,
     pub nominals: Vec<(&'static str, Type)>,
@@ -910,7 +1224,8 @@ pub fn put_member(
     for offset in offsets {
         w.u(u64::from(*offset));
     }
-    put_expr(w, ast, base);
+    // The TABLES first and the tree last: when the bytecode prefix is in play nothing
+    // needs the tree, and this is what lets `member_tables` stop before it.
     w.seq(intrinsics, |w, s| w.s(s));
     w.seq(signatures, |w, (n, t)| {
         w.s(n);
@@ -920,6 +1235,7 @@ pub fn put_member(
         w.s(n);
         put_type(w, t);
     });
+    put_expr(w, ast, base);
     let length = (w.out.len() - body_at) as u32;
     w.out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
 }
@@ -930,6 +1246,8 @@ pub struct Artifact {
     strings: Vec<&'static str>,
     /// Where each member's body starts, by name.
     members: Vec<(&'static str, usize)>,
+    /// Where each compiled prefix's body starts, by selection key.
+    prefixes: Vec<(&'static str, usize)>,
     blob: &'static [u8],
 }
 
@@ -969,7 +1287,16 @@ impl Artifact {
             members.push((name, r.at));
             r.at += length;
         }
-        Some(Artifact { strings, members, blob })
+        let n_prefixes = r.u() as usize;
+        let mut prefixes = Vec::with_capacity(n_prefixes);
+        for _ in 0..n_prefixes {
+            let key = r.s();
+            let length = u32::from_le_bytes(blob.get(r.at..r.at + 4)?.try_into().ok()?) as usize;
+            r.at += 4;
+            prefixes.push((key, r.at));
+            r.at += length;
+        }
+        Some(Artifact { strings, members, prefixes, blob })
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -989,11 +1316,159 @@ impl Artifact {
         let base = crate::ast::push_nodes(&offsets);
         Some(Member {
             name: self.members.iter().find(|(n, _)| *n == name)?.0,
-            ast: get_expr(&mut r, base),
             intrinsics: r.seq(base, |r, _| r.s()),
             signatures: r.seq(base, |r, _| (r.s(), get_type(r))),
             nominals: r.seq(base, |r, _| (r.s(), get_type(r))),
+            ast: Some(get_expr(&mut r, base)),
         })
+    }
+
+    /// The same member WITHOUT its tree, and without installing its nodes.
+    ///
+    /// What the checker needs — declared types and intrinsic names — when the compiled
+    /// prefix means nobody will walk the tree. Skipping it is 0.33ms on a `Dict`
+    /// program, because the tree is almost all of the member.
+    pub fn member_tables(&self, name: &str) -> Option<Member> {
+        let (found, at) = self.members.iter().find(|(n, _)| *n == name)?;
+        let mut r = Reader { blob: self.blob, at: *at, strings: &self.strings };
+        let n_offsets = r.u() as usize;
+        for _ in 0..n_offsets {
+            r.u();
+        }
+        Some(Member {
+            name: found,
+            intrinsics: r.seq(0, |r, _| r.s()),
+            signatures: r.seq(0, |r, _| (r.s(), get_type(r))),
+            nominals: r.seq(0, |r, _| (r.s(), get_type(r))),
+            ast: None,
+        })
+    }
+}
+
+
+// ---------------------------------------------------------------- the compiled prefix
+
+/// `Builtin.roc` COMPILED, for one selection of members.
+///
+/// The measurement that made this worth writing: with chunk numbers normalised, every
+/// named builtin chunk is byte-identical across four different programs — including one
+/// defining nominal operator methods, which flips a program-wide compiler switch. The
+/// builtin bytecode does not depend on the program that loads it. Only the NUMBERING
+/// did, because nested lambdas inside builtin members were numbered after every
+/// top-level binding, and a user program contributes some.
+///
+/// So the builtins take a stable id PREFIX — chunk 0 is their top level, then their
+/// functions, then their nested lambdas — and a program's own chunks are numbered after
+/// it. Nothing is renumbered on load; the prefix keeps the ids it was compiled with.
+pub struct Prefix {
+    pub chunks: Vec<Chunk>,
+    /// Global slot names, in slot order. A program's own globals follow them.
+    pub globals: Vec<&'static str>,
+    /// Top-level functions: name, chunk, arity.
+    pub fns: Vec<(&'static str, u32, u16)>,
+    pub methods: Vec<((&'static str, &'static str), u32)>,
+    pub methods_by_name: Vec<(&'static str, Vec<(&'static str, u32)>)>,
+    pub nominal_shapes: Vec<(&'static str, crate::vm::NominalShape)>,
+    pub literal_coercions: Vec<(&'static str, Value)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn put_prefix(
+    w: &mut Writer,
+    key: &str,
+    node_base: u32,
+    node_end: u32,
+    offsets: &[u32],
+    program: &crate::vm::Program,
+    group_chunks: usize,
+    globals: &[&'static str],
+    fns: &[(&'static str, u32, u16)],
+) {
+    w.s(key);
+    let length_at = w.out.len();
+    w.out.extend_from_slice(&0u32.to_le_bytes());
+    let body_at = w.out.len();
+    w.u(offsets.len() as u64);
+    for offset in offsets {
+        w.u(u64::from(*offset));
+    }
+    w.seq(&program.chunks[..group_chunks], |w, chunk| put_chunk(w, chunk, node_base, node_end));
+    w.seq(globals, |w, g| w.s(g));
+    w.seq(fns, |w, (n, c, a)| {
+        w.s(n);
+        w.u(u64::from(*c));
+        w.u(u64::from(*a));
+    });
+    // SORTED, all three: they are `HashMap`s, and iteration order varies per process —
+    // which made the artifact differ byte for byte between two runs that produced the
+    // same program. `tests/check_artifact.sh` is the gate that caught it.
+    let mut methods: Vec<_> = program.methods.iter().collect();
+    methods.sort_by_key(|(k, _)| *k);
+    w.seq(&methods, |w, ((module, method), chunk)| {
+        w.s(module);
+        w.s(method);
+        w.u(u64::from(**chunk));
+    });
+    let mut by_name: Vec<_> = program.methods_by_name.iter().collect();
+    by_name.sort_by_key(|(k, _)| *k);
+    w.seq(&by_name, |w, (method, defined)| {
+        w.s(method);
+        w.seq(defined, |w, (name, chunk)| {
+            w.s(name);
+            w.u(u64::from(*chunk));
+        });
+    });
+    let mut shapes: Vec<_> = program.nominal_shapes.iter().collect();
+    shapes.sort_by_key(|(k, _)| *k);
+    w.seq(&shapes, |w, (name, shape)| {
+        w.s(name);
+        put_shape(w, shape);
+    });
+    w.seq(&program.literal_coercions, |w, (name, value)| {
+        w.s(name);
+        put_value(w, value);
+    });
+    let length = (w.out.len() - body_at) as u32;
+    w.out[length_at..length_at + 4].copy_from_slice(&length.to_le_bytes());
+}
+
+impl Artifact {
+    /// The compiled prefix for a selection, if the artifact carries one.
+    pub fn prefix(&self, key: &str) -> Option<Prefix> {
+        let (_, at) = self.prefixes.iter().find(|(n, _)| *n == key)?;
+        let mut r = Reader { blob: self.blob, at: *at, strings: &self.strings };
+        let n_offsets = r.u() as usize;
+        let mut offsets = Vec::with_capacity(n_offsets);
+        for _ in 0..n_offsets {
+            offsets.push(r.u() as u32);
+        }
+        // The spans in these chunks point at builtin source, so the nodes go in first
+        // and the ids are rebased onto them — the same move the trees make.
+        let base = crate::ast::push_nodes(&offsets);
+        let mut id = 0u32;
+        let chunks = {
+            let n = r.u() as usize;
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(get_chunk(&mut r, id, base));
+                id += 1;
+            }
+            out
+        };
+        Some(Prefix {
+            chunks,
+            globals: r.seq(0, |r, _| r.s()),
+            fns: r.seq(0, |r, _| (r.s(), r.u() as u32, r.u() as u16)),
+            methods: r.seq(0, |r, _| ((r.s(), r.s()), r.u() as u32)),
+            methods_by_name: r
+                .seq(0, |r, _| (r.s(), r.seq(0, |r, _| (r.s(), r.u() as u32)))),
+            nominal_shapes: r.seq(0, |r, _| (r.s(), get_shape(r))),
+            literal_coercions: r.seq(0, |r, _| (r.s(), get_value(r))),
+        })
+    }
+
+    pub fn has_prefix(&self, key: &str) -> bool {
+        self.prefixes.iter().any(|(n, _)| *n == key)
     }
 }
 
@@ -1018,6 +1493,8 @@ mod tests {
             &loaded.signatures,
             &loaded.nominals,
         );
+        // No compiled prefixes in this one, but the section still has to be there.
+        w.count(0);
         let blob: &'static [u8] = Box::leak(w.finish(0, 1).into_boxed_slice());
         let artifact = Artifact::open(blob).expect("open");
         let back = artifact.member("Box").expect("member");
@@ -1030,8 +1507,14 @@ mod tests {
         // compared with the numbers taken out, and the ids are checked separately by
         // what they point at.
         let before = blank_ids(&format!("{:?}", loaded.ast));
-        let after = blank_ids(&format!("{:?}", back.ast));
+        let after = blank_ids(&format!("{:?}", back.ast.expect("the tree")));
         assert_eq!(before, after, "round trip changed the tree");
+
+        // And the tables come back without decoding the tree at all.
+        let tables = artifact.member_tables("Box").expect("tables");
+        assert!(tables.ast.is_none());
+        assert_eq!(tables.intrinsics, loaded.intrinsics);
+        assert_eq!(format!("{:?}", tables.signatures), format!("{:?}", loaded.signatures));
     }
 
     /// `NodeId(17)` -> `NodeId(_)`, so a rebased tree prints the same as its original.
@@ -1065,6 +1548,7 @@ mod tests {
             &loaded.signatures,
             &loaded.nominals,
         );
+        w.count(0);
         let blob: &'static [u8] = Box::leak(w.finish(0, 1).into_boxed_slice());
         let artifact = Artifact::open(blob).expect("open");
         let before = crate::ast::node_count() as u32;

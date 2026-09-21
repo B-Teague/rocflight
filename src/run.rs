@@ -33,6 +33,19 @@ pub struct Options {
     /// Render `Str.inspect` of the result while the program is still installed, so a
     /// nominal's own `to_inspect` steers it. `rocflight eval` (non-raw) sets this.
     pub inspect_result: bool,
+    /// Compile, hand the precompiled GROUP to `PREFIX_OUT` and stop. `gen-artifact`
+    /// sets this: it needs `Builtin.roc` compiled through the real front end, and the
+    /// front end lives here.
+    pub emit_prefix: bool,
+}
+
+thread_local! {
+    /// Where `emit_prefix` leaves what it compiled. A thread-local rather than a return
+    /// value because it is a generator-only path and `run_file` answers what a RUN
+    /// answers; threading it through every caller would be worse than this.
+    pub static PREFIX_OUT: std::cell::RefCell<
+        Option<(crate::vm::Program, crate::vm::compile::Group, u32, u32)>,
+    > = const { std::cell::RefCell::new(None) };
 }
 
 /// What a run produced.
@@ -54,7 +67,7 @@ pub struct Ran {
 /// the same pipeline serves `rocflight file.roc`, `rocflight test`, and `roc_main`
 /// inside a platform's host.
 pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn Error>> {
-    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _ } = options;
+    let Options { show_desugared, show_ast, ast_only, show_platforms, test_mode, args, host_entry, check_expects, inspect_result: _, emit_prefix } = options;
     // `roc test` times the whole invocation, compile included, not just the expects.
     let started = Instant::now();
 
@@ -131,11 +144,23 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // Which members load is read off the source, never chosen from the command line:
     // the module is part of the interpreter, so asking for a different set of it would
     // only be a way to run a program against a runtime that is not the real one.
-    let builtins = crate::builtin::load(&needed)?;
+    // `Builtin.roc` already COMPILED, when the artifact carries it for this selection.
+    // Then nothing needs the builtin trees — only their declared types — and their
+    // chunks are not rebuilt at all. See `artifact::Prefix`.
+    // `emit_prefix` is generating the prefix, so it must not use one.
+    let prefix = if emit_prefix { None } else { crate::builtin::compiled_prefix(&needed) };
+    let nodes_before = crate::ast::node_count() as u32;
+    let builtins = match prefix.as_ref().and(crate::builtin::load_tables(&needed)) {
+        Some(tables) => tables,
+        // Generating the artifact reads none of it — see `load_from_source`.
+        None if emit_prefix => crate::builtin::load_from_source(&needed)?,
+        None => crate::builtin::load(&needed)?,
+    };
     // The checker will ask for these modules' declared types; `load` has just parsed
     // them with more context than a re-parse would have. See `seed_signatures`.
     crate::builtin::seed_signatures(&builtins);
 
+    let builtin_nodes = (nodes_before, crate::ast::node_count() as u32);
     crate::tick("builtin::load", &mut phase);
     // Step 2c: Local modules — `import Hello exposing [hello]`.
     //
@@ -312,6 +337,10 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     // fallback interpreter to quietly take over, which is the point of there being one
     // engine: a program either compiles or says why.
     let unit = crate::vm::compile::Unit {
+        // The builtins lead, and they are the group that gets its own chunk block —
+        // the block a compiled prefix replaces. Zero when one was loaded: those
+        // modules are not here at all.
+        prefix_modules: if prefix.is_some() { 0 } else { builtins.len() },
         // A module's top level is compiled into the SAME program, ahead of the app's,
         // which is how `hello` from `import Hello exposing [hello]` ends up in scope.
         modules: builtins
@@ -319,6 +348,9 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
             // A member's own method blocks already qualified its names — the AST binds
             // `Str.is_empty`, not `is_empty` — so there is nothing to hang them on and
             // nothing to expose bare.
+            // Skipped entirely when the builtins arrived compiled: their chunks are
+            // the program's prefix, so there is nothing here to compile.
+            .filter(|_| prefix.is_none())
             .map(|loaded| crate::vm::compile::Module {
                 ast: &loaded.ast,
                 type_name: loaded.name,
@@ -405,7 +437,18 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
         test_mode,
     };
     crate::tick("build the unit", &mut phase);
-    let program = std::rc::Rc::new(crate::vm::compile_unit(&unit)?);
+    // Node ids the builtins' own parse made, bracketing what a prefix must carry.
+    let nodes_before = builtin_nodes.0;
+    let nodes_after = builtin_nodes.1;
+    let (compiled, group) = crate::vm::compile::compile_reporting(&unit, prefix)?;
+    if emit_prefix {
+        let group = group.ok_or("nothing to emit: this program loaded no builtins")?;
+        PREFIX_OUT.with(|out| {
+            *out.borrow_mut() = Some((compiled, group, nodes_before, nodes_after));
+        });
+        return Ok(None);
+    }
+    let program = std::rc::Rc::new(compiled);
 
     crate::tick("compile", &mut phase);
     if std::env::var_os("ROCFLIGHT_CODE").is_some() {

@@ -275,6 +275,7 @@ fn run_with(src: &str, builtins: &[&str]) -> Result<String, String> {
     checker.declare_nominal_literals(app.nominal_literals());
     checker.synth(&ast).map_err(|e| e.message)?;
     let unit = rocflight::vm::compile::Unit {
+        prefix_modules: 0,
         modules: loaded
             .iter()
             .map(|l| rocflight::vm::compile::Module {

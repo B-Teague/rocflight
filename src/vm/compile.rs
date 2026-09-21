@@ -130,6 +130,12 @@ pub struct Module<'a> {
 
 /// Everything a program is made of.
 pub struct Unit<'a> {
+    /// How many of the leading `modules` are the PRECOMPILED GROUP — `Builtin.roc`.
+    ///
+    /// They get their own top-level chunk and their own block of chunk ids, ahead of
+    /// everything else, so that block is the same for every program and can be compiled
+    /// once and reused. See `artifact::Prefix`.
+    pub prefix_modules: usize,
     /// Compiled into the SAME program as the app, ahead of it, so a module's top level
     /// is part of this one's. The tree-walker gets the same effect by evaluating each
     /// module into the shared global scope first.
@@ -213,6 +219,7 @@ pub struct Unit<'a> {
 /// Compile a single-file program.
 pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
     compile_unit(&Unit {
+        prefix_modules: 0,
         modules: Vec::new(),
         app: ast,
         entry,
@@ -247,6 +254,36 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
 
 /// Compile a whole program, local modules and ingested files included.
 pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
+    compile_unit_with(unit, None)
+}
+
+/// Compile, on top of `Builtin.roc` already compiled.
+///
+/// The prefix owns chunks `0..P` — chunk 0 being the builtins' own top level, which
+/// becomes this program's `prelude` — and this program's chunks are numbered after
+/// them. Nothing is renumbered: the prefix keeps the ids it was compiled with, which is
+/// sound because its bytecode does not depend on the program that loads it. See
+/// `artifact::Prefix` for the measurement that establishes that.
+pub fn compile_unit_with(
+    unit: &Unit,
+    prefix_owned: Option<crate::artifact::Prefix>,
+) -> Result<Program, String> {
+    compile_reporting(unit, prefix_owned).map(|(program, _)| program)
+}
+
+/// What a compile made of its precompiled GROUP — phase A — so `gen-artifact` can write
+/// it out. `None` when there was no group, or when one was loaded rather than compiled.
+pub struct Group {
+    /// How many chunks the group owns: ids `0..chunks` of the finished program.
+    pub chunks: usize,
+    pub fns: Vec<(&'static str, ChunkId, u16)>,
+    pub globals: Vec<&'static str>,
+}
+
+pub fn compile_reporting(
+    unit: &Unit,
+    prefix_owned: Option<crate::artifact::Prefix>,
+) -> Result<(Program, Option<Group>), String> {
     let (ast, entry) = (unit.app, unit.entry);
     // The top level is a chain of `let`s ending in an expression.
     //
@@ -261,7 +298,13 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     // Each module's top level, ahead of the app's. Its trailing expression keeps its
     // place as a statement — that is where a module's `expect`s live.
     let mut aliases: Vec<(&'static str, &'static str)> = Vec::new();
-    for module in &unit.modules {
+    // Where the precompiled group's bindings and statements end.
+    let (mut split_bindings, mut split_statements) = (0usize, 0usize);
+    for (at, module) in unit.modules.iter().enumerate() {
+        if at == unit.prefix_modules {
+            split_bindings = bindings.len();
+            split_statements = statements.len();
+        }
         let mut cursor = module.ast;
         while let Expr::Let { name, value, body, .. } = cursor {
             bindings.push((name, value.as_ref()));
@@ -272,6 +315,10 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         for name in &module.exposed {
             aliases.push((name, qualify(module.type_name, name)));
         }
+    }
+    if unit.prefix_modules >= unit.modules.len() {
+        split_bindings = bindings.len();
+        split_statements = statements.len();
     }
 
     let mut cursor = ast;
@@ -307,9 +354,22 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     // Chunk 0 is the top level itself, so top-level functions start at 1. Ids are
     // handed out before any body is compiled — that is what lets two functions call
     // each other, and a function call one declared further down the file.
+    // The compiled prefix, if there is one, owns chunks 0..P — chunk 0 being the
+    // builtins' own top level, which runs before this program's.
+    let prefix = prefix_owned.as_ref();
+    let prefix_chunks = prefix.map_or(0, |p| p.chunks.len());
+    let prefix_fns = prefix.map_or(0, |p| p.fns.len());
+    // Chunk 0 is the group's top level whenever there IS a group — compiled here as
+    // phase A, or loaded as a prefix — and it runs before this program's own.
+    let mut prelude: Option<ChunkId> = prefix.map(|_| 0);
+    // The first id this program may use. Its top level takes it, then its functions.
+    // Where THIS program's own top level lands. Without phase A it is chunk 0 (or the
+    // first free id after a loaded prefix); with phase A it is after the group's chunks,
+    // which is only known once the group is compiled.
+    let mut top_slot = prefix_chunks as ChunkId;
     let mut tops = Tops {
-        fns: Vec::new(),
-        globals: Vec::new(),
+        fns: prefix.map_or_else(Vec::new, |p| p.fns.clone()),
+        globals: prefix.map_or_else(Vec::new, |p| p.globals.clone()),
         aliases,
         operator_methods: false,
         fn_at: std::collections::HashMap::new(),
@@ -320,12 +380,42 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     for (name, _) in &unit.ingested {
         tops.globals.push(name);
     }
-    for (name, value) in &bindings {
+    // PHASE A is the precompiled group — `Builtin.roc` — and it gets its own top-level
+    // chunk (id 0) and its own block of function ids, ahead of everything else. That is
+    // what makes the block the same for every program and reusable. When a compiled
+    // prefix was handed in there is no phase A: its chunks ARE that block.
+    let phase_a = if prefix.is_some() { 0 } else { split_bindings };
+    let two_phase = phase_a > 0;
+    // Chunk 0 of the whole program: the group's top level when there is one, this
+    // program's own otherwise.
+    if two_phase {
+        prelude = Some(0);
+    }
+    let is_lambda = |v: &&Expr| matches!(v, Expr::Lambda { .. });
+    let a_lambdas = bindings.iter().take(phase_a).filter(|(_, v)| is_lambda(v)).count();
+    let b_lambdas = bindings.iter().skip(phase_a).filter(|(_, v)| is_lambda(v)).count();
+    let mut next_chunk = top_slot + 1;
+    for (name, value) in bindings.iter().take(phase_a) {
         match value {
             Expr::Lambda { params, .. } => {
-                let id = tops.fns.len() as ChunkId + 1;
-                tops.fns.push((name, id, params.len() as u16));
+                tops.fns.push((name, next_chunk, params.len() as u16));
+                next_chunk += 1;
             }
+            _ => tops.globals.push(name),
+        }
+    }
+    let group_globals = tops.globals.len();
+    // The GLOBAL slots can all be handed out now — a slot index does not depend on a
+    // chunk id. The remaining functions' chunk ids cannot, when there is a phase A:
+    // they come after its nested lambdas, and how many there are is only known once it
+    // has been compiled. Without a phase A there is nothing to wait for.
+    for (name, value) in bindings.iter().skip(phase_a) {
+        match value {
+            Expr::Lambda { params, .. } if !two_phase => {
+                tops.fns.push((name, next_chunk, params.len() as u16));
+                next_chunk += 1;
+            }
+            Expr::Lambda { .. } => {}
             _ => tops.globals.push(name),
         }
     }
@@ -339,8 +429,12 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         tops,
         // One reserved slot per chunk whose id is already known. Nested lambdas
         // reserve theirs as they are found.
-        chunks: (0..=bindings.iter().filter(|(_, v)| matches!(v, Expr::Lambda { .. })).count())
+        // One slot per chunk id, so an index into this IS a chunk id whichever path we
+        // took. A loaded prefix's slots stay `None` and its real chunks are put back in
+        // front at the end; nothing reads them while compiling.
+        chunks: (0..prefix_chunks)
             .map(|_| None)
+            .chain((0..=if two_phase { a_lambdas } else { b_lambdas }).map(|_| None))
             .collect(),
         states: Vec::new(),
         node: ast.id(),
@@ -385,7 +479,34 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         intrinsics: &unit.intrinsics,
     };
 
-    for (name, value) in &bindings {
+    for (name, value) in bindings.iter().take(phase_a) {
+        if let Expr::Lambda { params, body, id } = value {
+            let (chunk, _) = c.tops.func(name).expect("collected above");
+            c.pending_coerce = c.coerce_params.get(id).cloned();
+            let captures = c.function(chunk, name, params, body, None)?;
+            debug_assert!(captures.is_empty(), "a top-level function captured something");
+        }
+    }
+    if two_phase {
+        // The group's own top level, holding only ITS globals and statements.
+        let group = c.top_level(unit, &bindings[..phase_a], &statements[..split_statements], None)?;
+        c.chunks[0] = Some(group.finish(0, 0));
+        // Everything after the group's chunks — its functions AND their nested lambdas
+        // — belongs to this program. Its top level takes the next id, then its
+        // functions, and its own nested lambdas follow.
+        top_slot = c.chunks.len() as ChunkId;
+        c.chunks.push(None);
+        let mut next = top_slot + 1;
+        for (name, value) in bindings.iter().skip(phase_a) {
+            if let Expr::Lambda { params, .. } = value {
+                c.tops.fns.push((name, next, params.len() as u16));
+                c.chunks.push(None);
+                next += 1;
+            }
+        }
+        c.tops.index();
+    }
+    for (name, value) in bindings.iter().skip(phase_a) {
         if let Expr::Lambda { params, body, id } = value {
             let (chunk, _) = c.tops.func(name).expect("collected above");
             c.pending_coerce = c.coerce_params.get(id).cloned();
@@ -396,51 +517,8 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         }
     }
 
-    // The top level: assign each global in order, then evaluate the trailing
-    // expression. Order matters — a global that reads one declared below it gets
-    // "Used before it was defined", which is what the tree-walker does too.
-    c.states.push(FnState::new("top level", Rc::from([]), None, false));
-    for (name, text) in &unit.ingested {
-        let reg = c.alloc()?;
-        c.constant(reg, crate::eval::str_value(text.clone()))?;
-        let idx = c.tops.global(name).expect("reserved above");
-        c.emit(Op::StoreGlob { idx, src: reg });
-        c.st().next_reg = reg;
-    }
-    for (name, value) in &bindings {
-        if matches!(value, Expr::Lambda { .. }) {
-            continue;
-        }
-        let save = c.st().next_reg;
-        c.global_owner = name.rsplit_once('.').map(|(owner, _)| owner);
-        let src = c.expr(value)?;
-        c.global_owner = None;
-        let idx = c.tops.global(name).expect("collected above");
-        c.emit(Op::StoreGlob { idx, src });
-        c.st().next_reg = save;
-    }
-    // Statements the flattening lifted out of a `_` binding, run for their effects.
-    //
-    // ponytail: after the globals rather than interleaved with them in source order.
-    // The only thing this shape holds today is top-level `expect`s, which run after
-    // the declarations anyway; interleaving matters once those are compiled (V5).
-    for statement in &statements {
-        let save = c.st().next_reg;
-        c.top_statement(statement, unit.test_mode || unit.run_expects)?;
-        c.st().next_reg = save;
-    }
-    // A file whose last declaration is a top-level `expect` has it as the trailing
-    // expression rather than a statement. It is still a test, so it gets the same
-    // treatment and the top level's own value is `{}` either way.
-    if matches!(tail, Expr::Expect(..)) {
-        c.top_statement(tail, unit.test_mode || unit.run_expects)?;
-        let src = c.literal(Value::Unit)?;
-        c.emit(Op::Ret { src });
-    } else {
-        c.tail(tail)?;
-    }
-    let top = c.states.pop().expect("pushed above");
-    c.chunks[0] = Some(top.finish(0, 0));
+    let own = c.top_level(unit, &bindings[phase_a..], &statements[split_statements..], Some(tail))?;
+    c.chunks[top_slot as usize] = Some(own.finish(top_slot, 0));
 
     let entry = match entry {
         None => None,
@@ -449,11 +527,6 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         })?),
     };
 
-    let chunks = c
-        .chunks
-        .into_iter()
-        .map(|slot| slot.expect("every reserved chunk id was compiled"))
-        .collect();
     // The dispatch tables. Only the compiler knows which top-level functions are
     // methods — they are the ones whose name is `Type.method` — and only the running
     // value can resolve a dispatch the checker could not type.
@@ -461,7 +534,7 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     let mut methods_by_name: std::collections::HashMap<&'static str, Vec<(&'static str, ChunkId)>> =
         std::collections::HashMap::new();
     let block_local = c.capture_free_methods.clone();
-    for (qualified, chunk) in c.tops.fns.iter().map(|(q, c, _)| (*q, *c)).chain(block_local) {
+    for (qualified, chunk) in c.tops.fns.iter().skip(prefix_fns).map(|(q, c, _)| (*q, *c)).chain(block_local) {
         if let Some((module, method)) = qualified.rsplit_once('.') {
             let module: &'static str = Box::leak(module.to_string().into_boxed_str());
             let method: &'static str = Box::leak(method.to_string().into_boxed_str());
@@ -470,11 +543,47 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         }
     }
 
-    Ok(Program {
+    // The prefix's own dispatch tables, which were built when IT was compiled — that
+    // is where a builtin's block-local methods live, and nothing here recompiles them.
+    let mut literal_coercions = Vec::new();
+    let prefix_chunks_owned = match prefix_owned {
+        None => Vec::new(),
+        Some(p) => {
+            for ((module, method), chunk) in p.methods {
+                methods.entry((module, method)).or_insert(chunk);
+            }
+            for (method, defined) in p.methods_by_name {
+                methods_by_name.entry(method).or_default().extend(defined);
+            }
+            literal_coercions = p.literal_coercions;
+            p.chunks
+        }
+    };
+    literal_coercions.append(&mut c.literal_coercions);
+    let chunks: Vec<Chunk> = prefix_chunks_owned
+        .into_iter()
+        .chain(
+            // The first `prefix_chunks` slots are placeholders that kept an index equal
+            // to a chunk id while compiling; the real chunks go in front of them.
+            c.chunks
+                .into_iter()
+                .skip(prefix_chunks)
+                .map(|slot| slot.expect("every reserved chunk id was compiled")),
+        )
+        .collect();
+
+    let group = two_phase.then(|| Group {
+        chunks: top_slot as usize,
+        fns: c.tops.fns[..a_lambdas].to_vec(),
+        globals: c.tops.globals[..group_globals].to_vec(),
+    });
+    Ok((Program {
         chunks,
-        literal_coercions: std::mem::take(&mut c.literal_coercions),
+        literal_coercions,
         n_globals: c.tops.globals.len(),
-        top: 0,
+        top: top_slot,
+        // The builtins' top level, which binds their globals. It runs first.
+        prelude,
         entry,
         methods,
         methods_by_name,
@@ -494,7 +603,7 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
             .filter(|(name, _)| unit.opaque_nominals.contains(name))
             .map(|(_, backing)| resolved_shape(&unit.nominals, backing))
             .collect(),
-    })
+    }, group))
 }
 
 /// One function being compiled. `Compiler::states` is a stack of these, so a nested
@@ -781,6 +890,70 @@ struct Spares {
 }
 
 impl<'u> Compiler<'u> {
+    /// One top-level chunk: bind each global in order, then the statements, then the
+    /// trailing expression if this is the program's own rather than a group's.
+    ///
+    /// Two callers, which is why it is a method: the precompiled group gets one of
+    /// these and so does the program that loads it. Order matters within each — a
+    /// global that reads one declared below it gets "Used before it was defined".
+    fn top_level(
+        &mut self,
+        unit: &Unit,
+        bindings: &[(&'static str, &Expr)],
+        statements: &[&Expr],
+        tail: Option<&Expr>,
+    ) -> Result<FnState, String> {
+        self.states.push(FnState::new("top level", Rc::from([]), None, false));
+        if tail.is_some() {
+            for (name, text) in &unit.ingested {
+                let reg = self.alloc()?;
+                self.constant(reg, crate::eval::str_value(text.clone()))?;
+                let idx = self.tops.global(name).expect("reserved above");
+                self.emit(Op::StoreGlob { idx, src: reg });
+                self.st().next_reg = reg;
+            }
+        }
+        for (name, value) in bindings {
+            if matches!(value, Expr::Lambda { .. }) {
+                continue;
+            }
+            let save = self.st().next_reg;
+            self.global_owner = name.rsplit_once('.').map(|(owner, _)| owner);
+            let src = self.expr(value)?;
+            self.global_owner = None;
+            let idx = self.tops.global(name).expect("collected above");
+            self.emit(Op::StoreGlob { idx, src });
+            self.st().next_reg = save;
+        }
+        // Statements the flattening lifted out of a `_` binding, run for their effects.
+        //
+        // ponytail: after the globals rather than interleaved with them in source order.
+        // The only thing this shape holds today is top-level `expect`s, which run after
+        // the declarations anyway; interleaving matters once those are compiled (V5).
+        for statement in statements {
+            let save = self.st().next_reg;
+            self.top_statement(statement, unit.test_mode || unit.run_expects)?;
+            self.st().next_reg = save;
+        }
+        match tail {
+            // A group's top level answers nothing: it exists to bind its globals.
+            None => {
+                let src = self.literal(Value::Unit)?;
+                self.emit(Op::Ret { src });
+            }
+            // A file whose last declaration is a top-level `expect` has it as the
+            // trailing expression rather than a statement. It is still a test, so it
+            // gets the same treatment and the top level's own value is `{}` either way.
+            Some(tail) if matches!(tail, Expr::Expect(..)) => {
+                self.top_statement(tail, unit.test_mode || unit.run_expects)?;
+                let src = self.literal(Value::Unit)?;
+                self.emit(Op::Ret { src });
+            }
+            Some(tail) => self.tail(tail)?,
+        }
+        Ok(self.states.pop().expect("pushed above"))
+    }
+
     /// The function being compiled.
     fn st(&mut self) -> &mut FnState {
         self.states.last_mut().expect("a function is always being compiled")
