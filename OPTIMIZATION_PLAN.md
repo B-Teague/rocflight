@@ -370,7 +370,7 @@ not re-deriving tables. That is the hand-off to Phase 2 and Phase 3.
 
 ---
 
-## Phase 2 — parse `Builtin.roc` once, not once per process — **done, −39.7%**
+## Phase 2 — `Builtin.roc` parsed AND compiled at build time — **done**
 
 `src/artifact.rs` writes the parsed trees out at build time and reads them back.
 
@@ -422,21 +422,74 @@ Two tests hold the format together: a member round-trips to the same tree (compa
 the node numbers blanked, since the rebase is exactly what should differ), and its node
 offsets survive.
 
+### Phase 2b — and then COMPILED, not just parsed — **done, −56% more**
+
+Parsing was the phase; compiling was not, and once it landed `compile` was the largest
+number left: 0.018ms for a trivial program, 0.604ms with a `Dict`. Every run turned
+`Builtin.roc`'s 1,443 definitions into bytecode again.
+
+**The precondition was measured before anything was written.** Four programs were
+compiled and their bytecode diffed — including one defining nominal operator methods,
+which flips a program-wide compiler switch. With chunk NUMBERS normalised, every named
+builtin chunk is byte-identical across all four. The builtin bytecode does not depend on
+the program that loads it. Only the numbering did: nested lambdas inside builtin members
+were numbered after every top-level binding, and a user program contributes some.
+
+So the numbering changed. `compile_unit` runs in **two phases**: the precompiled group
+gets its own top-level chunk (id 0) and its own block of function ids, and everything
+else is numbered after it. That block is then the same for every program. The group's
+top level becomes the program's `prelude`, run first so the builtins' globals are bound
+before anything reads one. **That landed on its own and read 1953 of 1953 before a
+single prefix existed** — it is a layout change, not a behaviour one, and proving it
+separately is what made the rest safe to build on.
+
+```
+builtin::load   0.339ms -> 0.235ms      compile   0.604ms -> 0.088ms
+a Dict program           -56% of its wall
+```
+
+`run.rs` skips the builtin modules entirely when a prefix is loaded, and nothing decodes
+the builtin trees either — `member_tables` reads the declared types the checker wants
+and stops before the tree, which is why `load` fell too.
+
+The `Op` codec is generated from ONE table by a macro. An opcode codec is exactly where
+a writer and a reader drift apart, and a drift there decodes as a DIFFERENT PROGRAM
+rather than as an error; with both directions from one list, adding an `Op` variant
+without listing it is a non-exhaustive-match error.
+
+#### Two bugs, both found by gates rather than by reading
+
+- **The artifact was not reproducible.** Same size, different bytes, twice running:
+  `methods`, `methods_by_name` and `nominal_shapes` are `HashMap`s and went out in
+  iteration order. And generating an artifact READ the previous one, so the trees came
+  back with their nodes already installed and the ids differed. `check_artifact.sh`
+  caught both, which is the whole reason it regenerates rather than trusting.
+- **Some spans point outside the builtin node range.** A group's top level begins with
+  the compiler pointing at the APP's node, which means nothing in a prefix another
+  program reuses. The offset wrapped — and in release that is silently a nonsense error
+  location, not a crash. `tests/check_roc.sh` **on the debug build** is what caught it,
+  which is the argument for that gate running debug.
+
+#### What it costs
+
+The binary is 13.3MB → 15.6MB: 228kB of artifact and the rest codec. Six compiled
+prefixes are stored because `needed_by` can reach the low-level section six ways, and
+four of those contain `Dict` and `Set`, so that bytecode is stored four times. Worth
+revisiting only if binary size starts to matter.
+
 ### What is left of a `Dict` program
 
 ```
-[time]            parse    0.077ms   <- the user's four lines
-[time]    builtin::load    0.339ms   <- eight trees decoded, no text read
-[time]       type check    0.058ms
-[time]          compile    0.655ms   <- now the largest single number
-[time]              run    0.052ms
+[time]            parse    0.056ms   <- the user's four lines
+[time]    builtin::load    0.235ms   <- declared types only, no trees
+[time]       type check    0.050ms
+[time]          compile    0.088ms
+[time]              run    0.043ms
 ```
 
-`compile` is next if anyone reopens this, and it is the same question in a new place:
-1,443 definitions from `Builtin.roc` are compiled into chunks whether the program calls
-them or not. Pruning that needs the per-declaration reachability `build.rs` already
-computes for the low-level section, generalised — and the same care, because a
-declaration wrongly pruned is an unknown name at run time, not a slow one.
+0.49ms in process, against 3.5ms when this document was rewritten. `builtin::load` is
+now the largest of them, and all it does is decode `Type`s for the checker — so the next
+thing, if there is one, is to store those the way the bytecode is stored.
 
 ## Phase 3 — the parser — **the cheap items done; the lexer is a decision, not a task**
 
@@ -1507,9 +1560,11 @@ spent its effort removing) and putting `Tag`'s payload back behind a `Vec` (undo
    of annotations, so the cost was `parse_type`'s allocations. −39% on annotation-heavy
    parsing, −6.6% on a `Dict` program, and `types::Type`'s names are interned. The
    tokenizer is still unwritten and is no longer obviously next.
-14. ~~**Phase 2**~~ — done, −39.7% on a `Dict` program. `builtin::load` 1.821ms →
-   0.339ms, and the strings are read out of the binary's rodata rather than allocated,
-   which is most of why. A stale artifact is a build error.
+14. ~~**Phase 2**~~ — done twice over. Parsed at build time: `builtin::load` 1.821ms →
+   0.339ms, −39.7%, with the strings read out of the binary's rodata rather than
+   allocated. Then COMPILED at build time: `compile` 0.604ms → 0.088ms, another −56%.
+   A `Dict` program is 0.49ms in process against 3.5ms when this document was rewritten.
+   A stale artifact is a build error.
 15. ~~**Phase 8**~~ — done, all three items, and an opcode histogram picked every one
    of them over what this list had queued: a `for` loop's back edge, a literal operand,
    and Phase 4.3's destination hint reaching calls and the lowered loops. `calls`
