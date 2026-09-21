@@ -957,6 +957,17 @@ impl Parser {
     /// Called wherever a declaration may appear: the top-level header loop and the
     /// top-level binding chain both need it, and a missed annotation there silently
     /// truncates the chain (the binding after it never gets parsed).
+    /// Whitespace, comments, nominal declarations and standalone type annotations.
+    ///
+    /// The two captures below run between EVERY token, and each answers by scanning to
+    /// the end of the line and searching it for `:=`, `::` or `:`. Guarding them on
+    /// "the cursor is at the start of a line" was tried, for -4.2% on a `Dict` program,
+    /// -3.2% on `strings` and -2.7% on a 2,000-declaration file — and it reads **1881
+    /// of 1953**. Both constructs read to the next `\n`, so the guard looked safe and is
+    /// not: annotations reach here mid-line often enough to break 72 eval tests, and
+    /// `tests/check_roc.sh` and `tests/check_examples.sh` both stayed green while they
+    /// did. Anything cheaper than this has to understand WHICH mid-line positions
+    /// matter first.
     fn skip_trivia(&mut self) {
         loop {
             self.skip_whitespace();

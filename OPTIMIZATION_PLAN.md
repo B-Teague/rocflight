@@ -295,7 +295,11 @@ That is a tenth of what the first draft of this plan projected, because the 0.25
 attributed to `members_where` was a single-shot reading of a cold page cache. **Medians,
 not single runs, for anything under a millisecond.**
 
-**1.3b, not done, and not as written.** The plan said to generate the signature tables
+**1.3b, DONE — and it is what the front end costs now.** See below for why it stopped
+being optional. What follows is the reasoning that left it undone, which still holds for
+the `Set` half.
+
+**Why it was left.** The plan said to generate the signature tables
 in `build.rs`. That cannot work: a signature is a `types::Type` produced by *this
 crate's* type parser, and a build script cannot call the crate it is building. The
 options left are a checked-in generated file with a regeneration step, or reusing what
@@ -303,9 +307,24 @@ options left are a checked-in generated file with a regeneration step, or reusin
 `Set(item) :: Dict(item, {})`, so `Set`'s signatures only carry their element type if
 `Dict`'s declaration was in scope while they were parsed, which is exactly why
 `parse_signatures` prepends `Dict`'s annotations. `load` parses each member with its own
-`Parser`, so its `Set` signatures are the degraded ones. It would be sound for `Dict`
-alone, for 0.36ms on `Dict` programs, at the price of a side channel between `load` and
-`signatures_for`. Left for whoever needs that 0.36ms.
+`Parser`, so its `Set` signatures are the degraded ones. It is sound for everything
+else, though, and Phase 6 is what made 0.36ms worth having: with process startup gone,
+the front end is **~95% of a `Dict` program's wall**.
+
+So `builtin::seed_signatures` hands the cache what `load` already parsed, for every
+member but `Set`. `load` sees strictly more than the re-parse — the whole member, with
+its own declarations in scope, against annotation lines alone. Seeding only, never
+overwriting.
+
+```
+Dict program, in process:  3.22ms -> 2.84ms   (-12.7% of its wall)
+  signatures_for(Dict)     0.353ms -> gone
+  type check               0.413ms -> 0.061ms
+```
+
+And it is not only faster: `tests/check_examples.sh` goes from **19 passing to 20**, one
+fewer PENDING, because a full parse infers what an annotations-only one could not. The
+README has claimed 20 for a while; it is 20 now.
 
 The real cost here is the **0.37ms to parse 137 annotation lines**, at 2.7µs a line
 against ~1.4µs for ordinary source. That is Phase 3's number, not Phase 1's.
@@ -589,16 +608,36 @@ What is left in this area is small: `Lazy::Concat` clones the second iterator wh
 first runs out, once per concatenation, and `fold_native` and `materialize` hold their
 own handle so the first step of a walk still copies. Neither is per-element.
 
-### 4.2 — `Dec` arithmetic
+### 4.2 — `Dec` arithmetic — **measured and rejected**
 
-A 2M-element fold with a `Dec` accumulator is 310ms against 92ms for `I64`. Note that
-4.1 showed most of a `Dec` loop's cost was the iterator rather than the arithmetic —
-against an `F64` range the `Dec` one is only 25ns an element slower, over three
-operations — so the number to beat here is closer to 8ns an operation than 110ns. `apply_binop` reaches `Dec` only after an `Int` probe, a
-two-arm `U128` probe, `as_dec` on both operands and a `dec_binop` returning
-`Option<Result<…>>`. `Dec` is not exotic in Roc — it is what an unconstrained
-fractional literal becomes — so it deserves the same treatment `BinInt` gave integers:
-a `BinDec` opcode where the checker proved both operands are `Dec`.
+`BinDec`/`BinDecK`, exactly as this phase asked for: the checker already knows which
+binops are `Dec` (`dec_binops`, beside `integer_binops`), and the opcodes skip
+`apply_binop`'s `Int` probe, two-arm `U128` probe and `as_dec` on both operands.
+
+It works, and it is a net loss:
+
+| | |
+|---|---|
+| `iter_range` | **−5.6%** |
+| `records` | **+3.3%** |
+| `records_tail` | **+2.7%** |
+| `list_pass` | +1.9% |
+
+`records` and `records_tail` execute **not one `Dec` operation**. Their bytecode is
+unchanged. Two more arms in `exec` move the dispatch loop's code layout, and that is
+bigger than the win — the same finding 4.4 and 4.5 landed on, now for the third time.
+
+Two cheaper shapes were tried and neither pays:
+
+- **Reordering the probes inside `apply_binop`** so `Dec`-and-`Dec` is tested before
+  `U128`: `iter_range` +1.3%. The win was never the probe chain.
+- **Inlining the `Dec` case into the existing `Bin` arm** (`bin_any`, no new opcode and
+  so no new arm): `iter_range` −1.9%, `loop` +2.2%, `matching_tail` +1.7%. A wash.
+
+So the win is real and unreachable: it needs a dedicated arm, and a dedicated arm costs
+more elsewhere than it earns. **Ask again only if `exec` stops being layout-sensitive**
+— which is its own piece of work, and probably means a computed-goto or a table of
+handlers rather than one giant `match`.
 
 ### 4.3 — `Move` was the most executed opcode — **done, −17% to −26%**
 
@@ -726,12 +765,32 @@ the benchmark the change targets. Alternating the two binaries in one loop is wh
 these numbers readable at all — this machine drifts 7% across a few minutes, which is
 larger than every effect in this section.
 
-### 4.6 — top-level names are found by linear scan
+### 4.6 — top-level names are found by linear scan — **done, 94ms → 2.2ms**
 
-`Tops::global` / `Tops::func` and the checker's env are linear scans; 100k declarations
-take 15s. Nothing anyone runs today hits this, and no gate covers it. A `HashMap` is
-half an hour's work whenever a program shows up that cares. Left documented, not
-scheduled.
+Filed as "nothing anyone runs today hits this", with a guess that the checker's env
+shared the problem. Measured: the checker is linear and the COMPILER was the quadratic
+one.
+
+| declarations | parse | type check | compile |
+|---|---|---|---|
+| 1,000 | 1.5ms | 0.6ms | 1.8ms |
+| 2,000 | 3.0ms | 1.2ms | 4.1ms |
+| 4,000 | 6.0ms | 2.3ms | **19.4ms** |
+| 8,000 | 12.2ms | 4.6ms | **94.2ms** |
+
+`Tops::func`/`global`/`alias` were linear scans, and the top level looks EVERY binding
+up as it compiles it: 8,000 declarations is 32 million string comparisons. Three
+`HashMap`s, built once after the last name is known — `or_insert` and not `insert`,
+because a duplicate resolved to the FIRST one when these were scans.
+
+```
+8,000 declarations: compile 94.2ms -> 2.21ms, and linear
+    1,000 0.36ms   2,000 0.77ms   4,000 1.07ms   8,000 2.21ms
+```
+
+No benchmark moves, because nothing in `tests/bench` has more than a handful of
+top-level names. That is why it sat here as a ceiling rather than a cost. It is not a
+ceiling now.
 
 ---
 
@@ -846,19 +905,47 @@ bounded by the Rust stack with no Roc-level diagnostic.
 
 ---
 
-## Phase 6 — process startup
+## Phase 6 — process startup — **done, and it was never rocflight's**
 
-The binary is 13.5MB with fat LTO; a trivial program is 852µs of wall against 523µs for
-`/bin/true`, so rocflight's own startup is ~160µs and fork+exec is the rest. Across the
-eval suite that is ~1.2s of 13.7s — real, but a tenth of what Phase 1 is worth, and
-most of it belongs to the operating system rather than to this code.
+The question was "what is the ~350µs before `main`" — relocations, the `Lazy` statics,
+or faulting in 700kB of `Builtin.roc`. It is none of them. It is the dynamic loader, and
+it costs the same for a program that does nothing:
 
-Worth one afternoon, after everything above:
+| | wall, min of 41 |
+|---|---|
+| `/bin/true` | 1060µs (the harness's own fork/exec) |
+| `fn main() { println!("hi") }` | 1260µs — **+200µs** |
+| the same, `-C target-feature=+crt-static` | **997µs** |
+| `rocflight --version` | 1297µs |
 
-- what the 160µs is (relocations? the `Lazy` statics? faulting in 700kB of
-  `Builtin.roc` — which Phase 1 should already have stopped touching?);
-- whether `codegen-units = 1` plus fat LTO is still paying for itself, measured on the
-  suite rather than assumed.
+**rocflight's own startup on top of the Rust floor is ~20µs.** There was nothing inside
+the program to fix, which is why this phase kept reading as "or never".
+
+So the fix is the link. `.cargo/config.toml` sets `-C target-feature=+crt-static` for
+x86_64 Linux only; every other platform builds as before. Static glibc costs `dlopen`
+and NSS, and rocflight reads files, writes stdout, reads the clock and forks a compiler.
+
+Two things had to move first:
+
+- **`thiserror` is gone.** A proc macro cannot be built for a statically linked target,
+  so one derive blocked the whole thing. It was buying three `Display` impls, which are
+  now three `write!` calls in `src/error.rs`.
+- **`strip = true`** — a further ~30µs interleaved, and 240kB.
+
+```
+rocflight --version   1297µs -> 1042µs, two microseconds over /bin/true
+```
+
+Everything short gets it back, because a benchmark's wall includes its own startup:
+`closure_capture` −13.0%, `list_ops` −11.8%, `list_pass` −8.1%, `calls` −7.8%,
+`records_tail` −6.0%, `loop` −5.8%, `strings` −5.2%, `records` −4.2%. `iter_range`
+(183ms) does not move, which is the control: the win is per-process, not per-instruction.
+
+### And fat LTO is still paying for itself
+
+The other half of this phase, measured at last. `lto = "thin"` with
+`codegen-units = 16` builds in 8s instead of 21s and loses on ten of twelve benchmarks —
+`records_tail` +6.8%, `iter_range` +6.0%, `records` +4.4%. Keep it.
 
 ---
 
@@ -1205,6 +1292,82 @@ itself — see Phase 4.
 
 ---
 
+## Where the time goes now — **re-measured after Phases 4.6, 6, 7, 8 and 1.3b**
+
+Everything this document was chasing at the run end is gone or measured away. What is
+left is one number, and it is the front end again — but a different part of it, and for
+a different reason: **process startup used to hide it.**
+
+A four-line program that names a `Dict`, in process:
+
+```
+[time]                  desugar    0.012ms
+[time]                    parse    0.065ms   <- the USER's four lines
+[time]            slice + index    0.172ms
+[time]    (low level) reachable    0.132ms
+[time]        (low level) parse    0.617ms   <- 454 lines of Builtin.roc
+[time]               Dict parse    0.693ms   <- 674 lines
+[time]                Set parse    0.318ms   <- 230 lines
+[time]            builtin::load    2.003ms
+[time]               type check    0.061ms
+[time]                  compile    0.629ms
+[time]                      run    0.045ms
+```
+
+Its whole wall is 4.2ms of which 1.0ms is the shell's own fork/exec, so **rocflight is
+~3.2ms and `builtin::load` is two thirds of it.** 1,358 lines of `Builtin.roc` parsed at
+~1.2µs a line, so a program can name a `Dict` and spend all of its time on source it did
+not write.
+
+That is Phase 2 and Phase 3, and they are the same 1.66ms seen from two sides: don't
+parse it, or parse it faster. Both are large, and neither is started here.
+
+### Why Phase 3 is still not a side quest
+
+The parser has no hot spot — ~200ns a token, spread evenly, measured before any of this
+and unchanged since. The one cheap idea left was tried this round and refused:
+
+**Refused: only look for line-shaped constructs at a line start.** `skip_trivia` runs
+between every token and asks `capture_nominal_declaration` and
+`capture_type_annotation`, each of which scans to the end of the line and searches it
+for `:=`, `::` or `:`; the second then builds two `String`s. Both constructs read to the
+next `\n`, so guarding them on "the cursor is at the start of a line" looks free, and it
+is worth **−4.2%** on a `Dict` program, −3.2% on `strings` and −2.7% on a
+2,000-declaration file.
+
+It reads **1881 of 1953**. Annotations reach `skip_trivia` mid-line often enough to
+break 72 eval tests — and `tests/check_roc.sh` (99 golden pairs) and
+`tests/check_examples.sh` both stayed green while they did, which is the sharpest
+reminder yet of which gate is load-bearing. Anything cheaper than the full tokenizer has
+to understand WHICH mid-line positions matter first.
+
+So Phase 3 remains what it was: tokenize once instead of probing at 183 slice sites,
+across 5,915 lines with 13 save/restore points. It is the right fix and it is a project.
+
+### Why Phase 2 got bigger, not smaller
+
+Phase 2 now targets the single largest remaining number. It also still needs what it
+always needed: `Expr`, `Pattern` and `types::Type` serialized into a checked-in artifact
+(a build script cannot call the crate it is building), with node identity reproduced —
+`fresh_node` is load-bearing for annotations and nominal literals — and a regeneration
+gate so the artifact cannot rot. Worth roughly 1.5ms on any program naming a `Dict`,
+against a format that has to be kept fresh forever.
+
+Phase 3 needs no artifact and speeds up the user's own file too, which is why it is
+still ahead of Phase 2 in the order below.
+
+### The VM's per-op floor — measured, and there is nothing to shrink
+
+`loop.roc` is two instructions per iteration at ~18ns each. The standing theory was drop
+glue on every 48-byte register write, and that shrinking `Value` would pay. It cannot
+be shrunk: **three variants force 48 bytes independently** — `Simd { u8, u128 }`,
+`Range { i128, i128, bool, i64 }` and `Tag(&'static str, Rc<[Value]>)`. Getting to 32
+means boxing `Simd` (fine), boxing `Range` (an allocation per loop, which Phase 4.1
+spent its effort removing) and putting `Tag`'s payload back behind a `Vec` (undoing
+7.2). There is no version of this that wins.
+
+---
+
 ## Not doing
 
 - **A JIT.** The measured problem is a front end re-parsing a constant, not a slow inner
@@ -1259,8 +1422,7 @@ itself — see Phase 4.
    plus not materializing a discarded `Unit` took `loop` −26%, `matching` −20%,
    `records_tail` −19%. **4.4 and 4.5 measured and rejected** — neither's premise held, and
    perturbing the `DispatchMethod` arm cost `records` 6.5% through code layout alone.
-9. **Phase 2**, only if Phase 3 stalls: it needs a checked-in generated artifact and the
-   discipline to keep it fresh, which Phase 3 does not.
+9. **Phase 2** — see 14.
 10. ~~**Phase 7**~~ — done, all five items. Every benchmark faster, none regressed,
    1953 of 1953 throughout: `records` −27.5%, `matching_tail` −10.4%, `list_pass`
    −10.2%, down to `calls` −2.7%. Three of its own claims were wrong and the
@@ -1271,13 +1433,25 @@ itself — see Phase 4.
    needed to). 7.5 is the one to be careful around: a liveness pass whose failure mode
    is a wrong answer with no crash, kept safe by matching every opcode with no wildcard
    arm.
-11. ~~**Phase 8**~~ — done, all three items, and an opcode histogram picked every one
+11. ~~**Phase 4.6**~~ — done, and it was the COMPILER that was quadratic, not the
+   checker: compiling 8,000 declarations went 94.2ms → 2.21ms and is linear now.
+   ~~**Phase 4.2**~~ — measured and rejected, the third time code layout has beaten a
+   new opcode. ~~**Phase 1.3b**~~ — done, −12.7% on a `Dict` program, and it turned one
+   PENDING example into a passing one.
+12. ~~**Phase 6**~~ — done, and the answer was that the startup was never rocflight's:
+   ~200µs of it is the dynamic loader, which a static link removes. `--version` is now
+   two microseconds over `/bin/true`. Fat LTO measured and kept.
+13. **Phase 3**, the lexer — now the largest number in this document, because Phase 6
+   stopped hiding it. Still a project and still not a side quest; the one cheap
+   shortcut was tried this round and reads 1881 of 1953.
+14. **Phase 2**, only after 3 stalls, and for the reason it always had: an artifact that
+   must be kept fresh forever, against a fix that needs none.
+15. ~~**Phase 8**~~ — done, all three items, and an opcode histogram picked every one
    of them over what this list had queued: a `for` loop's back edge, a literal operand,
    and Phase 4.3's destination hint reaching calls and the lowered loops. `calls`
    −20.8%, `records_tail` −17.9%, `iter_range` −13.5%, nothing regressed. `loop.roc` is
    two instructions per iteration now.
-12. **Phase 6**, or never. Now measured: rocflight's own startup is ~350µs over
-   `/bin/true`, which is 0.7s of the suite's 13.0s.
+
 
 Every phase, the same gates, and the eval suite at 1953 of 1953. A phase that cannot
 hold that number does not land, however good its benchmark looks.
