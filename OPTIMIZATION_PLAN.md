@@ -477,19 +477,56 @@ prefixes are stored because `needed_by` can reach the low-level section six ways
 four of those contain `Dict` and `Set`, so that bytecode is stored four times. Worth
 revisiting only if binary size starts to matter.
 
+### Phase 2c — and stop decoding what nothing reads — **done**
+
+With the bytecode precompiled, what a run still did was decode `Builtin.roc`'s declared
+TYPES for the checker — and most of that was decoded into nothing. **Only `Dict` is ever
+asked for its signatures**: `signatures_for` serves four modules, two of which are never
+loaded, and `Set`'s must be re-parsed beside `Dict`'s anyway. The low-level section's 153
+signatures and `Set`'s 32 were built and dropped, every run.
+
+A member's sections are ordered by who wants what now, each expensive run behind a length
+so it can be stepped over rather than decoded:
+
+```
+intrinsics | signatures | nominals | node offsets | tree
+```
+
+`member_tables` reads the intrinsics and the nominals — what every run needs — and steps
+over the rest. `signatures_of` reads one member's when `signatures_for` asks, at most
+once and only for `Dict`.
+
+```
+builtin::load   0.235ms -> 0.018ms        a Dict program  -9.6%
+```
+
+The bytecode section is FIXED-WIDTH rather than varint, since binary size is not the
+constraint here. It bought 0.146ms → 0.136ms, so the honest reading is that the cost is
+materialising 99 chunks' `Vec`s and not decoding them. Without `unsafe` that is the
+floor, and `#![forbid(unsafe_code)]` is load-bearing.
+
+**The artifact was not reproducible, twice, for the same reason in two places.**
+`load` was a reader, and later `signatures_for` became another: generating an artifact
+read the previous one, and a table read back installs no nodes where parsing it would
+have, so every node id after it shifted. There is one switch now,
+`builtin::generating`, and every reader goes through `artifact()` — so a reader added
+later cannot reintroduce it. `tests/check_artifact.sh` caught it both times, which is
+the argument for a gate that REGENERATES rather than one that trusts.
+
 ### What is left of a `Dict` program
 
 ```
-[time]            parse    0.056ms   <- the user's four lines
-[time]    builtin::load    0.235ms   <- declared types only, no trees
-[time]       type check    0.050ms
-[time]          compile    0.088ms
-[time]              run    0.043ms
+[time]            parse    0.058ms   <- the user's four lines
+[time] builtin bytecode    0.133ms   <- 99 chunks materialised, not compiled
+[time]    builtin::load    0.018ms
+[time]       type check    0.104ms   <- including Dict's 36 signatures, read on demand
+[time]          compile    0.093ms   <- the app only
+[time]              run    0.041ms
 ```
 
-0.49ms in process, against 3.5ms when this document was rewritten. `builtin::load` is
-now the largest of them, and all it does is decode `Type`s for the checker — so the next
-thing, if there is one, is to store those the way the bytecode is stored.
+**0.46ms in process, against 3.5ms when this document was rewritten.** Nothing left is a
+re-derivation: the two largest numbers are materialising bytecode that cannot be shared
+without `unsafe`, and type-checking the user's own program.
 
 ## Phase 3 — the parser — **the cheap items done; the lexer is a decision, not a task**
 
