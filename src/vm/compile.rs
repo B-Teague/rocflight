@@ -28,6 +28,15 @@ struct Tops {
     /// Almost none do, so the ordinary `Bin` opcode skips the check entirely and only
     /// a program that overloads an operator pays for the lookup.
     operator_methods: bool,
+    /// The three above, by name.
+    ///
+    /// They were linear scans, and the top level looks EVERY binding up as it compiles
+    /// it, so compiling was quadratic in the number of top-level names: 1,000
+    /// declarations took 1.8ms, 8,000 took 94ms. First wins on a duplicate, which is
+    /// what `position`/`find` did.
+    fn_at: std::collections::HashMap<&'static str, (ChunkId, u16)>,
+    global_at: std::collections::HashMap<&'static str, u32>,
+    alias_at: std::collections::HashMap<&'static str, &'static str>,
 }
 
 /// The method names roc maps its operators onto. `a + b` IS `a.plus(b)`.
@@ -49,16 +58,30 @@ impl Tops {
     }
 
     fn func(&self, name: &str) -> Option<(ChunkId, u16)> {
-        self.fns.iter().find(|(n, ..)| *n == name).map(|(_, c, a)| (*c, *a))
+        self.fn_at.get(name).copied()
     }
 
     fn global(&self, name: &str) -> Option<u32> {
-        self.globals.iter().position(|n| *n == name).map(|i| i as u32)
+        self.global_at.get(name).copied()
     }
 
     /// The qualified name a bare one was exposed as, if any.
     fn alias(&self, name: &str) -> Option<&'static str> {
-        self.aliases.iter().find(|(bare, _)| *bare == name).map(|(_, full)| *full)
+        self.alias_at.get(name).copied()
+    }
+
+    /// Build the three indexes, once, after every name is known. `or_insert` and not
+    /// `insert`: a duplicate name resolved to the FIRST one when these were scans.
+    fn index(&mut self) {
+        for (name, chunk, arity) in &self.fns {
+            self.fn_at.entry(name).or_insert((*chunk, *arity));
+        }
+        for (i, name) in self.globals.iter().enumerate() {
+            self.global_at.entry(name).or_insert(i as u32);
+        }
+        for (bare, full) in &self.aliases {
+            self.alias_at.entry(bare).or_insert(full);
+        }
     }
 }
 
@@ -289,6 +312,9 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
         globals: Vec::new(),
         aliases,
         operator_methods: false,
+        fn_at: std::collections::HashMap::new(),
+        global_at: std::collections::HashMap::new(),
+        alias_at: std::collections::HashMap::new(),
     };
     // An ingested file is a top-level Str, known before the program starts.
     for (name, _) in &unit.ingested {
@@ -306,6 +332,8 @@ pub fn compile_unit(unit: &Unit) -> Result<Program, String> {
     tops.operator_methods = tops.fns.iter().any(|(name, ..)| {
         OPERATOR_METHODS.iter().any(|m| name.ends_with(&format!(".{}", m)))
     });
+    // Every name is known now and none is added after this point.
+    tops.index();
 
     let mut c = Compiler {
         tops,
