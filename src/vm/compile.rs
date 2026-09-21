@@ -765,6 +765,42 @@ impl Compiler {
         st.spans.push(node);
     }
 
+    /// `x + 1`: fold the literal straight into the operator, if that is what this is.
+    ///
+    /// The right operand is a literal exactly when the LAST instruction emitted is a
+    /// `LoadK` into `b`, and `b` is a temporary this expression allocated — `b >= save`,
+    /// the `next_reg` watermark from before the operands compiled. That second test is
+    /// not decoration: without it `y = 5` followed by `x + y` would match, because `y`'s
+    /// own `LoadK` is the previous instruction and `y`'s register is the operand. Fusing
+    /// there would delete the binding and leave every later read of `y` empty.
+    ///
+    /// The `LoadK` is REPLACED rather than removed, so the instruction count is what it
+    /// was when any jump target was recorded — a `while` loop's head is the first
+    /// instruction of its condition, which for `while i < 10` is exactly this `LoadK`.
+    /// Its span becomes the operator's, so an overflow still reports at the operator.
+    ///
+    /// `fused` arrives with `k: 0`; the real constant index is filled in here.
+    fn fuse_literal_operand(&mut self, a: Reg, b: Reg, save: Reg, fused: Op) -> bool {
+        if b == a || b < save {
+            return false;
+        }
+        let node = self.node;
+        let st = self.st();
+        let Some(&Op::LoadK { dst, k }) = st.code.last() else { return false };
+        if dst != b {
+            return false;
+        }
+        let with_k = match fused {
+            Op::BinK { dst, a, op, .. } => Op::BinK { dst, a, k, op },
+            Op::BinIntK { dst, a, op, width, .. } => Op::BinIntK { dst, a, k, op, width },
+            _ => return false,
+        };
+        let last = st.code.len() - 1;
+        st.code[last] = with_k;
+        st.spans[last] = node;
+        true
+    }
+
     fn alloc(&mut self) -> Result<Reg, String> {
         let st = self.st();
         let reg = st.next_reg;
@@ -1948,9 +1984,15 @@ impl Compiler {
                         }
                         _ => 0,
                     };
-                    self.emit(Op::BinInt { dst, a, b, op: *op, width });
+                    let fused = Op::BinIntK { dst, a, k: 0, op: *op, width };
+                    if !self.fuse_literal_operand(a, b, save, fused) {
+                        self.emit(Op::BinInt { dst, a, b, op: *op, width });
+                    }
                 } else {
-                    self.emit(Op::Bin { dst, a, b, op: *op });
+                    let fused = Op::BinK { dst, a, k: 0, op: *op };
+                    if !self.fuse_literal_operand(a, b, save, fused) {
+                        self.emit(Op::Bin { dst, a, b, op: *op });
+                    }
                 }
                 Ok(dst)
             }
@@ -3089,6 +3131,8 @@ impl Compiler {
             | Op::LoadSelf { dst: d }
             | Op::Bin { dst: d, .. }
             | Op::BinInt { dst: d, .. }
+            | Op::BinK { dst: d, .. }
+            | Op::BinIntK { dst: d, .. }
             | Op::BinDispatch { dst: d, .. }
             | Op::MakeClosure { dst: d, .. }
             | Op::MakeList { dst: d, .. }

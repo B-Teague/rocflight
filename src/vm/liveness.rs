@@ -175,6 +175,8 @@ pub(super) fn successors(op: &Op, ip: usize, len: usize, mut f: impl FnMut(usize
         | Op::LoadSelf { .. }
         | Op::Bin { .. }
         | Op::BinInt { .. }
+        | Op::BinK { .. }
+        | Op::BinIntK { .. }
         | Op::BinDispatch { .. }
         | Op::MakeClosure { .. }
         | Op::CallFn { .. }
@@ -239,6 +241,9 @@ fn reads(op: &Op, out: &mut Vec<Reg>) {
             out.push(a);
             out.push(b);
         }
+
+        // The right operand is a constant, not a register.
+        Op::BinK { a, .. } | Op::BinIntK { a, .. } => out.push(a),
 
         Op::JumpFalse { cond, .. }
         | Op::TestBool { cond, .. }
@@ -320,6 +325,8 @@ fn kills(op: &Op, out: &mut Vec<Reg>) {
         | Op::LoadSelf { dst }
         | Op::Bin { dst, .. }
         | Op::BinInt { dst, .. }
+        | Op::BinK { dst, .. }
+        | Op::BinIntK { dst, .. }
         | Op::BinDispatch { dst, .. }
         | Op::MakeClosure { dst, .. }
         | Op::CallFn { dst, .. }

@@ -229,6 +229,12 @@ pub enum Op {
     /// `width` is the operands' integer width as `bits | (signed << 7)`, or 0 when the
     /// checker did not name one; a result outside it is roc's overflow crash.
     BinInt { dst: Reg, a: Reg, b: Reg, op: BinOp, width: u8 },
+    /// `Bin`/`BinInt` whose RIGHT operand is a literal, read straight from `consts`
+    /// rather than loaded into a register first. `x + 1` was two instructions and is
+    /// one; `vm::compile` fuses them where the literal's register is a temporary it
+    /// allocated for exactly that operand.
+    BinK { dst: Reg, a: Reg, k: u32, op: BinOp },
+    BinIntK { dst: Reg, a: Reg, k: u32, op: BinOp, width: u8 },
     /// `ip = to`
     Jump { to: u32 },
     /// `if cond == False { ip = to }`. The condition must be a `Bool`, and `kind`
@@ -911,49 +917,32 @@ impl Vm {
                     .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
+                // The right operand is a LITERAL, read straight out of the constant
+                // table. The `LoadK` that used to put it in a register first was a
+                // whole dispatch, a 48-byte copy and the drop glue on whatever the
+                // register held — a quarter of everything `calls` executes and nearly
+                // a third of `records_tail`.
+                Op::BinK { dst, a, k, op } => {
+                    let value = crate::eval::apply_binop(
+                        op,
+                        &regs[base + a as usize],
+                        &program.chunks[chunk_id as usize].consts[k as usize],
+                    )
+                    .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                    regs[base + dst as usize] = value;
+                }
                 Op::BinInt { dst, a, b, op, width } => {
-                    // `I128` cannot be range-checked after the fact — its arithmetic
-                    // wraps at the same width the value lives in — so its overflow is
-                    // caught with checked i128 math here, before `int_binop` wraps it.
-                    if width == crate::eval::I128_WIDTH {
-                        if let (Value::Int(x), Value::Int(y)) = (&regs[base + a as usize], &regs[base + b as usize]) {
-                            let checked = match op {
-                                crate::ast::BinOp::Add => x.checked_add(*y),
-                                crate::ast::BinOp::Sub => x.checked_sub(*y),
-                                crate::ast::BinOp::Mul => x.checked_mul(*y),
-                                crate::ast::BinOp::IntDiv | crate::ast::BinOp::Div => x.checked_div(*y),
-                                _ => Some(0),
-                            };
-                            match checked {
-                                Some(_) if !matches!(op, crate::ast::BinOp::Add | crate::ast::BinOp::Sub | crate::ast::BinOp::Mul | crate::ast::BinOp::IntDiv | crate::ast::BinOp::Div) => {}
-                                Some(n) => { regs[base + dst as usize] = Value::Int(n); continue; }
-                                None => {
-                                    return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                        message: "crash: integer overflow: I128 arithmetic overflowed".to_string(),
-                                    }))
-                                }
-                            }
-                        }
-                    }
-                    let value = match (&regs[base + a as usize], &regs[base + b as usize]) {
-                        (Value::Int(x), Value::Int(y)) => match crate::eval::int_binop(op, *x, *y)
-                        {
-                            Some(Ok(Value::Int(n))) if width != 0 && !crate::eval::fits_width(n, width) => {
-                                return Err(locate_error(&program, chunk_id, ip, EvalError {
-                                    message: format!("crash: integer overflow: {} does not fit", n),
-                                }))
-                            }
-                            Some(result) => result,
-                            // `and`/`or` are the only ops `int_binop` declines, and the
-                            // compiler never specialises those.
-                            None => crate::eval::apply_binop(
-                                op,
-                                &regs[base + a as usize],
-                                &regs[base + b as usize],
-                            ),
-                        },
-                        (left, right) => crate::eval::apply_binop(op, left, right),
-                    }
+                    let value = bin_int(op, width, &regs[base + a as usize], &regs[base + b as usize])
+                        .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
+                    regs[base + dst as usize] = value;
+                }
+                Op::BinIntK { dst, a, k, op, width } => {
+                    let value = bin_int(
+                        op,
+                        width,
+                        &regs[base + a as usize],
+                        &program.chunks[chunk_id as usize].consts[k as usize],
+                    )
                     .map_err(|e| locate_error(&program, chunk_id, ip, e))?;
                     regs[base + dst as usize] = value;
                 }
@@ -1651,6 +1640,64 @@ impl Vm {
 ///
 /// A move rather than a clone: these registers are the aggregate's own arguments and
 /// are dead the instant it is built.
+/// Integer arithmetic the checker proved is integer arithmetic.
+///
+/// Shared by `BinInt` and `BinIntK`, which differ only in where the right operand
+/// comes from — a register or the constant table. `inline(always)` for the reason
+/// `iter_step` has it: left out of line this is a call on the hottest opcode there is.
+/// Errors come back UNLOCATED; the call site attaches the instruction.
+#[inline(always)]
+fn bin_int(
+    op: crate::ast::BinOp,
+    width: u8,
+    lhs: &Value,
+    rhs: &Value,
+) -> Result<Value, EvalError> {
+    // `I128` cannot be range-checked after the fact — its arithmetic wraps at the same
+    // width the value lives in — so its overflow is caught with checked i128 math here,
+    // before `int_binop` wraps it.
+    if width == crate::eval::I128_WIDTH {
+        if let (Value::Int(x), Value::Int(y)) = (lhs, rhs) {
+            let checked = match op {
+                crate::ast::BinOp::Add => x.checked_add(*y),
+                crate::ast::BinOp::Sub => x.checked_sub(*y),
+                crate::ast::BinOp::Mul => x.checked_mul(*y),
+                crate::ast::BinOp::IntDiv | crate::ast::BinOp::Div => x.checked_div(*y),
+                _ => Some(0),
+            };
+            match checked {
+                Some(_)
+                    if !matches!(
+                        op,
+                        crate::ast::BinOp::Add
+                            | crate::ast::BinOp::Sub
+                            | crate::ast::BinOp::Mul
+                            | crate::ast::BinOp::IntDiv
+                            | crate::ast::BinOp::Div
+                    ) => {}
+                Some(n) => return Ok(Value::Int(n)),
+                None => {
+                    return Err(EvalError {
+                        message: "crash: integer overflow: I128 arithmetic overflowed".to_string(),
+                    })
+                }
+            }
+        }
+    }
+    match (lhs, rhs) {
+        (Value::Int(x), Value::Int(y)) => match crate::eval::int_binop(op, *x, *y) {
+            Some(Ok(Value::Int(n))) if width != 0 && !crate::eval::fits_width(n, width) => {
+                Err(EvalError { message: format!("crash: integer overflow: {} does not fit", n) })
+            }
+            Some(result) => result,
+            // `and`/`or` are the only ops `int_binop` declines, and the compiler never
+            // specialises those.
+            None => crate::eval::apply_binop(op, lhs, rhs),
+        },
+        (left, right) => crate::eval::apply_binop(op, left, right),
+    }
+}
+
 /// One step of a `for` loop, shared by `IterNext` and `IterNextBack`.
 ///
 /// They differ only in which way round the two answers go: `on_item` is where to
