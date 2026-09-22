@@ -201,7 +201,6 @@ impl Substitution {
         }
     }
 
-    /// Create empty substitution
     pub fn new() -> Self {
         Substitution {
             bindings: HashMap::new(),
@@ -213,7 +212,6 @@ impl Substitution {
         self.bindings.insert(var, ty);
     }
 
-    /// Get a type binding
     pub fn get(&self, var: u32) -> Option<&Type> {
         self.bindings.get(&var)
     }

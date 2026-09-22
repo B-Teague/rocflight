@@ -21,7 +21,6 @@ pub struct PlatformLoader {
 }
 
 impl PlatformLoader {
-    /// Create new platform loader
     pub fn new(name: String, url: String) -> Self {
         PlatformLoader { url, name }
     }

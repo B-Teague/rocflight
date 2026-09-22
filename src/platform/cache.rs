@@ -16,24 +16,20 @@ pub struct PlatformCache {
 }
 
 impl PlatformCache {
-    /// Create new empty cache
     pub fn new() -> Self {
         PlatformCache {
             platforms: HashMap::new(),
         }
     }
 
-    /// Check if platform is cached
     pub fn contains(&self, url: &str) -> bool {
         self.platforms.contains_key(url)
     }
 
-    /// Get cached platform
     pub fn get(&self, url: &str) -> Option<&Platform> {
         self.platforms.get(url)
     }
 
-    /// Get cached platform (clone if needed)
     pub fn get_clone(&self, url: &str) -> Option<Platform> {
         self.platforms.get(url).cloned()
     }
@@ -43,7 +39,6 @@ impl PlatformCache {
         self.platforms.insert(url, platform);
     }
 
-    /// Get all cached platform URLs
     pub fn cached_urls(&self) -> Vec<&String> {
         self.platforms.keys().collect()
     }
@@ -53,7 +48,6 @@ impl PlatformCache {
         self.platforms.len()
     }
 
-    /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
         self.platforms.is_empty()
     }

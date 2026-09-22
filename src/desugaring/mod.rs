@@ -1,93 +1,39 @@
-//! Shorthand Syntax Desugaring
+//! Step 1 of the pipeline: a text-level rewrite before parsing.
 //!
-//! Converts all Roc shorthand syntax to explicit functional syntax
-//! BEFORE parsing. This keeps the parser simple and the AST clean.
+//! It is currently the identity. Everything that once lived here either was never
+//! sugar or needs an expression's extent, so the parser does it — `??`, `?` (which
+//! moves the rest of the block into the `Ok` arm), `.?` and `?:`. Learning.md §8 has
+//! the full table, including the forms that only look like sugar. The tests below are
+//! the guardrail: a text pass that scanned for `!` once emitted Rust-shaped nonsense
+//! into `.roc` output, mangled `a != b` into `a = b` and rewrote every `match` arm's
+//! `=>` to `->`.
 //!
-//! See DESUGARING.md for detailed rules on each transformation.
-//!
-//! Type annotations are PRESERVED, not stripped: the emitted .roc file is a real
-//! Roc program that must pass `roc check` on its own, with explicit types (see
-//! PHASE_IMPLEMENTATION_GUIDE.md, "The golden-pair rule"). Skipping annotations is
-//! the parser's job, not the desugarer's.
-//!
-//! Handled in the PARSER, not here (they need the expression structure):
-//! - `??` — default value; becomes `match e { Ok(v) => v, Err(_) => d }`
-//! - `?` — error propagation; becomes a match whose Ok arm holds the rest of the block
-//!
-//! Not implemented:
-//! - `.?` — optional field access; SEGFAULTS `roc` on nightly-2026-09-03, so no
-//!   golden pair can be written against it
-//! - `?:` — optional record fields; type-level only, and needs nominal types
-//!
-//! NOT desugaring, despite looking like it (see roc-compiler/src/parse/tokenize.zig
-//! `chompIdentGeneral` and src/check/problem/types.zig `EffectfulFunctionName`):
-//! - `foo!` — the `!` is part of the identifier. An effectful binding whose name
-//!   lacks `!` is a warning upstream; there is nothing here to rewrite.
-//! - `!foo` — unary logical not. Upstream canonicalizes it to a `Bool.not` call
-//!   (src/base/mod.zig `CalledVia.unary_op`), not a text rewrite.
-//! - `=>` — effectful function type in an annotation, and the arm separator in
-//!   `match`. It is never `->`.
+//! Whatever this emits must be a real Roc program that passes `roc check` on its own,
+//! with its types explicit — that is what a golden pair's `.desugared.roc` file is,
+//! which is why annotations are PRESERVED rather than stripped. The parser skips
+//! annotation lines instead (`Parser::skip_type_annotation`).
 
 use crate::error::ParseError;
 
-/// Desugarer: converts shorthand syntax to functional syntax
 pub struct Desugarer {
     input: String,
 }
 
 impl Desugarer {
-    /// Create new desugarer for input
     pub fn new(input: String) -> Self {
         Desugarer { input }
     }
 
-    /// Load from file and create desugarer
     pub fn from_file(path: &str) -> Result<Self, std::io::Error> {
-        let input = std::fs::read_to_string(path)?;
-        Ok(Desugarer { input })
+        Ok(Desugarer { input: std::fs::read_to_string(path)? })
     }
 
-    /// Run all desugaring passes in order
-    /// Each pass transforms shorthand syntax into explicit, verbose forms
-    /// Desugar the source text.
-    ///
-    /// Text-level passes only. `?` and `??` are NOT here: they are desugared in the
-    /// parser, which is the only place with the information they need.
-    ///
-    /// * `??` becomes `match e { Ok(v) => v, Err(_) => default }` — a local rewrite,
-    ///   but it needs the operand's extent, which means expression parsing.
-    /// * `?` moves THE REST OF THE BLOCK into the `Ok` arm. Locating "the rest of the
-    ///   block" in raw text is not something string substitution can do reliably;
-    ///   the parser already builds blocks by folding statements from the end, so the
-    ///   continuation is exactly what it has in hand.
-    ///
-    /// See `Parser::propagate_error` and `Parser::parse_or_expr`.
+    /// Desugar the source text. See the module header.
     pub fn desugar(&self) -> Result<String, ParseError> {
-        // Type annotations are preserved; the parser skips them. See Rule 1 in
-        // DESUGARING.md for why deleting them was wrong.
-        let annotated = self.remove_type_annotations(&self.input)?;
-
-        // ponytail: no text-level passes remain. Kept as a single call so the shape
-        // is obvious when `.?` / `?:` arrive — and `.?` is blocked upstream anyway,
-        // it segfaults `roc` on nightly-2026-09-03.
-        Ok(annotated)
+        // ponytail: no text-level pass remains. Kept as a step so the shape is obvious
+        // if one is ever needed again; adding one means re-reading the module header.
+        Ok(self.input.clone())
     }
-
-    /// Pass 0: type annotations are kept verbatim.
-    ///
-    /// This used to delete `x : Type` lines so the parser never saw them. That made
-    /// the emitted .roc file un-compilable as Roc and lost the types the desugared
-    /// output is supposed to make explicit. The parser skips annotation lines
-    /// instead; see `Parser::skip_type_annotation`.
-    fn remove_type_annotations(&self, input: &str) -> Result<String, ParseError> {
-        Ok(input.to_string())
-    }
-
-
-
-
-
-
 }
 
 #[cfg(test)]

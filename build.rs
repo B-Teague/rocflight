@@ -2,7 +2,7 @@
 // platform's `app`, for x86_64-unknown-linux-musl — so `rocflight main.roc` on a
 // platform app works from a copied binary with nothing beside it. The driver
 // extracts it into the cache on first use, the way `roc` extracts its own shim
-// libraries (PLATFORM_HOST_PLAN.md §3).
+// libraries (Learning.md §13).
 //
 // Build order is therefore: the host library first, then this binary:
 //     cargo build -p rocflight-host --release --target x86_64-unknown-linux-musl
@@ -61,7 +61,7 @@ fn member_name(line: &str) -> Option<&str> {
 /// This scan used to happen once per process, inside a `OnceLock` — and "once per
 /// process" was still 0.9ms of every program that names a `Dict`, because it walks all
 /// 700kB of the file. The file is a constant compiled into the binary, so its member
-/// boundaries are a constant too. `OPTIMIZATION_PLAN.md` phase 1.1.
+/// boundaries are a constant too. `Learning.md` §11, phase 1.
 ///
 /// The gate is `tests/check_builtin.sh --strict`: a skewed offset makes a member fail
 /// to parse, loudly, member by member.
@@ -130,7 +130,7 @@ fn member_source(source: &str, start: usize, end: usize, in_nominal: bool) -> St
 /// itself then cost 0.75ms, because it closed over the text word by word and allocated
 /// a `String` per word — over 2,300 lines, in every process. The words are a constant,
 /// so the answer is: this writes it out per member and `builtin::reachable` unions the
-/// lists of whatever is loaded. `OPTIMIZATION_PLAN.md` phase 1.2.
+/// lists of whatever is loaded. `Learning.md` §11, phase 1.
 ///
 /// A declaration is reached when its name appears in the member's text or in a reached
 /// declaration's own text, closed over. The walk is by word, so a name in a comment

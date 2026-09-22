@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 ROC=${ROC:-roc}
 ROCFLIGHT=${ROCFLIGHT:-$PWD/target/debug/rocflight}
 # An app on a real platform runs on that platform's host: rocflight links
-# `librocflight_host.a` into it (see PLATFORM_HOST_PLAN.md). Built by
+# `librocflight_host.a` into it (Learning.md §13). Built by
 # `tests/check_host.sh`; without it, platform apps stop at their first effect.
 HOST_LIB=$PWD/target/x86_64-unknown-linux-musl/release/librocflight_host.a
 [ -z "${ROCFLIGHT_LIB:-}" ] && [ -f "$HOST_LIB" ] && export ROCFLIGHT_LIB=$HOST_LIB
@@ -37,7 +37,7 @@ ROC_VERSION=$("$ROC" version 2>/dev/null | awk '{print $NF}')
 #   run       compare bare `roc <entry>` against `rocflight <entry>`
 #   test      a module with no entry point; roc runs its `expect`s via `roc test`
 #   host      runs on a real platform's compiled host, which rocflight links itself
-#             into (PLATFORM_HOST_PLAN.md; needs librocflight_host.a, see below).
+#             into (Learning.md §13; needs librocflight_host.a, see below).
 #             `roc` is the oracle; a mismatch is a language gap met on the way and
 #             is reported as PENDING, fatal only under --strict
 #   skip:...  roc itself cannot run it with the installed compiler; reason follows
@@ -57,7 +57,7 @@ ROC_VERSION=$("$ROC" version 2>/dev/null | awk '{print $NF}')
 # compiler's own open-addressing table, `Json` and `EncodeDecode` a codec a type can
 # override with its own `encoder_for`, and `SafeMath` a real fixed-point `Dec`. The
 # numeric ones also needed roc's numeral default — an unconstrained literal is
-# fractional, so `15` prints `15.0`. See BUILTIN_PLAN.md.
+# fractional, so `15` prints `15.0`. See Learning.md §11.
 MANIFEST=$(cat <<'EOF'
 HelloWorld              main.roc                run
 FizzBuzz                main.roc                run

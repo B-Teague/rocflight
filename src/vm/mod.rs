@@ -1,7 +1,7 @@
 //! A register VM for Roc, in safe Rust. The engine.
 //!
 //! It ran alongside a tree-walking interpreter for six phases, gated against it at
-//! every step; `OPTIMIZATION_PLAN.md` has the measurements and the order they landed
+//! every step; `Learning.md` §11 has the measurements and the order they landed
 //! in. The tree-walker is gone, and this runs every program.
 //!
 //! Four properties are load-bearing and worth stating before the code:
@@ -213,7 +213,7 @@ pub enum Op {
     CellSet { cell: Reg, src: Reg },
     /// `dst = the closure that is running`.
     ///
-    /// How a block-local function calls itself. The tree-walker rebinds a rebuilt
+    /// How a block-local function calls itself. The tree-walker rebound a rebuilt
     /// closure into every call frame to tie that knot; the running closure is already
     /// in the frame, so this is a refcount bump and no analysis.
     LoadSelf { dst: Reg },
@@ -239,7 +239,7 @@ pub enum Op {
     Jump { to: u32 },
     /// `if cond == False { ip = to }`. The condition must be a `Bool`, and `kind`
     /// decides only what a non-`Bool` is told — roc words the three cases differently
-    /// and the tree-walker follows it, so the VM has to as well.
+    /// and the tree-walker followed it, so the VM has to as well.
     JumpFalse { cond: Reg, to: u32, kind: CondKind },
     /// `dst = closure(chunk, regs[base..base + n])` — the captures are already in
     /// consecutive registers, put there by the enclosing function.
@@ -248,7 +248,7 @@ pub enum Op {
     ///
     /// The arguments are already in consecutive registers, and the callee's frame
     /// starts at `base` — so a call passes no argument list at all, which is the
-    /// per-call `Vec<Value>` the tree-walker allocates. A top-level function needs no
+    /// per-call `Vec<Value>` the tree-walker allocated. A top-level function needs no
     /// closure value either, so a direct call allocates nothing whatsoever.
     CallFn { dst: Reg, chunk: ChunkId, base: Reg, argc: u16 },
     /// `dst = regs[func](regs[base..base + argc])`, the callee a value in a register.
@@ -418,11 +418,13 @@ pub struct Chunk {
     pub n_regs: u16,
     pub arity: u16,
     /// Parameter names. Shared with the AST node, and used only to render a function
-    /// value as `<lambda |x, y|>` — the same text the tree-walker produces.
+    /// value as `<lambda |x, y|>` — the same text the tree-walker produced.
     pub params: Rc<[&'static str]>,
-    /// Field and tag names, by index. Names are compared by content at run time —
-    /// resolving a field to a SLOT needs the record's type at the access site, which
-    /// means threading the checker's types through the compiler. A later phase.
+    /// Field and tag names, by index. Names are compared by content at run time, which
+    /// is the one exception to "no string comparison at run time" and is deliberate:
+    /// resolving a field to a SLOT was measured twice and bought nothing, because
+    /// `GetField`'s cost is the dispatch and the `Value` clone, not reaching the name
+    /// (Learning.md §12).
     pub names: Vec<&'static str>,
     /// Literal patterns, by index. Only `Int`, `Float` and `Str` ever land here: every
     /// other pattern is compiled into tests and destructuring ops.
@@ -672,7 +674,7 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
 
 /// A suspended caller: where to resume, and where to put the result.
 ///
-/// The tree-walker spends many Rust frames per Roc call, which is why it needs a 256 MB
+/// The tree-walker spent many Rust frames per Roc call, which is why it needed a 256 MB
 /// stack to recurse a few hundred levels; this is a `Vec` push.
 #[derive(Debug)]
 struct Frame {
@@ -916,13 +918,13 @@ impl Vm {
                     regs[base + dst as usize] = Value::Closure(cur.clone());
                 }
                 Op::Bin { dst, a, b, op } => {
-                    // The one implementation of Roc's operators, shared with the
-                    // tree-walker. The operands are borrowed, not cloned: cloning two
-                    // 32-byte `Value`s to add two integers was 40% of `fib`.
+                    // The one implementation of Roc's operators. The operands are
+                    // borrowed, not cloned: cloning two 32-byte `Value`s to add two
+                    // integers was 40% of `fib`.
                     //
-                    // Nominal operator overloading (`dispatch_operator`) is not
-                    // consulted because the compiler cannot yet compile a nominal's
-                    // method block, so no value reaching here can have one.
+                    // A nominal's own operator method goes to `BinDispatch`, which the
+                    // compiler emits whenever the program defines one, so nothing
+                    // reaching this arm can have one.
                     let value = crate::eval::apply_binop(
                         op,
                         &regs[base + a as usize],
@@ -962,7 +964,7 @@ impl Vm {
                 }
                 Op::Jump { to } => ip = to as usize,
                 Op::JumpFalse { cond, to, kind } => {
-                    // Strictly a `Bool`, and the same message as the tree-walker for
+                    // Strictly a `Bool`, and the tree-walker's message for
                     // anything else: roc has no truthiness and neither does this.
                     match &regs[base + cond as usize] {
                         Value::Bool(true) => {}
@@ -1859,7 +1861,7 @@ fn grow(regs: &mut Vec<Value>, need: usize) {
     }
 }
 
-/// The tree-walker's wording, so a wrong-arity call reads the same on both engines.
+/// The tree-walker's wording, kept so the message did not change when it went.
 fn check_arity(expected: u16, got: u16) -> Result<(), EvalError> {
     if expected == got {
         return Ok(());
@@ -1875,7 +1877,7 @@ fn too_deep(name: &str) -> EvalError {
     }
 }
 
-/// A value being called has to be a function, and the message matches the tree-walker's.
+/// A value being called has to be a function; the tree-walker's message, kept.
 fn as_closure(value: &Value) -> Result<Rc<Closure>, EvalError> {
     match value {
         Value::Closure(c) => Ok(c.clone()),

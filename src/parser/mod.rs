@@ -1,25 +1,15 @@
-//! Pure Functional Parser for Roc
+//! Hand-written recursive descent, desugared source in and `ast::Expr` out.
 //!
-//! Built with pure functional combinators (no external parser libraries)
-//! Follows idiomatic Rust with Result-based error handling
-//!
-//! Pipeline:
-//! 1. Desugar shorthand syntax
-//! 2. Parse desugared code
-//! 3. Build AST
-//!
-//! Parser Architecture:
-//! - Recursive descent with explicit precedence levels
-//! - Pure functions that return Result<(T, &str), ParseError>
-//! - No side effects or external dependencies
-//! - Full transparency and control over parsing behavior
+//! It also collects the side-tables later phases need and cannot recover from the tree
+//! (nominals, `where` methods, literal suffixes, field defaults, imports, the entry
+//! point), and it is where `?`, `??` and `.?` are expanded — each needs an expression's
+//! extent, which the text-level desugarer cannot find. Learning.md §2 has the pipeline.
 
 use crate::ast::{Expr, StrPart, MatchArm, Pattern};
 use crate::types::Type;
 use crate::error::ParseError;
 use crate::memory::string_pool;
 
-/// Roc parser
 pub struct Parser {
     input: String,
     pos: usize,
@@ -154,7 +144,6 @@ pub struct Parser {
 }
 
 impl Parser {
-    /// Create new parser for input
     /// A parser whose nodes know which file they came from, so a runtime error can
     /// say where.
     ///
@@ -207,17 +196,10 @@ impl Parser {
         }
     }
 
-    /// Get the app entry point if one was found
     pub fn app_entry_point(&self) -> Option<String> {
         self.entry_point.clone()
     }
 
-    /// Parse expression (entry point)
-    /// Handles: let bindings, function calls, literals, top-level definitions
-    /// A fresh node id, remembering where the parser currently is.
-    ///
-    /// Composite nodes should prefer `crate::ast::fresh_node_like(child)`, which takes
-    /// the construct's START from its first child rather than its end from here.
     /// A nominal suffix on a literal PATTERN — `123.MyNum =>` — is dropped: the
     /// scrutinee's type already says which conversion the literal goes through.
     fn skip_type_suffix(&mut self) {
@@ -228,6 +210,9 @@ impl Parser {
         }
     }
 
+    /// A fresh node id, remembering where the parser currently is. Composite nodes
+    /// should prefer `crate::ast::fresh_node_like(child)`, which takes the construct's
+    /// START from its first child rather than its end from here.
     fn node(&self) -> crate::ast::NodeId {
         crate::ast::fresh_node(self.pos)
     }
@@ -1090,8 +1075,8 @@ impl Parser {
     /// two alike is honest rather than lazy — within one file roc does not distinguish
     /// them either (both allow field access and both accept the plain backing value).
     ///
-    /// A trailing `.{ ... }` method block is skipped: methods need static dispatch,
-    /// which is a later phase.
+    /// A trailing `.{ ... }` method block is parsed by `parse_method_block`: its
+    /// members become ordinary `Type.method` bindings.
     fn capture_nominal_declaration(&mut self) -> bool {
         let rest = &self.input[self.pos..];
         let line_end = rest.find('\n').unwrap_or(rest.len());

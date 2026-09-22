@@ -8,14 +8,11 @@
 //!     backing record
 //!   * a nominal over a tag union is still exhaustiveness-checked
 //!
-//! NOT implemented, with reasons:
-//!   * `::` opaque types — within one file roc does not distinguish them from `:=`
-//!     (both allow field access and both accept the plain backing), and opacity only
-//!     matters across module boundaries, which the interpreter does not have
-//!   * `.{ ... }` method blocks — methods need static dispatch, a later phase; the
-//!     block is parsed and skipped
-//!   * `field : T ?? default` and `field ?: T` in a backing record — reading an
-//!     optional field needs `.?`, which SEGFAULTS the roc compiler
+//! `::` opaque types are accepted as a SYNONYM for `:=`, because within one file roc
+//! does not distinguish them — both allow field access and both accept the plain
+//! backing — and opacity only matters across module boundaries. Method blocks, field
+//! defaults and optional fields all landed later in this phase; the notes that used to
+//! sit here calling them unimplemented, and `.?` a compiler segfault, were both wrong.
 
 use rocflight::desugaring::Desugarer;
 use rocflight::eval::Value;

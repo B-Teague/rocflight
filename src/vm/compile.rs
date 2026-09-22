@@ -1,6 +1,6 @@
 //! AST → bytecode.
 //!
-//! Everything this pass does is work the tree-walker does again on every execution:
+//! Everything this pass does is work a tree-walker would redo on every execution:
 //! deciding which register a name lives in, which chunk a call goes to, which of an
 //! enclosing function's values a closure needs, where a branch lands. Doing it once is
 //! the entire point.
@@ -137,7 +137,7 @@ pub struct Unit<'a> {
     /// once and reused. See `artifact::Prefix`.
     pub prefix_modules: usize,
     /// Compiled into the SAME program as the app, ahead of it, so a module's top level
-    /// is part of this one's. The tree-walker gets the same effect by evaluating each
+    /// is part of this one's. The tree-walker got the same effect by evaluating each
     /// module into the shared global scope first.
     pub modules: Vec<Module<'a>>,
     pub app: &'a Expr,
@@ -1090,7 +1090,7 @@ impl<'u> Compiler<'u> {
         Ok(idx)
     }
 
-    /// Resolve a name the way the tree-walker's `lookup` would: innermost first.
+    /// Resolve a name innermost-first, as the tree-walker's `lookup` did.
     /// The nominal whose method block is being compiled, from the function's own name.
     ///
     /// Inside `Graph :: … .{ … }` a sibling method is in scope UNQUALIFIED — roc lets
@@ -1151,7 +1151,7 @@ impl<'u> Compiler<'u> {
             return Some(Found::Func(c, a));
         }
         // Last: a name another module exposed. Checked after everything else so a
-        // local binding of the same name wins, as it does in the tree-walker.
+        // local binding of the same name wins, as it did in the tree-walker.
         let full = self.tops.alias(name)?;
         match self.resolve(full) {
             None => Some(Found::Refused(format!(
@@ -1177,11 +1177,12 @@ impl<'u> Compiler<'u> {
 
         if let Some(l) = self.states[parent].local_mut(name) {
             if l.is_var && !l.boxed {
-                // ponytail: a `var` a closure captures needs a shared cell
-                // (`Rc<RefCell<Value>>`) so both see the assignments; captured by value
-                // it would silently go stale, and the tree-walker's shared frames make
-                // it work. Nothing in the language's own suite does this, so it is
-                // refused rather than built for. Add the cell if a real program wants it.
+                // A `var` a closure captures is compiled through a shared cell
+                // (`MakeCell` / `CellGet`) so both sides see the assignments — but only
+                // when the binding was boxed as it was created. This arm is the one that
+                // was not, and capturing it by value would silently go stale, so it is
+                // refused instead. ponytail: boxing retroactively means re-emitting the
+                // binding; do it only if a real program hits this.
                 return Err(format!(
                     "vm: `{}` is a `var` captured by a closure, which needs a shared cell (V3 refuses it rather than copying it and going stale)",
                     name
@@ -2434,7 +2435,7 @@ impl<'u> Compiler<'u> {
                 self.dispatch(receiver, method, args, *id)
             }
 
-            // The three statement forms. Each yields `{}`, as in the tree-walker.
+            // The three statement forms. Each yields `{}`.
             Expr::Expect(condition, _) => {
                 let save = self.st().next_reg;
                 let cond = self.expr(condition)?;
@@ -2473,7 +2474,7 @@ impl<'u> Compiler<'u> {
 
             Expr::For { name, iterable, body, .. } => {
                 self.for_loop(name, iterable, body)?;
-                // `for` is a statement: its value is `{}`, as in the tree-walker.
+                // `for` is a statement: its value is `{}`.
                 self.literal(Value::Unit)
             }
 
@@ -2484,7 +2485,7 @@ impl<'u> Compiler<'u> {
 
             Expr::Break(_) => {
                 if self.st().loops.is_empty() {
-                    // The tree-walker raises a break signal that nothing catches, so
+                    // The tree-walker raised a break signal that nothing caught, so
                     // what a bare `break` does there is not worth copying.
                     return Err("vm: `break` outside a loop".to_string());
                 }
@@ -2505,7 +2506,7 @@ impl<'u> Compiler<'u> {
     /// A `match`, as a chain of compare-and-branch.
     ///
     /// Every arm's tests jump to the next alternative on failure, so a match costs the
-    /// tests it actually runs and nothing else. The tree-walker instead allocates a
+    /// tests it actually runs and nothing else. The tree-walker instead allocated a
     /// `Vec` of bindings per pattern attempt, pushes a scope, and binds each name into
     /// it — for every arm it tries, not just the one that wins.
     ///
@@ -3005,7 +3006,7 @@ impl<'u> Compiler<'u> {
                     self.emit(Op::CallBuiltin { dst, name, base: arg_base, argc });
                     return Ok(Some(dst));
                 }
-                // Bare `to_str(x)`. The tree-walker stringifies any value here, which
+                // Bare `to_str(x)`. The tree-walker stringified any value here, which
                 // is what `Num.to_str` does, so it goes to the same place.
                 if *bare == "to_str" {
                     let name = self.names_run(&["Num", "to_str"])?;
@@ -3269,7 +3270,7 @@ impl<'u> Compiler<'u> {
 
     /// `x = value` where `x` already exists: a write to wherever it lives.
     ///
-    /// The tree-walker's `assign` walks the scopes and updates the binding in place;
+    /// The tree-walker's `assign` walked the scopes and updated the binding in place;
     /// this resolves it once, at compile time, to a register or a global slot.
     fn assign(&mut self, name: &'static str, value: &Expr) -> Result<(), String> {
         let save = self.st().next_reg;
@@ -3462,7 +3463,7 @@ fn escapes(e: &Expr) -> bool {
 }
 
 /// A direct call's arity is known at compile time, so a wrong one need not wait for
-/// run time. The name makes it a better message than the tree-walker's.
+/// run time. The name makes it a better message than the tree-walker's was.
 fn check_arity(name: &str, arity: u16, argc: u16) -> Result<(), String> {
     if arity == argc {
         return Ok(());

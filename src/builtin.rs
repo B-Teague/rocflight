@@ -83,8 +83,8 @@ include!(concat!(env!("OUT_DIR"), "/builtin_index.rs"));
 pub struct Read {
     pub name: &'static str,
     pub lines: usize,
-    /// The parse error, if it did not parse. Checking the TYPES is a later phase, so
-    /// this stops at the AST.
+    /// The parse error, if it did not parse. This reports PARSING only; whether a
+    /// member also type-checks is `check_builtin.sh`'s second number.
     pub error: Option<String>,
     /// Members with a body: ordinary Roc, which rocflight can run once it loads them.
     pub defined: Vec<&'static str>,
@@ -433,7 +433,7 @@ fn reachable(source: &str, selected: &[&str]) -> String {
 /// let in: the annotation parse is what a program that calls `.map` or `.len` pays for
 /// a real type. It is the single largest cost of a program that touches nothing else —
 /// 0.57ms for `List`, 0.22ms for `Str` — and `annotations_only` plus the lazy cache
-/// below is what keeps it to that. See `OPTIMIZATION_PLAN.md` phase 1.3.
+/// below is what keeps it to that. See `Learning.md` §11, phase 1.
 ///
 /// All ten parsing members are verified to seed cleanly, with the golden pairs and the
 /// examples green on any combination of them, so widening this is one edit whenever the
@@ -502,7 +502,7 @@ pub fn signatures_for(module: &str) -> &'static [(&'static str, crate::types::Ty
     }
     // Timed because this RE-PARSES a member `load` may already have parsed — the
     // measured 0.4ms of a `Dict` program and 1.4ms of a program that merely calls
-    // `.map`. See `OPTIMIZATION_PLAN.md`, phase 1.3.
+    // `.map`. See `Learning.md` §11, phase 1.
     let mut step = std::time::Instant::now();
     let parsed: &'static [(&'static str, crate::types::Type)] =
         Box::leak(parse_signatures(module));

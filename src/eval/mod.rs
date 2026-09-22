@@ -2461,9 +2461,9 @@ pub fn call_builtin_values(
         });
     }
     // `to_str` is dispatched on the numeric type, so it is spelled `I64.to_str`,
-    // `F64.to_str`, `U8.to_str`, ... — not only `Num.to_str`. All of them
-    // stringify the same way here; the interpreter does not yet track which
-    // numeric type a value has (see IMPLEMENTATION_PHASES.md, numeric types).
+    // `F64.to_str`, `U8.to_str`, ... — not only `Num.to_str`. Every width shares one
+    // implementation: the VALUE already carries its kind (`Int`, `U128`, `Float`,
+    // `F32`, `Dec`), so the module name only has to reach it.
     // The `Encoding` protocol's own operations, which a type's `encoder_for` calls to
     // add to the text: `Encoding.encode_u32(n, state)`.
     if module == "Encoding" {

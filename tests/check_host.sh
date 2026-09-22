@@ -17,7 +17,7 @@
 #
 # Needs: zig (`zig cc` is the linker, as in basic-cli's own CI), the Rust musl
 # target (`rustup target add x86_64-unknown-linux-musl`), and the platform in roc's
-# cache (`roc check tests/host/ok.roc` fetches it). See PLATFORM_HOST_PLAN.md.
+# cache (`roc check tests/host/ok.roc` fetches it). See Learning.md §13.
 #
 # Usage: tests/check_host.sh
 set -uo pipefail

@@ -1,15 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Roc Interpreter CLI
-//!
-//! Usage: rocflight <file.roc>
-//!
-//! Pipeline:
-//! 1. Load .roc file
-//! 2. Desugar shorthand syntax
-//! 3. Parse into AST
-//! 4. Type check with Hindley-Milner inference
-//! 5. Compile to bytecode and run it on the register VM
+//! The CLI. `rocflight <file.roc>`; the pipeline itself is `run::run_file`, so a
+//! platform's host can run the same thing from `roc_main`.
 
 use std::env;
 use std::error::Error;

@@ -21,7 +21,7 @@
 //! * `rocflight_hosted_*` are the dispatch table the driver generates from the
 //!   platform's `hosted { … }` block, one C file linked in beside this library.
 //!
-//! See PLATFORM_HOST_PLAN.md.
+//! See Learning.md §13.
 
 use std::ffi::{c_char, c_void, CStr};
 

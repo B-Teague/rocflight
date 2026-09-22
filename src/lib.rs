@@ -6,16 +6,10 @@
 // lifetime parameter removed the need for it.
 #![forbid(unsafe_code)]
 
-//! Roc Language Interpreter
+//! An interpreter for the Roc programming language.
 //!
-//! An interpreter for the Roc programming language, built in Rust.
-//!
-//! Pipeline:
-//! 1. Load .roc file
-//! 2. Desugar shorthand syntax (!, ?, ??, .?, ?:)
-//! 3. Parse into AST
-//! 4. Type check with Hindley-Milner inference
-//! 5. Compile to bytecode and run it on the register VM
+//! The pipeline is `run::run_file`: desugar, parse, type check, compile, run. Each step
+//! and what it hands the next is Learning.md §2; `ROCFLIGHT_TIME=1` prints their times.
 
 pub mod ast;
 pub mod types;

@@ -7,12 +7,10 @@ Two goals, in this order:
 
 1. **Full feature parity with the Roc compiler.** Not "mostly works" — every syntax
    feature is verified against the real `roc` binary, and a divergence is a bug.
-2. **As close to bare metal as safe Rust reaches.** Every optimization is measured
-   against a benchmark suite, and none of them is allowed to cost goal 1. It began as a
-   tree-walker; a register VM replaced it, in safe Rust throughout — no `unsafe` in
-   the interpreter, no loss of Rust's memory-safety guarantees. The one exception is
-   `host/`, the small crate that hands values to a platform's compiled host, which
-   is foreign code by definition (see `PLATFORM_HOST_PLAN.md`).
+2. **As close to bare metal as safe Rust reaches.** Every optimization is measured, and
+   none of them is allowed to cost goal 1. No `unsafe` in the interpreter; the one
+   exception is `host/`, the crate that hands values to a platform's compiled host,
+   which is foreign code by definition.
 
 ```bash
 cargo build -p rocflight-host --release --target x86_64-unknown-linux-musl  # once; needs `rustup target add x86_64-unknown-linux-musl`
@@ -21,8 +19,11 @@ cargo build --release
 ```
 
 The first line builds the interpreter as a platform's `app`; the second embeds it, so
-the release binary is self-contained — copy it anywhere. Running an app on a real
-platform links the two together with `zig` (on the path), once per platform.
+the release binary is self-contained. Running an app on a real platform links the two
+together with `zig` (on the path), once per platform.
+
+`Learning.md` is the maintainer's map: the pipeline, the gates, how to add a feature,
+and the measured history of everything that was tried.
 
 ---
 
@@ -40,7 +41,7 @@ Richard Feldman and subsequent Roc authors.
 Everything this interpreter knows about Roc, it learned from their work:
 
 - The [**language reference**](https://github.com/roc-lang/roc/tree/main/docs/langref),
-  which is what phase 21 was written against.
+  which phase 21 was written against.
 - The [**examples**](https://github.com/roc-lang/examples), all 28 of which are vendored
   here under `tests/roc/examples/` and used as the outside-in correctness gate. They
   found bugs no test of ours would have.
@@ -103,34 +104,32 @@ or WebAssembly.
 
 | | |
 |---|---|
-| roc's eval tests | **1,953 / 1,953** pass with rocflight as a fifth backend of roc's own eval harness, and all 72 of its problem tests are refused: `tests/check_eval.sh --strict` is green. `EVAL_PARITY_PLAN.md` is how it got there, phase by phase (957 → 1,953) |
+| roc's eval tests | **1,953 / 1,953** pass with rocflight as a fifth backend of roc's own eval harness, and all 72 of its problem tests are refused: `tests/check_eval.sh --strict` is green |
 | Golden pairs | **99 / 99** across 20 phases |
-| Rust tests | **535** |
-| Language examples | **20** match `roc` byte for byte — Snake among them, on basic-cli's real host, including a whole game played key by key; 7 platform apps pending on language gaps (`PLATFORM_HOST_PLAN.md`) |
+| Rust tests | **574** pass; 2 `vm_test` assertions fail, and are stale rather than broken (see `Learning.md`, "Known red gates") |
+| Language examples | **20** of the 28 vendored examples match `roc` byte for byte — Snake among them, on basic-cli's real host, including a whole game played key by key. 2 fail, 6 are pending on language gaps, 1 `roc` itself rejects |
 | `Builtin.roc` | **12 of 12** members parse; 1,443 definitions in Roc, 1,109 intrinsics in Rust |
 
 ```bash
-tests/check_eval.sh             # roc's ~2,300 eval tests, rocflight alongside roc's backends
-tests/check_roc.sh --strict     # the 98 pairs — the definition of done
-tests/check_examples.sh         # roc-lang.org's own examples
+tests/check_eval.sh --strict    # roc's own eval tests, rocflight as a fifth backend
+tests/check_roc.sh --strict     # the 99 golden pairs — the definition of done
+tests/check_examples.sh         # roc-lang.org's own examples, outside-in
 tests/check_builtin.sh --strict # the vendored Builtin.roc still parses
+tests/check_artifact.sh         # the parsed-at-build-time blob regenerates identically
 tests/check_host.sh             # linked into basic-cli's real host, calling its effects
 cargo test --quiet              # the Rust side
 tests/bench.sh                  # performance, against a saved baseline
-tests/bench_compare.sh          # the same programs under roc's own interpreter and dev backend
+tests/bench_compare.sh          # the same programs under roc's interpreter and dev backend
 ```
 
 Eight of the 28 examples are apps on basic-cli's compiled host. rocflight does not
 re-implement that host: `rocflight main.roc` links the interpreter INTO it — the
 platform's own recipe, `zig`'s lld, once per platform, about 100 ms — and runs the
-result, so `Stdout.line!` is the platform's Roc calling the platform's C. Snake runs
-that way and matches `roc` byte for byte. The other seven are PENDING on language gaps
-their platform modules expose (a string literal standing for a `Path`, package
-imports, two inference cases); `tests/check_examples.sh --strict` makes those fatal.
-The plan and what it measured is `PLATFORM_HOST_PLAN.md`. One example `roc` itself
-rejects. Every one of the other 19 matches byte for byte, `Dict` and `Set` included —
-those run `Builtin.roc`'s own open-addressing table rather than a Rust stand-in. See
-`BUILTIN_PLAN.md`.
+result, so `Stdout.line!` is the platform's Roc calling the platform's C. The pending
+ones are blocked on language gaps their platform modules expose (a string literal
+standing for a `Path`, package imports, two inference cases); `--strict` makes those
+fatal. `Dict` and `Set` run `Builtin.roc`'s own open-addressing table rather than a Rust
+stand-in.
 
 ### The command line
 
@@ -146,159 +145,107 @@ rocflight version                print the version
 rocflight help                   print the above
 ```
 
-An app on a real platform is run by linking the interpreter into that platform's
-host. The release binary carries what it needs for that (`build.rs` embeds
+An app on a real platform is run by linking the interpreter into that platform's host.
+The release binary carries what it needs for that (`build.rs` embeds
 `librocflight_host.a`; the driver extracts it into `~/.cache/rocflight` on first use),
 and looks beside itself or at `ROCFLIGHT_LIB` first for development. `zig` must be on
 the path: it is the linker, as it is for basic-cli's own builds.
 
-There are no `--` options in the release binary, on purpose: everything that was one
-was a development aid, and a switch that changes how a program runs is a way to run it
+There are no `--` options in the release binary, on purpose: everything that was one was
+a development aid, and a switch that changes how a program runs is a way to run it
 against something other than the real interpreter. `Builtin.roc` is the clearest case —
 it used to be selectable with `--load-builtins`, and it is not a choice, it is the
-runtime. Which of its members load is read off the source, every time.
-
-The pipeline can still be inspected, in **debug builds only**, where `rocflight help`
+runtime. The pipeline can still be inspected in **debug builds**, where `rocflight help`
 lists `--show-desugared`, `--show-ast`, `--ast-only`, `--show-platforms` and
-`--builtins`. The release binary rejects all of them as unknown arguments, and the
-blocks behind them are compiled out of it entirely.
-
-### How parity is enforced
-
-Every syntax feature gets a **golden pair**: a sugared file and a `.desugared.roc`
-sibling with explicit types. Four outputs must be byte-identical — `roc` and `rocflight`,
-on both files — and both files must build the same AST.
-
-The sugared file carries **no type annotations at all**; types are inferred. Twelve files
-keep one, each saying why in a comment: either the annotation *is* the syntax under test,
-or `roc` refuses the file without it. The gate rejects any other annotation in a sugared
-file, so this can't quietly rot.
-
-The rule that makes it work: **probe the compiler before implementing.** The langref is
-partly aspirational — `list[i]` and `continue` are documented but rejected by `roc` — and
-the reverse also bites: a form that looks broken may just be misused. Guessing produced
-more bugs in this project than anything else.
+`--builtins`; the release binary rejects all of them as unknown arguments.
 
 ---
 
 ## Performance
 
-The interpreter was profiled and optimized against `tests/bench.sh`, which reports
-medians against a saved baseline and checks each benchmark's output, so a change that is
-fast and wrong fails instead of looking like a win.
+`tests/bench.sh` reports medians against a saved baseline and checks each benchmark's
+output, so a change that is fast and wrong fails instead of looking like a win.
 
 It started as a tree-walker. Two rounds of representation fixes took it a long way, and
 then a **register VM in safe Rust** replaced it — built alongside it for six phases,
 differentially gated against it at every step, and switched over only once both engines
 passed every gate on every file.
 
+Against roc's own interpreter (`roc --opt=interpreter`, the LIR interpreter in
+`roc-compiler/src/eval`) and its dev backend, on the same programs, measured by
+`tests/bench_compare.sh` (medians, nightly-2026-09-03, wall time including each engine's
+parse and compile; roc's build cache is warm):
+
 ```
-benchmark        tree-walker, first   tree-walker, tuned   register VM
-calls                          80ms                 12ms           6ms
-closure_capture               516ms                  3ms           2ms
-closure_in_loop                75ms                 29ms           8ms
-loop                           27ms                 22ms           9ms
-matching                      224ms                 52ms          22ms
-records                        32ms                 16ms           8ms
-strings                        30ms                  5ms           5ms
+benchmark        rocflight   roc-interp   roc-dev   interp/rocflight
+calls                  5ms         71ms      31ms         14.2x
+closure_capture        2ms        151ms      74ms         75.5x
+closure_in_loop        9ms        752ms      69ms         83.6x
+iter_range           174ms      35640ms     485ms        204.8x
+list_ops               2ms        154ms      75ms         77.0x
+list_pass              3ms         38ms      34ms         12.7x
+loop                   8ms       3196ms      89ms        399.5x
+matching              19ms       1258ms      71ms         66.2x
+matching_tail         21ms        309ms      30ms         14.7x
+records                7ms        796ms      70ms        113.7x
+records_tail           6ms         83ms      30ms         13.8x
+strings                6ms        197ms     130ms         32.8x
 ```
 
-`strings` and `list_ops` are unchanged by the VM, because they are bound by allocation
-rather than by dispatch — which the plan predicted before any of it was written.
-What is left of `iter_range` is the VM's ordinary per-instruction cost: four
-instructions per element, at the same rate `loop` runs them.
+Every benchmark's output is checked against roc's on every run. Two things had to change
+to get there: each program's work depends on `args.len()`, because roc evaluates a pure
+call with literal arguments at compile time; and the programs use roc's own names
+(`Try.ok_or`, not an invented `with_default`).
 
 Eight ceilings are gone rather than merely improved:
 
-- List work is **linear**, not quadratic.
-- Passing a list to a function is a **refcount bump**, not a copy. A register move
-  used to deep-copy a `Vec`, so a loop that handed 8,000 elements to each iteration
-  took four seconds; it takes six milliseconds, and `tests/bench/list_pass.roc` keeps
-  it that way.
-- Type-checking a block is **linear in its bindings**: every `let` used to rebuild the
-  set of numeral-tainted variables and walk the whole environment, so 3,000 bindings
-  cost 1.5 seconds. They cost 11 milliseconds.
-- A chain of statements is walked in a **loop**, not a Rust frame per statement, in
-  the parser, the checker and the compiler alike. 6,000 statements in one block
-  overflowed the stack; 20,000 run in 48 milliseconds, and the next limit is the
-  65,535 registers a frame may have. A file of 100,000 top-level declarations runs
-  too, though top-level names are still found by a linear scan, so it takes seconds.
-- `fold` and `map` on a list are **compiled into the frame** when the checker has
-  proved the receiver is a list and no roc-defined method answers to the name. The
-  builtin re-entered the VM from Rust once per element, with a fresh machine and an
-  argument `Vec` each time; a compiled loop makes the callback an ordinary `Call`. And
-  when the callback is a **literal lambda** whose body has no `return`, `break` or
-  assignment, the body is compiled into the loop with its parameters bound to the
-  loop's registers, so there is no call at all. `iter_range`, two million elements
-  folded: 199ms to 90ms.
+- List work is **linear**, not quadratic, and passing a list to a function is a
+  **refcount bump**, not a copy. A register move used to deep-copy a `Vec`, so a loop
+  that handed 8,000 elements to each iteration took four seconds; it takes six
+  milliseconds, and `tests/bench/list_pass.roc` keeps it that way.
+- Type-checking a block is **linear in its bindings**: 3,000 bindings cost 1.5 seconds,
+  and now cost 11 milliseconds.
+- A chain of statements is walked in a **loop**, not a Rust frame per statement, in the
+  parser, the checker and the compiler alike. 6,000 statements in one block overflowed
+  the stack; 20,000 run in 48 milliseconds.
+- `fold` and `map` and six more callback methods are **compiled into the frame** when the
+  checker has proved the receiver is a list. A literal lambda callback is inlined into
+  the loop, so there is no call at all.
 - Building a 40,000-character string peaks at 6 MB where it used to reach **710 MB**.
 - Recursion is heap-allocated frames, so 500,000 levels run in 4 MB — the tree-walker
   exhausted a 256 MB reserved stack at 200,000 — and a **tail call reuses its frame**,
   so five million tail calls run in 2.8 MB.
 - A `for` over a range never builds one, so `0..<10_000_000` allocates nothing.
+- Compiling 8,000 top-level declarations was quadratic (94ms); it is linear (2.2ms).
 
 Names are resolved once, at compile time: a local is a register, a captured variable an
 index, a top-level name a slot, a top-level function a chunk id. Nothing compares a
-string at run time. `Value` is **48 bytes** (it was 80), with a guard test to keep it
-there, and the crate is `#![forbid(unsafe_code)]` — it contained exactly one `unsafe`, a
-lifetime transmute around the AST, and removing the lifetime removed the need for it.
+string at run time. `Value` is **48 bytes**, with a guard test to keep it there, and the
+crate is `#![forbid(unsafe_code)]`.
 
-Against roc's own interpreter (`roc --opt=interpreter`, the LIR interpreter in
-`roc-compiler/src/eval`) and its dev backend, on the same programs, measured by
-`tests/bench_compare.sh` (medians of 5, nightly-2026-09-03, wall time including each
-engine's parse and compile; roc's build cache is warm):
-
-```
-benchmark        rocflight   roc-interp   roc-dev   interp/rocflight
-calls                  7ms         70ms      28ms         10.0x
-closure_capture        3ms        151ms      73ms         50.3x
-closure_in_loop       10ms        752ms      69ms         75.2x
-iter_range            89ms      35464ms     479ms        398.5x
-list_ops               4ms        149ms      73ms         37.2x
-list_pass              4ms         37ms      32ms          9.2x
-loop                  12ms       3182ms      88ms        265.2x
-matching              23ms       1255ms      68ms         54.6x
-matching_tail         26ms        306ms      31ms         11.8x
-records               10ms        786ms      67ms         78.6x
-records_tail          12ms         79ms      29ms          6.6x
-strings                7ms        192ms     126ms         27.4x
-```
-
-Every benchmark's output is checked against roc's on every run. Two things had to
-change to get there. Each program's work now depends on `args.len()`, because roc
-evaluates a pure call with literal arguments at compile time — `go(0, 0)` and
-`fib(22)` ran in the dev backend before the interpreter ever started, and showed up
-as a 14ms floor. And the programs use roc's own names: `Try.ok_or`, not the invented
-`with_default`, and `List.from_iter` rather than treating an iterator as a list.
-
-`OPTIMIZATION_PLAN.md` is the plan for what is left, and it is not the VM: on a short
-program the VM is 1-4% of the time and the rest is the front end re-deriving facts
-about `Builtin.roc`, a file that ships inside the binary. It carries the measurements,
-the phases in the order they are worth doing, and what is deliberately not being done.
-Set `ROCFLIGHT_TIME=1` on any run to see the phases for yourself.
+On a short program the VM is 1–4% of the time and the rest is the front end, which is
+why `Builtin.roc` is parsed *and* compiled at build time and read back as a blob. A
+four-line `Dict` program is **1.14ms** in process, against 3.5ms before that work.
+`ROCFLIGHT_TIME=1` on any run prints each phase; `ROCFLIGHT_CODE=1` dumps the bytecode.
+The measured history, including everything tried and rejected, is in `Learning.md`.
 
 ---
 
 ## Layout
 
 ```
-src/parser/      the parser — the largest piece, and where most syntax lives
+src/desugaring/  text-level sugar, before parsing
+src/parser/      recursive descent → AST; the largest piece, and where most syntax lives
 src/types/       bidirectional checker with let-polymorphism
-src/vm/          the register VM: compiler, opcodes, machine
-src/eval/        builtins, operators and runtime helpers
-src/platform/    platform resolution, including real tarball loading
-tests/roc/       98 golden pairs across 20 phases, plus the 28 vendored examples
+src/vm/          the register VM: compiler, liveness, peephole, opcodes, machine
+src/eval/        builtins, operators, inspect, lazy iterators, Dec/F32 math, crypto
+src/platform/    platform resolution, module loading, ABI, marshalling, the link driver
+src/builtin.rs   reading the vendored Builtin.roc
+src/artifact.rs  the parsed-and-compiled-at-build-time Builtin.roc blob
+host/            the interpreter as a platform host library (the only unsafe)
+tests/roc/       99 golden pairs across 20 phases, plus the 28 vendored examples
 tests/bench/     benchmark programs and the saved baseline
 ```
-
-| Document | |
-|---|---|
-| `IMPLEMENTATION_PHASES.md` | all 22 phases, what each exposed, and the known ceilings |
-| `PHASE_IMPLEMENTATION_GUIDE.md` | the golden-pair rule and how to add a feature |
-| `OPTIMIZATION_PLAN.md` | where the time goes, measured, and the phased plan for it |
-| `TESTING_STRATEGY.md` | how the gates fit together, the eval harness first |
-| `EVAL_PARITY_PLAN.md` | the phased road to all of roc's eval tests, 957 → 1,953, every phase measured; finished 2026-09-19 |
-| `BUILTIN_PLAN.md` | how the vendored `Builtin.roc` is read, loaded and bounded |
 
 ---
 
@@ -308,22 +255,27 @@ Written down rather than hidden, because an interpreter that quietly disagrees w
 compiler is worse than one that says where it doesn't:
 
 - A nominal's type ARGUMENTS are dropped: `Dict(Str, U64)` and `Dict(I64, Bool)` are one
-  type here, so an element's type is still a variable. `Type` has no parameterised
-  nominal.
+  type here, so an element's type is still a variable.
 - Nominals are erased, so the runtime tells them apart by SHAPE. A record with exactly an
   opaque nominal's fields inspects as `<opaque>` too, and a `Set` and a `Dict` are the
   same shape — only the checker separates those.
 - The `Encoding` protocol's own members are Rust rather than roc's. JSON round-trips and
   a type's `encoder_for` runs, but another format would need the real thing.
-- Iterators and `.iter()` are eager: `map` over a range still builds its output list.
+- `.iter()` on a list **is** that list, so nothing after the checker can tell
+  `xs.keep_if(p)` from `xs.iter().keep_if(p)` — and `map` produces its output list
+  rather than fusing into its consumer. A range that stays a range is lazy and allocates
+  nothing; an `Iter` that is its own value is the fix, and it is a representation change.
 - `where` constraints are read for the names they promise, not verified.
-- A frame has at most 65,535 registers, and every `let` in a block takes one, so a
-  single block of that many bindings is refused at compile time.
+- A frame has at most 65,535 registers, and every `let` in a block takes one.
 - A cyclic record type (`{ ..p, next: p }`) is refused by `roc` as anonymous recursion;
-  the checker here reports nothing and the program runs. It used to crash the checker.
-
-Full list, with the reasoning for each, in `IMPLEMENTATION_PHASES.md`; the builtin ones
-in `BUILTIN_PLAN.md`.
+  the checker here reports nothing and the program runs.
+- `.1` on a nominal over a tuple works here; roc keeps the nominal opaque to tuple access.
+- `var` names are tracked in one flat set, so a `var x` in one function makes a later
+  `x = e` in another read as a reassignment rather than a shadow.
+- A refutable top-level pattern (`(1, b) = pair`) and `..rest` in a top-level
+  destructuring are refused: both need a match, and a top-level binding cannot be scoped.
+- `m-n` with no spaces is subtraction here; `roc` rejects it. More permissive, which is
+  the safe direction, and no golden pair can depend on it.
 
 ---
 

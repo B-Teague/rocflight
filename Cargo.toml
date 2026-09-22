@@ -10,7 +10,7 @@ libm = "0.2"
 
 # `host/` is the platform-side half: the same interpreter built as a static library
 # that a platform's compiled host links against and calls `roc_main` on. It is not
-# built by default; `tests/check_host.sh` builds it for musl. See PLATFORM_HOST_PLAN.md.
+# built by default; `tests/check_host.sh` builds it for musl. See Learning.md §13.
 [workspace]
 members = ["host"]
 

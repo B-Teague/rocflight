@@ -579,8 +579,8 @@ pub struct MatchArm {
 
 /// A `match` pattern.
 ///
-/// List patterns (`[]`, `[x, ..]`, `[1, .. as tail]`) are absent: they need lists,
-/// which are a later phase. See IMPLEMENTATION_PHASES.md.
+/// Learning.md §9 has the verified semantics of each form — arm order, guards falling
+/// through, and where `..` may sit in a list pattern.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pattern {
     /// `_` — matches anything, binds nothing.

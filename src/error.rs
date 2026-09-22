@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-/// Parse errors from the pure functional parser
+/// Parse errors, with the position they were raised at.
 #[derive(Debug, Clone)]
 pub struct ParseError {
     pub message: String,
@@ -17,7 +17,6 @@ pub struct ParseError {
 }
 
 impl ParseError {
-    /// Create a new parse error
     pub fn new(message: impl Into<String>, position: usize) -> Self {
         ParseError {
             message: message.into(),
@@ -73,7 +72,6 @@ pub struct TypeError {
 }
 
 impl TypeError {
-    /// Create a new type error
     pub fn new(
         message: impl Into<String>,
         expected: impl Into<String>,
@@ -147,7 +145,6 @@ impl EvalError {
         self.message == Self::BREAK
     }
 
-    /// Create a new evaluation error
     pub fn new(message: impl Into<String>) -> Self {
         EvalError {
             message: message.into(),

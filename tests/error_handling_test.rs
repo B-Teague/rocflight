@@ -6,10 +6,9 @@
 //!     yields the payload rather than a Try
 //!   * `??` binds looser than arithmetic: `x ?? 1 + 2` is `x ?? (1 + 2)`, giving 3
 //!
-//! NOT implemented, with reasons:
-//!   * `.?` optional field access — SEGFAULTS the roc compiler on nightly-2026-09-03,
-//!     so no golden pair can be written for it
-//!   * `?:` optional record fields — type-level only, and needs nominal types
+//! `.?` and `?:` landed later, in phase 14 — see `tests/field_defaults_test.rs`. The
+//! note that used to sit here, that `.?` segfaults `roc`, was wrong: it segfaults only
+//! when misused on an ordinary field of a plain record.
 
 use rocflight::desugaring::Desugarer;
 use rocflight::eval::Value;

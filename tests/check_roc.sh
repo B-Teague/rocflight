@@ -28,7 +28,7 @@ cd "$(dirname "$0")/.."
 ROC=${ROC:-roc}
 ROCFLIGHT=${ROCFLIGHT:-./target/debug/rocflight}
 # An app on a real platform runs on that platform's host: rocflight links
-# `librocflight_host.a` into it (see PLATFORM_HOST_PLAN.md). Built by
+# `librocflight_host.a` into it (Learning.md §13). Built by
 # `tests/check_host.sh`; without it, platform apps stop at their first effect.
 HOST_LIB=$PWD/target/x86_64-unknown-linux-musl/release/librocflight_host.a
 [ -z "${ROCFLIGHT_LIB:-}" ] && [ -f "$HOST_LIB" ] && export ROCFLIGHT_LIB=$HOST_LIB

@@ -20,6 +20,7 @@ cd "$(dirname "$0")/.."
 ROCFLIGHT=${ROCFLIGHT:-$PWD/target/release/rocflight}
 ROC=${ROC:-roc}
 RUNS=5
+BUDGET_MS=${BUDGET_MS:-10000}   # per-cell time budget; a slow engine gets fewer runs
 only=()
 
 while [ $# -gt 0 ]; do
@@ -39,12 +40,14 @@ command -v "$ROC" >/dev/null || { echo "error: $ROC not found" >&2; exit 1; }
 # Median wall time in ms of `cmd...` (the last argument is the file). roc caches
 # builds, so its first run may include compilation; the median absorbs that.
 median_ms() {
-  local times=() start end
+  local times=() start end total=0
   for _ in $(seq "$RUNS"); do
     start=$(date +%s%N)
-    timeout 120 "$@" >/dev/null 2>&1
+    timeout 120 "$@" >/dev/null 2>&1 </dev/null
     end=$(date +%s%N)
     times+=( $(( (end - start) / 1000000 )) )
+    total=$(( total + ${times[-1]} ))
+    [ "$total" -gt "$BUDGET_MS" ] && break
   done
   printf '%s\n' "${times[@]}" | sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'
 }
@@ -53,7 +56,8 @@ median_ms() {
 measure() {
   local expected=$1; shift
   local actual
-  actual=$(timeout 120 "$@" 2>&1 | grep -v '^\[Desugaring\]')
+  printf '\r%-16s %s...\033[K' "$name" "$(basename "$1")" >&2
+  actual=$(timeout 120 "$@" 2>&1 </dev/null | grep -v '^\[Desugaring\]')
   if [ "$actual" != "$expected" ]; then echo n/a; return; fi
   median_ms "$@"
 }
@@ -77,5 +81,6 @@ for file in tests/bench/*.roc; do
   rd=$(measure "$expected" "$ROC" "$file")
   ratio=-
   [ "$rf" != n/a ] && [ "$ri" != n/a ] && [ "$rf" -gt 0 ] && ratio=$(awk -v a="$ri" -v b="$rf" 'BEGIN{printf "%.1fx", a/b}')
+  printf '\r\033[K' >&2
   printf '%-16s %11s %11s %11s %9s\n' "$name" "$(ms "$rf")" "$(ms "$ri")" "$(ms "$rd")" "$ratio"
 done

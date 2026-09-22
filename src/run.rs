@@ -1,7 +1,7 @@
 //! The pipeline: file in, value out.
 //!
 //! What `rocflight file.roc` does, as a library call, so a platform's host can run
-//! the same thing from `roc_main` (see `host/` and PLATFORM_HOST_PLAN.md). Printing,
+//! the same thing from `roc_main` (see `host/` and Learning.md §13). Printing,
 //! the test tally and exit codes stay with the caller.
 
 use std::error::Error;

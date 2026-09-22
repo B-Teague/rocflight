@@ -12,7 +12,6 @@ pub struct PlatformModule {
 }
 
 impl PlatformModule {
-    /// Create new module
     pub fn new(name: String) -> Self {
         PlatformModule {
             name,
@@ -52,12 +51,10 @@ pub enum ModuleExport {
 }
 
 impl ModuleExport {
-    /// Create a type export
     pub fn type_export(name: String, definition: String) -> Self {
         ModuleExport::Type { name, definition }
     }
 
-    /// Create a function export
     pub fn function_export(name: String, type_sig: String) -> Self {
         ModuleExport::Function {
             name,
@@ -65,7 +62,6 @@ impl ModuleExport {
         }
     }
 
-    /// Get the name of this export
     pub fn name(&self) -> &str {
         match self {
             ModuleExport::Type { name, .. } => name,

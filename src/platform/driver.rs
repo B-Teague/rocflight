@@ -1,7 +1,7 @@
 //! Running an app on its platform's compiled host.
 //!
 //! A platform's host is native code that cannot be called from this process (see
-//! PLATFORM_HOST_PLAN.md §3), so `rocflight main.roc` on an app that names one does
+//! Learning.md §13), so `rocflight main.roc` on an app that names one does
 //! what `roc` does: links an executable and runs that instead. The executable is
 //! `librocflight_host.a` — this interpreter as the platform's `app` — linked by the
 //! platform's own recipe, and it is per PLATFORM, not per app: the app's path goes

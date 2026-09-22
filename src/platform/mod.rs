@@ -57,7 +57,6 @@ impl Platform {
         self.modules.get(name)
     }
 
-    /// Get all available module names
     pub fn module_names(&self) -> Vec<&str> {
         self.modules.keys().map(|k| k.as_str()).collect()
     }
