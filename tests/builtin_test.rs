@@ -1,39 +1,25 @@
-//! The constructs `src/roc/Builtin.roc` needs that nothing else in `tests/roc` reached.
-//!
-//! Every expectation here was produced by running the same program under
-//! `roc nightly-2026-09-03` on 2026-09-16 and copying what it printed. They are NOT
-//! golden pairs: `?` now lifts its Try out under a generated `#tryN` name, so no
-//! hand-written desugared twin can produce an identical AST, which is what a pair in
-//! `tests/roc/` has to do.
-//!
-//! `tests/check_builtin.sh` is the gate these serve — it reports how much of
-//! Builtin.roc parses. This file says what each construct MEANS once it does.
+//! The builtins: what `Builtin.roc` is allowed to say, and how a call reaches one.
 
-use rocflight::desugaring::Desugarer;
-use rocflight::parser::Parser;
-use rocflight::types::TypeChecker;
+mod common;
+use crate::common::*;
 
-fn parse(src: &str) -> Result<rocflight::ast::Expr, rocflight::error::ParseError> {
-    let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
-    Parser::new(&desugared).parse_expr()
-}
-
-/// Evaluate a snippet and render its value, type-checking first.
-fn run(src: &str) -> String {
-    let ast = parse(src).unwrap_or_else(|e| panic!("parse failed on:\n{}\n{}", src, e));
-    TypeChecker::new()
-        .synth(&ast)
-        .unwrap_or_else(|e| panic!("type check failed on:\n{}\n{}", src, e));
-    rocflight::vm::eval(&ast)
-        .unwrap_or_else(|e| panic!("eval failed on:\n{}\n{}", src, e))
-        .to_string()
-}
+// ==========================================================================
+// The constructs `src/roc/Builtin.roc` needs that nothing else in `tests/roc` reached.
+//
+// Every expectation here was produced by running the same program under
+// `roc nightly-2026-09-03` on 2026-09-16 and copying what it printed. They are NOT
+// golden pairs: `?` now lifts its Try out under a generated `#tryN` name, so no
+// hand-written desugared twin can produce an identical AST, which is what a pair in
+// `tests/roc/` has to do.
+//
+// `tests/check_builtin.sh` is the gate these serve — it reports how much of
+// Builtin.roc parses. This file says what each construct MEANS once it does.
 
 #[test]
 fn for_destructures_a_tuple() {
     // `for (key, value) in Dict.iter(dict)` is how Builtin.roc walks a Dict.
     let src = "f = |ps| {\n\tvar $t = 0\n\tfor (a, b) in ps {\n\t\t$t = $t + a * b\n\t}\n\t$t\n}\n\nf([(1, 2), (3, 4)])";
-    assert_eq!(run(src), "14");
+    assert_eq!(value(src), "14");
 }
 
 #[test]
@@ -41,7 +27,7 @@ fn for_takes_a_guard() {
     // `for item in list if predicate(item) { … }` runs the body only for the items
     // that pass, which is the body wrapped in an else-less `if`.
     let src = "f = |xs| {\n\tvar $t = 0\n\tfor x in xs if x > 10 {\n\t\t$t = $t + x\n\t}\n\t$t\n}\n\nf([5, 20, 30])";
-    assert_eq!(run(src), "50");
+    assert_eq!(value(src), "50");
 }
 
 #[test]
@@ -50,9 +36,9 @@ fn question_works_inside_an_expression() {
     // out of the expression it sits in before the match can wrap the block.
     let half = "half = |n| if n % 2 == 0 { Ok(n / 2) } else { Err(Odd) }\n\n";
     let f = "f = |xs| {\n\tvar $t = 0\n\tfor x in xs {\n\t\t$t = $t + half(x)?\n\t}\n\tOk($t)\n}\n\n";
-    assert_eq!(run(&format!("{}{}f([2, 4, 6])", half, f)), "Ok(6)");
+    assert_eq!(value(&format!("{}{}f([2, 4, 6])", half, f)), "Ok(6)");
     // And it short-circuits out of the LOOP, not just out of the iteration.
-    assert_eq!(run(&format!("{}{}f([2, 3, 6])", half, f)), "Err(Odd)");
+    assert_eq!(value(&format!("{}{}f([2, 3, 6])", half, f)), "Err(Odd)");
 }
 
 #[test]
@@ -60,7 +46,7 @@ fn question_may_be_a_loop_bodys_last_statement() {
     // An assignment evaluates to `{}` whatever its right-hand side does, so there is a
     // continuation to propagate into — unlike a block ending in a bare `expr?`.
     let src = "step = |a, b| Ok(a + b)\n\nf = |xs| {\n\tvar $s = 0\n\tfor x in xs {\n\t\t$s = step($s, x)?\n\t}\n\tOk($s)\n}\n\nf([1, 2])";
-    assert_eq!(run(src), "Ok(3)");
+    assert_eq!(value(src), "Ok(3)");
 }
 
 #[test]
@@ -68,7 +54,7 @@ fn a_bare_rest_in_a_record_pattern() {
     // `Found({ data, entry_index, .. })`. The `..` names nothing; it says only that
     // the record has other fields, which is what keeps its type open.
     let src = "f = |p| match p {\n\t{ x, y, .. } => x + y\n}\n\nf({ x: 1, y: 2, label: \"p\" })";
-    assert_eq!(run(src), "3");
+    assert_eq!(value(src), "3");
 }
 
 #[test]
@@ -77,33 +63,33 @@ fn a_tag_can_be_destructured_by_a_binding() {
     // with "non exhaustive destructure", and so does the checker here — but exhaustive
     // for a single-tag union.
     let src = "f = |b| {\n\tWrap(v) = b\n\tv\n}\n\nf(Wrap(7))";
-    assert_eq!(run(src), "7");
+    assert_eq!(value(src), "7");
 }
 
 #[test]
 fn the_smallest_integer_is_a_literal() {
     // `-9223372036854775808` has a magnitude one past `i64::MAX`, so reading the digits
     // before applying the sign rejects the one literal that names `I64.lowest`.
-    assert_eq!(run("x = -9223372036854775808\n\nx"), "-9223372036854775808");
+    assert_eq!(value("x = -9223372036854775808\n\nx"), "-9223372036854775808");
 }
 
 #[test]
 fn the_languages_own_numbers_fit() {
     // `U64.highest` and `U128.highest` are written out in `Builtin.roc`, and an i64
     // could not hold either — which is what stopped `Iter` and `Num` parsing.
-    assert_eq!(run("x = 18446744073709551615\n\nx"), "18446744073709551615");
+    assert_eq!(value("x = 18446744073709551615\n\nx"), "18446744073709551615");
     // `I128.lowest`, whose magnitude is one past `i128::MAX` — the trap `I64.lowest`
     // sprang, one width up.
     assert_eq!(
-        run("x = -170141183460469231731687303715884105728\n\nx"),
+        value("x = -170141183460469231731687303715884105728\n\nx"),
         "-170141183460469231731687303715884105728"
     );
-    assert_eq!(run("x = -9223372036854775808\n\nx"), "-9223372036854775808");
+    assert_eq!(value("x = -9223372036854775808\n\nx"), "-9223372036854775808");
 
     // `U128.highest` is past `i128::MAX`, so it is held as the same BIT PATTERN and
     // reads back as -1. Every width operation is correct on it; only printing one that
     // large is not. `ponytail: the ceiling is now 128 bits rather than 64.`
-    assert_eq!(run("x = 340282366920938463463374607431768211455\n\nx"), "-1");
+    assert_eq!(value("x = 340282366920938463463374607431768211455\n\nx"), "-1");
 
     // Wider than an i128 is still refused, by name.
     let err = parse("x = 9999999999999999999999999999999999999999999\n\nx")
@@ -113,7 +99,7 @@ fn the_languages_own_numbers_fit() {
 
 #[test]
 fn a_tag_payload_may_end_with_a_comma() {
-    assert_eq!(run("x = Pair(\n\t1,\n\t2,\n)\n\nx"), "Pair(1, 2)");
+    assert_eq!(value("x = Pair(\n\t1,\n\t2,\n)\n\nx"), "Pair(1, 2)");
 }
 
 #[test]
@@ -130,7 +116,7 @@ fn a_record_field_may_hold_a_multi_parameter_function() {
 fn a_file_may_be_nothing_but_declarations() {
     // Builtin.roc has no trailing expression, and neither does a module of pure
     // annotations. Its value is `{}`.
-    assert_eq!(run("N :: [A].{\n\tf : N -> N\n\tf = |n| n\n}"), "{}");
+    assert_eq!(value("N :: [A].{\n\tf : N -> N\n\tf = |n| n\n}"), "{}");
 }
 
 #[test]
@@ -151,7 +137,7 @@ fn a_grapheme_literal_is_a_pattern() {
     // roc has no character type, so `'"' => …` matches the number 34. Builtin.roc's
     // JSON scanner matches bytes that way.
     let src = "f = |b| match b {\n\t'\\\"' => 1\n\t'a' => 2\n\t_ => 0\n}\n\nf(97)";
-    assert_eq!(run(src), "2");
+    assert_eq!(value(src), "2");
 }
 
 #[test]
@@ -362,22 +348,7 @@ fn an_ambiguous_method_is_still_named_not_guessed() {
 
 // --- P3b: Builtin.roc's signatures are the type table --------------------------------
 
-/// The type `src` infers to.
-fn type_of(src: &str) -> String {
-    let ast = parse(src).unwrap_or_else(|e| panic!("parse failed on:\n{}\n{}", src, e));
-    TypeChecker::new()
-        .synth(&ast)
-        .unwrap_or_else(|e| panic!("type check failed on:\n{}\n{}", src, e))
-        .to_string()
-}
 
-fn type_error(src: &str) -> String {
-    let ast = parse(src).unwrap_or_else(|e| panic!("parse failed on:\n{}\n{}", src, e));
-    match TypeChecker::new().synth(&ast) {
-        Err(e) => e.message,
-        Ok(t) => panic!("expected a type error on:\n{}\ngot {}", src, t),
-    }
-}
 
 #[test]
 fn a_type_roc_names_is_a_type_here() {
@@ -590,4 +561,129 @@ fn a_graph_is_a_dict_wearing_a_name() {
     // raw Dict inside its own methods.
     let src = "G(a) :: Dict(a, List(a)).{\n    from_list : List((a, List(a))) -> G(a)\n    from_list = |l| G.(Dict.from_list(l))\n\n    size : G(a) -> U64\n    size = |G.(d)| Dict.len(d)\n}\n\ng : G(Str)\ng = G.from_list([(\"A\", [\"B\"]), (\"B\", [])])\n\ng.size()";
     assert_eq!(run_with(src, &["(low level)", "Dict", "Set"]).expect("graph"), "2");
+}
+
+// ==========================================================================
+// Static dispatch — phase 20.
+//
+// Verified against `roc` nightly-2026-09-03 before implementing:
+//   * `receiver.method(args)` resolves through the receiver's TYPE, and the receiver
+//     becomes the FIRST argument — which is why roc's builtins take their subject
+//     first (`List.map(list, fn)`)
+//   * dispatching on an unresolved type is an error in roc too: "trying to dispatch a
+//     method named to_str on an unresolved type variable"
+//   * `s.is_empty` is a field read; `s.is_empty()` is a method call. The parens are
+//     the only difference.
+
+// --- the basic form -------------------------------------------------------
+
+#[test]
+fn a_method_call_resolves_through_the_receivers_type() {
+    assert_eq!(as_str("n : I64\nn = 42\nn.to_str()"), "42");
+    assert_eq!(as_str("s : Str\ns = \"hi\"\nStr.inspect(s.is_empty())"), "False");
+}
+
+#[test]
+fn any_numeric_width_dispatches_to_the_same_place() {
+    // The interpreter keeps one integer representation, so `U8` and `I64` land in the
+    // same builtin.
+    assert_eq!(as_str("small : U8\nsmall = 7\nsmall.to_str()"), "7");
+}
+
+#[test]
+fn the_receiver_becomes_the_first_argument() {
+    // `xs.fold(0, f)` is `List.fold(xs, 0, f)`. Subtraction catches an argument swap.
+    assert_eq!(as_str("xs : List(I64)\nxs = [1, 2]\nxs.fold(10, |a, x| a - x).to_str()"), "7");
+}
+
+#[test]
+fn extra_arguments_follow_the_receiver() {
+    assert_eq!(
+        as_str("xs : List(I64)\nxs = [1, 2, 3]\nStr.inspect(xs.map(|x| x * 2))"),
+        "[2, 4, 6]"
+    );
+}
+
+#[test]
+fn a_zero_argument_method_still_needs_parens() {
+    assert_eq!(as_str("xs : List(I64)\nxs = [1, 2, 3]\nxs.len().to_str()"), "3");
+}
+
+// --- chaining -------------------------------------------------------------
+
+#[test]
+fn dispatch_chains() {
+    // The result of one dispatch is itself a receiver, so its type has to be known.
+    assert_eq!(as_str("xs : List(I64)\nxs = [1, 2, 3]\nxs.len().to_str()"), "3");
+    assert_eq!(as_str("xs : List(I64)\nxs = [1, 2]\nxs.fold(0, |a, x| a + x).to_str()"), "3");
+    assert_eq!(as_str("xs : List(I64)\nxs = [1, 2]\nxs.map(|x| x).len().to_str()"), "2");
+}
+
+#[test]
+fn a_method_works_on_any_receiver_expression() {
+    // Postfix, like field access: a call result or a field is a fine receiver.
+    assert_eq!(as_str("mk = |n| [n]\nmk(1).len().to_str()"), "1");
+    assert_eq!(as_str("r : { s: Str }\nr = { s: \"\" }\nStr.inspect(r.s.is_empty())"), "True");
+}
+
+// --- field versus method --------------------------------------------------
+
+#[test]
+fn parens_separate_a_method_call_from_a_field_read() {
+    // `.f` reads a field; `.f()` calls a method. Only the parens differ.
+    assert_eq!(as_str("r = { f: 1 }\nI64.to_str(r.f)"), "1");
+    assert_eq!(as_str("xs : List(I64)\nxs = [1]\nxs.len().to_str()"), "1");
+}
+
+// --- errors ---------------------------------------------------------------
+
+#[test]
+fn dispatching_on_an_unresolved_type_is_rejected() {
+    // roc rejects this too. It now says WHY in roc's own terms: `first` gives a
+    // `Try(item, [ListWasEmpty])` — read off `Builtin.roc`'s signature rather than
+    // guessed — and a Try has no `to_str`. The older, vaguer "unresolved receiver" was
+    // all this could say before the result type was known.
+    let err = type_error("x = []\nx.first().to_str()");
+    assert!(
+        err.contains("unresolved") || err.contains("does not have it"),
+        "error should explain why the dispatch cannot work, got {}",
+        err
+    );
+}
+
+#[test]
+fn dispatch_inside_an_unannotated_lambda_is_deferred() {
+    // A known ceiling. roc infers a lambda's parameter types from its CALL SITES; this
+    // checker synthesises the body once, before any call site is seen, so a dispatch on
+    // a parameter has nothing to resolve yet and falls back to the builtin table
+    // instead of refusing. The call still evaluates correctly.
+    assert_eq!(as_str("show = |x| x.to_str()\nshow(7)"), "7");
+}
+
+#[test]
+fn an_unknown_method_names_the_module_it_looked_in() {
+    let err = eval_error("n : I64\nn = 1\nn.nope()");
+    assert!(err.contains("I64.nope"), "got {}", err);
+}
+
+#[test]
+fn a_record_receiver_has_no_module_to_dispatch_on() {
+    // Values carry no nominal wrapper, so there is nothing to look a method up in.
+    let err = eval_error("r : { x: I64 }\nr = { x: 1 }\nr.nope()");
+    assert!(err.contains("Cannot dispatch"), "got {}", err);
+}
+
+// --- the hole this work exposed -------------------------------------------
+
+#[test]
+fn expressions_inside_interpolation_are_type_checked() {
+    // `StrInterp` used to synthesise as Str WITHOUT checking its parts, so any error
+    // inside `${...}` went unreported — which is what hid broken chained dispatch in
+    // this project's own golden pair.
+    let err = type_error(r#""v=${1 + "s"}""#);
+    assert!(
+        err.contains("Cannot unify") || err.contains("A number cannot be used as Str"),
+        "got {}",
+        err
+    );
 }

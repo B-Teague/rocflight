@@ -20,7 +20,7 @@
 #
 # The two files also have to build the SAME AST — they differ only in sugar, which is
 # the point of the pair. That check needs no `roc` and no binary, so it is
-# `cargo test --test golden_ast_test` rather than part of this script.
+# `cargo test --test desugar_test` rather than part of this script.
 #
 # Usage: tests/check_roc.sh [--strict] [path-under-tests/roc]
 set -uo pipefail
@@ -111,7 +111,7 @@ while IFS= read -r sugared; do
   [ "$int_sug" = "$roc_sug" ] || bad="sugared"
   [ "$int_des" = "$roc_des" ] || bad="${bad:+$bad, }desugared"
 
-  # Same sugar, same AST — that check lives in `cargo test --test golden_ast_test`,
+  # Same sugar, same AST — that check lives in `cargo test --test desugar_test`,
   # which walks these same pairs through the library and needs neither `roc` nor a
   # built binary.
 

@@ -1,19 +1,24 @@
-//! Real platform loading — phase 19.
-//!
-//! Verified against `roc` nightly-2026-09-03 and basic-cli 0.22.0:
-//!   * `roc` caches dependencies content-addressed at
-//!     `~/.cache/roc/packages/<HASH>/`, where `<HASH>` is the URL's filename with its
-//!     archive extension removed — so a URL maps to a directory with no network access
-//!   * the archive is `.tar.zst` now; the Rust-era compiler used `.tar.br`
-//!   * a platform root declares `requires`, `exposes`, `packages`, `provides`, `hosted`
-//!   * an exposed module declares its members inside `Name :: [].{ ... }`; anything
-//!     after that block is private
-//!
-//! The architectural limit: a platform's `hosted` functions live in its COMPILED HOST,
-//! which a tree-walking interpreter cannot call. Effects run only where this
-//! interpreter supplies its own implementation; the rest are reported as a gap.
+//! The outside world: platform loading, the host ABI, and the app entry point.
 
-use rocflight::parser::Parser;
+mod common;
+use crate::common::*;
+
+// ==========================================================================
+// Real platform loading — phase 19.
+//
+// Verified against `roc` nightly-2026-09-03 and basic-cli 0.22.0:
+//   * `roc` caches dependencies content-addressed at
+//     `~/.cache/roc/packages/<HASH>/`, where `<HASH>` is the URL's filename with its
+//     archive extension removed — so a URL maps to a directory with no network access
+//   * the archive is `.tar.zst` now; the Rust-era compiler used `.tar.br`
+//   * a platform root declares `requires`, `exposes`, `packages`, `provides`, `hosted`
+//   * an exposed module declares its members inside `Name :: [].{ ... }`; anything
+//     after that block is private
+//
+// The architectural limit: a platform's `hosted` functions live in its COMPILED HOST,
+// which a tree-walking interpreter cannot call. Effects run only where this
+// interpreter supplies its own implementation; the rest are reported as a gap.
+
 use rocflight::platform::{real, resolve};
 
 /// basic-cli 0.22.0 — the platform the roc-lang example uses.
@@ -173,4 +178,226 @@ fn a_compiler_pin_is_skipped_rather_than_fetched() {
     // `roc: "nightly-..."` must not be treated as a platform to load.
     let deps = vec![("roc".to_string(), "nightly-2026-09-03".to_string(), false)];
     assert!(real::verify_app(&deps, &[]).is_ok());
+}
+
+// ==========================================================================
+// Every hosted function basic-cli declares has a call shape rocflight can make.
+//
+// The platform's `Host.roc` is the signatures, `main.roc`'s `hosted { … }` block is
+// the symbols, and `IOErr.roc` and the `Internal*.roc` modules are the types those
+// signatures name. All vendored under `tests/fixtures/basic-cli-0.22.0/`, so this
+// runs without roc's cache. The gate is `abi::Plan::of` accepting all sixty.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use rocflight::platform::abi::{Plan, Signature};
+use rocflight::platform::layout::Declarations;
+use rocflight::types::Type;
+
+const FIXTURES: &str = "tests/fixtures/basic-cli-0.22.0";
+
+/// Parse one platform module for what it declares: its signatures and its types.
+fn declarations(file: &str) -> (Vec<(&'static str, Type)>, Vec<(&'static str, Type)>) {
+    let path = Path::new(FIXTURES).join(file);
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {}", path.display(), e));
+    let desugared = Desugarer::new(source).desugar().expect("desugars");
+    let desugared: &'static str = Box::leak(desugared.into_boxed_str());
+    let mut parser = Parser::named(&path.display().to_string(), desugared);
+    parser.parse_expr().unwrap_or_else(|e| panic!("{}: {}", file, e));
+    (parser.signatures().to_vec(), parser.nominals().to_vec())
+}
+
+#[test]
+fn every_basic_cli_hosted_function_has_a_call_shape() {
+    let (host_sigs, _host_types) = declarations("Host.roc");
+    let mut decls: HashMap<String, Type> = HashMap::new();
+    for file in ["IOErr.roc", "InternalHttp.roc", "InternalSqlite.roc", "InternalDateTime.roc", "Host.roc"] {
+        let (_, types) = declarations(file);
+        for (name, ty) in types {
+            // `Host.NativeOsStr` and bare `NativeOsStr` are the same declaration.
+            let bare = name.rsplit('.').next().unwrap_or(name);
+            decls.insert(bare.to_string(), ty.clone());
+            decls.insert(name.to_string(), ty);
+        }
+    }
+    let decls = Declarations::new(decls);
+
+    let main = std::fs::read_to_string(Path::new(FIXTURES).join("main.roc")).expect("main.roc");
+    let hosted: Vec<(&str, &str)> = main
+        .lines()
+        .filter_map(|l| {
+            // `"hosted_stdin_bytes": Host.stdin_bytes!,`
+            let l = l.trim();
+            let (symbol, member) = l.strip_prefix('"')?.split_once("\": ")?;
+            Some((symbol, member.trim_end_matches(',')))
+        })
+        .collect();
+    assert_eq!(hosted.len(), 60, "basic-cli 0.22.0 declares 60 hosted functions");
+
+    let mut failures = Vec::new();
+    for (symbol, member) in &hosted {
+        let Some((_, ty)) = host_sigs.iter().find(|(n, _)| n == member) else {
+            failures.push(format!("{}: `{}` has no signature in Host.roc", symbol, member));
+            continue;
+        };
+        match Signature::of(ty, &decls).and_then(|sig| Plan::of(&sig)) {
+            Ok(_) => {}
+            Err(e) => failures.push(format!("{}: {} — {}", symbol, ty, e)),
+        }
+    }
+    assert!(failures.is_empty(), "{} of {} cannot be called:\n  {}", failures.len(), hosted.len(), failures.join("\n  "));
+}
+
+// ==========================================================================
+// The platformless-app entry-point model.
+//
+// Facts locked in here were verified against `roc` nightly-2026-09-03 and
+// `roc experimental-lsp`, not assumed:
+//   * `main! = |_args| { ... }` with no header is a valid app; the header
+//     `app [main!] {}` is implied.
+//   * `echo!` comes from the default host, and is `Str => {}`.
+//   * The `!` is part of the identifier, so names are looked up verbatim.
+
+fn entry_point_of(src: &str) -> Option<String> {
+    let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
+    let mut parser = Parser::new(&desugared);
+    parser.parse_expr().unwrap();
+    parser.app_entry_point()
+}
+
+#[test]
+fn headerless_app_implies_main_bang() {
+    let entry = entry_point_of("main! = |_args| {\n    echo!(\"hi\")\n    Ok({})\n}\n");
+    assert_eq!(entry.as_deref(), Some("main!"));
+}
+
+#[test]
+fn explicit_empty_header_is_accepted() {
+    // `app [main!] {}` has no platform string. The header parser must not go
+    // looking for one.
+    let entry = entry_point_of("app [main!] {}\n\nmain! = |_| {\n    echo!(\"hi\")\n    Ok({})\n}\n");
+    assert_eq!(entry.as_deref(), Some("main!"));
+}
+
+#[test]
+fn annotations_do_not_truncate_the_binding_chain() {
+    // Regression: an unskipped `main! : ...` line ended the top-level chain, so
+    // `main!` was never bound and lookup failed at run time.
+    let src = "app [main!] {}\n\
+               \n\
+               greeting : Str\n\
+               greeting = \"hello\"\n\
+               \n\
+               main! : List(Str) => Try({}, [Exit(I8), ..])\n\
+               main! = |_args| {\n    echo!(greeting)\n    Ok({})\n}\n";
+    let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
+
+    // The annotations survive desugaring...
+    assert!(desugared.contains("greeting : Str"), "stripped annotation");
+    assert!(desugared.contains("main! : List(Str)"), "stripped annotation");
+
+    // ...and the parser still reaches the `main!` binding past them.
+    let mut parser = Parser::new(&desugared);
+    let ast = parser.parse_expr().unwrap();
+    assert!(
+        format!("{}", ast).contains("main!"),
+        "binding chain truncated at the annotation: {}",
+        ast
+    );
+}
+
+#[test]
+fn record_fields_are_not_mistaken_for_annotations() {
+    // `name: value` (no space) is a record field; `name : Type` is an annotation.
+    // Conflating them would silently delete record fields.
+    let src = "app [main!] {}\n\nmain! = |_| {\n    r = 1\n    r\n}\n";
+    assert_eq!(entry_point_of(src).as_deref(), Some("main!"));
+}
+
+#[test]
+fn echo_is_a_host_effect_not_a_builtin() {
+    use rocflight::platform::host;
+
+    // Confirmed by LSP hover: `echo! : Str => {}`.
+    assert_eq!(host::lookup("echo!"), Some((&["Str"][..], "{}")));
+    // Dropping the `!` gives a different, unknown name.
+    assert!(host::lookup("echo").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Expressions must be parsed at full precedence wherever they can appear.
+// Three places used a lower rung of the ladder and silently truncated:
+// argument lists, top-level binding values, and block statements.
+// ---------------------------------------------------------------------------
+
+
+#[test]
+fn call_can_be_an_argument_to_a_call() {
+    // Regression: arguments were parsed with `parse_primary_expr`, a single atom,
+    // so `inc(41)` inside `I64.to_str(...)` stopped after `inc` and the stray `(`
+    // failed the closing-paren check.
+    assert_eq!(value("inc = |x| x + 1\nI64.to_str(inc(41))"), "\"42\"");
+}
+
+#[test]
+fn operator_can_be_an_argument_to_a_call() {
+    assert_eq!(value("f = |x| x * 2\nI64.to_str(f(20 + 1))"), "\"42\"");
+}
+
+#[test]
+fn top_level_binding_value_can_be_an_operator_expression() {
+    // Regression: top-level binding values used `parse_call_expr`, which has no
+    // operator handling, so `a = 2 + (3 * 4)` failed — while the same binding
+    // inside a block worked. Only the desugared test files exposed this, because
+    // they lift bindings to the top level.
+    assert_eq!(value("a = 2 + (3 * 4)\na"), "14");
+}
+
+#[test]
+fn block_statements_may_be_annotated() {
+    // Regression: `skip_trivia` was not called inside blocks, so an annotation on
+    // a block-local binding was parsed as an expression.
+    let src = "main! = |_| {\n    n : I64\n    n = 21\n    n * 2\n}\n";
+    let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
+    assert!(desugared.contains("n : I64"), "annotation stripped");
+    let mut parser = Parser::new(&desugared);
+    parser.parse_expr().expect("annotation inside block broke parsing");
+}
+
+#[test]
+fn calling_a_non_function_is_still_an_error() {
+    // Loosening the Call arm to unify instead of pattern-matching must not make
+    // every callee acceptable. Now that identifiers have types, a named non-function
+    // is caught too — `x = 42` then `x(1)` used to slip through.
+    for src in ["42(1)", "\"hi\"(1)", "x = 42\nx(1)", "s = \"hi\"\ns(1)"] {
+        let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
+        let mut parser = Parser::new(&desugared);
+        let ast = parser.parse_expr().unwrap();
+        let mut tc = rocflight::types::TypeChecker::new();
+        assert!(tc.synth(&ast).is_err(), "{} should not type check", src);
+    }
+}
+
+#[test]
+fn identifiers_now_carry_their_type() {
+    // This replaces a test that documented the opposite: identifiers used to synth to
+    // a fresh type variable, so the checker knew nothing about them. With a type
+    // environment, a name's type is available wherever it is used.
+    use rocflight::types::TypeChecker;
+
+    let typed = |src: &str| -> String {
+        let desugared = Desugarer::new(src.to_string()).desugar().unwrap();
+        let ast = Parser::new(&desugared).parse_expr().unwrap();
+        let mut checker = TypeChecker::new();
+        let ty = checker.synth(&ast);
+        // Defaulted, because an unconstrained NUMERAL has no width until something
+        // gives it one — and roc then makes it a `Dec`, printing `42.0`.
+        ty.map(|t| checker.defaulted(&t).to_string()).unwrap_or_default()
+    };
+
+    assert_eq!(typed("x = 42\nx"), "Dec");
+    assert_eq!(typed("n : I64\nn = 42\nn"), "I64");
+    assert_eq!(typed("s = \"hi\"\ns"), "Str");
+    assert_eq!(typed("b = Bool.True\nb"), "Bool");
 }

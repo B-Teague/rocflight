@@ -281,10 +281,10 @@ The requirement list:
    warnings**, so "compiles cleanly" means warning-free — a constant scrutinee earns
    "this match value is known at compile time", so keep test inputs non-constant.
 2. All four outputs are **byte-identical**.
-3. Both files build the **same AST** (`cargo test --test golden_ast_test`, which needs
+3. Both files build the **same AST** (`cargo test --test desugar_test`, which needs
    neither `roc` nor a built binary). This catches what output comparison cannot: five
    pairs once had bindings inside `main!` in one file and at the top level in the other —
-   same output, different programs. `golden_ast_test` compares the AST only, not the
+   same output, different programs. `desugar_test` compares the AST only, not the
    inferred type, because a desugared file's declared type is legitimately more specific.
 4. The `.desugared.roc` carries **explicit type annotations**; the sugared file carries
    **none at all**. That is what proves inference works — an annotation on every binding
@@ -597,7 +597,7 @@ The point of keeping it is §12.
 99 golden pairs across 20 phases: strings, numbers, lambdas, operators, entry points,
 `if`, unary minus, records, tuples, `match`, tag unions, pipelines, nominals, lists,
 loops, error sugar, generics, real platforms, dispatch, and the langref sweep (phase 21,
-15 pairs, `tests/langref_test.rs`). Phase 21 found three forms that were **silently
+15 pairs, `tests/lang_test.rs`). Phase 21 found three forms that were **silently
 wrong** rather than missing — digit separators stopped at the `_`, `1.5e3` stopped at the
 `e`, `\u(e9)` was literal — and six that were accepted but unchecked, where an unknown
 type name became a fresh variable that unified with anything.
@@ -703,7 +703,7 @@ to the host, which owns the process.
 No assembly trampoline was needed, unlike roc's: on x86-64 SysV anything over 16 bytes is
 passed by pointer and returned through a hidden `sret` pointer, and every `Str`, `List`,
 record and payload-carrying union is over 16 bytes, so all 60 signatures collapse onto a
-handful of `extern "C"` shapes. `tests/host_abi_test.rs` classifies all 60 and fails the
+handful of `extern "C"` shapes. `tests/platform_test.rs` classifies all 60 and fails the
 build if one does not fit. `ponytail:` x86-64 SysV only; aarch64 needs a second
 classifier, and floats in SSE registers are rejected explicitly rather than mis-passed.
 

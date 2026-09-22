@@ -162,16 +162,6 @@ fn what_the_vm_refuses_is_refused_deliberately() {
     // tree-walker rather than failing loudly. Each has its own test below for the
     // reason; this one is the inventory.
     for (src, expected) in [
-        // A `var` a closure captures needs a shared cell.
-        (
-            "f = || {\n\tvar n = 0\n\tbump = |x| x + n\n\tn = 10\n\tbump(1)\n}\n\nf()",
-            "shared cell",
-        ),
-        // The same hazard, the other way round.
-        (
-            "f = || {\n\tvar n = 0\n\tbump = |x| x + n\n\tn = 1\n\tbump(1)\n}\n\nf()",
-            "shared cell",
-        ),
         // `break` belongs to a loop in the same function.
         ("f = || break\n\nf()", "break"),
         // `return` belongs to a function.
@@ -566,16 +556,14 @@ fn loop_errors_say_what_was_wrong() {
     }
 }
 #[test]
-fn a_var_a_closure_captures_is_refused_rather_than_going_stale() {
-    // Captured by value it would be a snapshot, and the tree-walker's shared frames
-    // make it live — a silent disagreement. It needs a shared cell; nothing in roc's
-    // own suite does this, so V3 refuses it instead of building one. If this test ever
-    // has to change, the cell is the change.
-    let ast = parse(
-        "f = || {\n\tvar n = 0\n\tbump = |x| x + n\n\tn = 10\n\tbump(1)\n}\n\nf()",
+fn a_var_a_closure_captures_is_live_not_a_snapshot() {
+    // Captured by value this would be a snapshot of `n` at 0. V3 refused the program
+    // rather than pick; the cell that comment said would be the change is now built,
+    // so the closure reads the assignment that happened after it was made.
+    assert_eq!(
+        run("f = || {\n\tvar n = 0\n\tbump = |x| x + n\n\tn = 10\n\tbump(1)\n}\n\nf()"),
+        "11"
     );
-    let err = vm::compile(&ast, None).expect_err("the VM compiled a captured var");
-    assert!(err.contains("shared cell"), "unexpected message: {}", err);
 }
 
 #[test]
