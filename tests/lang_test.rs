@@ -1761,3 +1761,29 @@ fn the_new_list_functions_as_methods_and_on_empty_lists() {
     let src = "Str.inspect(([1.I64, 2].join_map(|n| [n, n]), [\"x\"].map_with_index(|s, i| (s, i)), List.find_last([], |n| n > 1.I64), List.join_map([], |n| [n, 1.I64]), List.ends_with([1.I64], []), Try.ok_or(Err(Odd), 7.I64), Try.ok_or(Ok(1.I64), 7)))";
     assert_eq!(as_str(src), "([1, 1, 2, 2], [(\"x\", 0)], Err(NotFound), [], True, 7, 1)");
 }
+
+
+#[test]
+fn a_constant_may_read_one_declared_below_it() {
+    // roc orders top-level constants by what they read; in file order `table` found
+    // `squares` undefined ("Used before it was defined"). `squares` itself reads
+    // `count` only through a function, `upto`.
+    let src = "Board :: [].{\n\ttable : List(U64)\n\ttable = List.map(squares, |s| s * 10)\n\n\tsquares : List(U64)\n\tsquares = upto(count)\n\n\tupto : U64 -> List(U64)\n\tupto = |n| List.repeat(1, n)\n\n\tcount : U64\n\tcount = 3\n}\n\ntotal = List.sum(Board.table) + later\n\nlater : U64\nlater = 1\n\nStr.inspect(total)";
+    assert_eq!(as_str(src), "31");
+}
+
+#[test]
+fn a_name_a_lambda_binds_is_not_a_read_of_the_constant() {
+    // `|b| b + 1` is the lambda's own `b`, not the constant below; counted as a read,
+    // it made `a` and `b` read each other and `b` ran first.
+    let src = "xs = [1.I64, 2]\n\na = List.map(xs, |b| b + 1)\n\nb = List.len(a)\n\nStr.inspect((a, b))";
+    assert_eq!(as_str(src), "([2, 3], 2)");
+}
+
+#[test]
+fn constants_that_seem_to_read_each_other_keep_file_order() {
+    // `f` reads `b` only on a branch `a`'s call never takes, so `a` and `b` appear to
+    // read each other. They keep the order they were written in, which works.
+    let src = "a = f(0)\n\nf = |n| if n > 0 { b } else { 1.I64 }\n\nb : I64\nb = a + 1\n\nStr.inspect((a, b))";
+    assert_eq!(as_str(src), "(1, 2)");
+}
