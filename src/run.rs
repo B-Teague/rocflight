@@ -159,34 +159,60 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
 
     let builtin_nodes = (nodes_before, crate::ast::node_count() as u32);
     crate::tick("builtin::load", &mut phase);
-    // Step 2c: Local modules — `import Hello exposing [hello]`.
+    // Step 2c: modules — `import Hello exposing [hello]`, `import pkg.Text`, and every
+    // module those import in turn.
     //
-    // Each is an ordinary .roc beside the importer. Its top level is evaluated into
-    // the shared global scope BEFORE the app's, so `Hello.hello` is bound by the time
-    // the app runs; `exposing` then aliases the named ones so they can be used bare.
+    // Each is an ordinary .roc file, found beside its importer, or in the directory of
+    // the package its alias names. Its top level is compiled into the shared global
+    // scope BEFORE the app's, dependencies before their dependents, so `Hello.hello`
+    // is bound by the time the app runs; `exposing` then aliases the named ones so
+    // they can be used bare.
+    let packages = package_dirs(parser.dependencies(), &source_dir);
+    let mut wanted: Vec<(std::path::PathBuf, Vec<String>)> = parser
+        .local_modules()
+        .iter()
+        .map(|(path, exposed)| (source_dir.join(format!("{}.roc", path)), exposed.clone()))
+        .collect();
+    for (alias, module) in parser.imports() {
+        if let Some(dir) = packages.get(alias) {
+            wanted.push((dir.join(format!("{}.roc", module.replace('.', "/"))), Vec::new()));
+        }
+    }
+    let mut loaded_modules = ModuleLoader { packages: &packages, seen: Default::default(), order: Vec::new() };
+    for (file, _) in &wanted {
+        loaded_modules.load(file)?;
+    }
+    // The app, parsed again knowing what its imports declare (see `ModuleLoader`).
+    let imports: Vec<std::path::PathBuf> = wanted.iter().map(|(f, _)| f.clone()).collect();
+    let (imported, imported_params) = loaded_modules.declared_by(&imports);
+    let (ast, app_entry_point) = if imported.is_empty() {
+        (ast, app_entry_point)
+    } else {
+        parser = Parser::named(filename, &desugared);
+        parser.declare_imported(&imported, &imported_params);
+        let expr = parser.parse_expr()?;
+        let entry = parser.app_entry_point();
+        (expr, entry)
+    };
     let mut module_asts = Vec::new();
     let mut module_nominals: Vec<(&'static str, Type)> = Vec::new();
     let mut module_params: Vec<(String, Vec<u32>)> = Vec::new();
     let mut module_defaults: Vec<(String, Vec<(String, crate::ast::Expr)>)> = Vec::new();
     let mut module_where_methods: Vec<String> = Vec::new();
-    for (path, exposed) in parser.local_modules() {
-        let file = source_dir.join(format!("{}.roc", path));
-        let text = std::fs::read_to_string(&file)
-            .map_err(|e| format!("cannot read module `{}`: {}", file.display(), e))?;
-        let module_source = Desugarer::new(text).desugar()?;
-        let module_source: &'static str = Box::leak(module_source.into_boxed_str());
-        let mut module_parser = Parser::named(&file.display().to_string(), module_source);
-        let module_ast = module_parser.parse_expr()?;
+    let mut enclosing_owners: Vec<(String, String)> = parser.enclosing_owners().to_vec();
+    for (file, module_ast, module_parser) in loaded_modules.order {
+        enclosing_owners.extend(module_parser.enclosing_owners().iter().cloned());
         // The last segment is the type the module's method block hangs its names on:
         // `Dir/Hello` exposes them as `Hello.hello`.
-        let type_name = path.rsplit('/').next().unwrap_or(path).to_string();
+        let type_name = file.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+        let exposed = wanted.iter().find(|(f, _)| *f == file).map(|(_, e)| e.clone()).unwrap_or_default();
         module_nominals.extend(module_parser.nominals().iter().cloned());
         module_params.extend(module_parser.nominal_params().iter().cloned());
         // A module's own `where` clauses promise dispatch on a generic parameter, the
         // same as the app's: `read : item -> U64 where [item.get : item -> U64]`.
         module_where_methods.extend(module_parser.where_methods());
         module_defaults.extend(module_parser.field_default_exprs().iter().cloned());
-        module_asts.push((module_ast, type_name, exposed.clone()));
+        module_asts.push((module_ast, type_name, exposed));
     }
 
     // Step 2d: the platform's own modules, as the Roc they are.
@@ -233,6 +259,7 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     type_checker.declare_nominal_literals(parser.nominal_literals());
     type_checker.declare_defaults(parser.field_default_exprs());
     type_checker.declare_defaults(&module_defaults);
+    type_checker.declare_enclosing_owners(enclosing_owners.iter().cloned());
     type_checker.declare_suffixed_literals(&parser.suffixed_literals());
     type_checker.declare_suffixed_nominals(parser.nominal_suffixes());
     type_checker.declare_overflowed_literals(parser.overflowed_literals());
@@ -431,6 +458,13 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
             .collect(),
         opaque_nominals: parser.opaque_nominals().to_vec(),
         intrinsics: builtins.iter().flat_map(|b| b.intrinsics.iter().copied()).collect(),
+        enclosing_owners: enclosing_owners
+            .iter()
+            .map(|(inner, outer)| {
+                let leak = |s: &String| -> &'static str { Box::leak(s.clone().into_boxed_str()) };
+                (leak(inner), leak(outer))
+            })
+            .collect(),
         test_mode,
     };
     crate::tick("build the unit", &mut phase);
@@ -471,3 +505,87 @@ pub fn run_file(filename: &str, options: Options) -> Result<Option<Ran>, Box<dyn
     Ok(Some(Ran { value, is_app: app_entry_point.is_some(), inspected, elapsed: started.elapsed() }))
 }
 
+/// The directory of each package the app header names, by alias: `cdx: "./codex/main.roc"`
+/// is `./codex`, relative to the app; a URL is the directory `roc` extracted it to, when
+/// it has. Platforms are not packages here: `platform::real` loads those.
+fn package_dirs(
+    dependencies: &[(String, String, bool)],
+    source_dir: &std::path::Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    let mut dirs = std::collections::HashMap::new();
+    for (alias, spec, is_platform) in dependencies {
+        if *is_platform {
+            continue;
+        }
+        let dir = if spec.contains("://") {
+            crate::platform::resolve::sources_dir(spec)
+        } else {
+            source_dir.join(spec).parent().map(|d| d.to_path_buf())
+        };
+        if let Some(dir) = dir {
+            dirs.insert(alias.clone(), dir);
+        }
+    }
+    dirs
+}
+
+/// Loads a module and, first, every module it imports: `order` ends up dependencies
+/// first, each file once.
+struct ModuleLoader<'a> {
+    packages: &'a std::collections::HashMap<String, std::path::PathBuf>,
+    seen: std::collections::HashSet<std::path::PathBuf>,
+    order: Vec<(std::path::PathBuf, crate::ast::Expr, Parser)>,
+}
+
+impl ModuleLoader<'_> {
+    fn load(&mut self, file: &std::path::Path) -> Result<(), Box<dyn Error>> {
+        if !self.seen.insert(file.to_path_buf()) {
+            return Ok(());
+        }
+        let text = std::fs::read_to_string(file)
+            .map_err(|e| format!("cannot read module `{}`: {}", file.display(), e))?;
+        let module_source = Desugarer::new(text).desugar()?;
+        let module_source: &'static str = Box::leak(module_source.into_boxed_str());
+        let mut module_parser = Parser::named(&file.display().to_string(), module_source);
+        let mut module_ast = module_parser.parse_expr()?;
+        // A module's own imports: a bare one is beside it, a qualified one is in the
+        // package its alias names.
+        let dir = file.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let mut deps: Vec<std::path::PathBuf> = module_parser
+            .local_modules()
+            .iter()
+            .map(|(path, _)| dir.join(format!("{}.roc", path)))
+            .collect();
+        for (alias, module) in module_parser.imports() {
+            if let Some(pkg) = self.packages.get(alias) {
+                deps.push(pkg.join(format!("{}.roc", module.replace('.', "/"))));
+            }
+        }
+        for dep in &deps {
+            self.load(dep)?;
+        }
+        // Parsed again knowing what its imports declare, so an imported type
+        // written with arguments keeps them.
+        let (types, params) = self.declared_by(&deps);
+        if !types.is_empty() {
+            module_parser = Parser::named(&file.display().to_string(), module_source);
+            module_parser.declare_imported(&types, &params);
+            module_ast = module_parser.parse_expr()?;
+        }
+        self.order.push((file.to_path_buf(), module_ast, module_parser));
+        Ok(())
+    }
+
+    /// The types these loaded modules declare, and their parameters.
+    fn declared_by(&self, files: &[std::path::PathBuf]) -> (Vec<(&'static str, Type)>, Vec<(String, Vec<u32>)>) {
+        let mut types = Vec::new();
+        let mut params = Vec::new();
+        for (file, _, parser) in &self.order {
+            if files.contains(file) {
+                types.extend(parser.nominals().iter().cloned());
+                params.extend(parser.nominal_params().iter().cloned());
+            }
+        }
+        (types, params)
+    }
+}

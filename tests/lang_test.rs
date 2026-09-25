@@ -1693,6 +1693,26 @@ fn a_user_defined_operator_does_not_capture_the_primitives() {
     assert_eq!(value(src), "3");
 }
 
+#[test]
+fn a_nested_nominals_methods_see_the_enclosing_blocks_members() {
+    // `Box.is_eq` calls `same_box`, which `Shape`'s block declares: roc resolves a bare
+    // name through every block around the method, not only the method's own.
+    let file = std::env::temp_dir().join("rocflight_enclosing_owner.roc");
+    std::fs::write(
+        &file,
+        "app [main!] {}\n\nShape :: [].{\n\tBox := [B(I64)].{\n\t\tis_eq : Shape.Box, Shape.Box -> Bool\n\t\tis_eq = |a, b| same_box(a, b)\n\t}\n\n\
+         \tsame_box : Shape.Box, Shape.Box -> Bool\n\tsame_box = |a, b| match (a, b) {\n\t\t(B(x), B(y)) => x == y\n\t}\n}\n\n\
+         main! = |_args| Ok(B(3) == B(3))\n",
+    )
+    .unwrap();
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let ran = rocflight::run::run_file(file.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_file(&file);
+    assert_eq!(ran.inspected.expect("inspected"), "Ok(True)");
+}
+
 // --- type-level features --------------------------------------------------
 
 #[test]
@@ -1722,4 +1742,151 @@ fn a_parameterised_nominal_instantiates_its_backing_type() {
     let src = "Wrapper(a) := { item: a }\nunwrap : Wrapper(a) -> a\nunwrap = |w| w.item\n\
                n : Wrapper(I64)\nn = Wrapper.{ item: 42 }\nunwrap(n) + 1";
     assert_eq!(value(src), "43");
+}
+
+// ==========================================================================
+// Modules and packages.
+//
+// Verified against `roc` nightly-2026-09-07 and nightly-2026-09-22: the program
+// below prints `hi!` under both.
+//   * a module's own `import Sibling` is a file beside that module, and is loaded
+//     whether or not the app imports it too.
+//   * `pkg: "./pkg/main.roc"` in an app header is a package on disk: `import
+//     pkg.Words` is `pkg/Words.roc`, and Words' own `import Letters` is beside it.
+
+/// Write `files` under a fresh directory and run its `main.roc`, answering
+/// `Str.inspect` of what `main!` returned.
+fn run_files(dir: &str, files: &[(&str, &str)]) -> String {
+    let root = std::env::temp_dir().join(dir);
+    let _ = std::fs::remove_dir_all(&root);
+    for (path, text) in files {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, text).unwrap();
+    }
+    let options = rocflight::run::Options { inspect_result: true, ..Default::default() };
+    let main = root.join("main.roc");
+    let ran = rocflight::run::run_file(main.to_str().unwrap(), options)
+        .unwrap_or_else(|e| panic!("{}", e))
+        .expect("an app runs");
+    let _ = std::fs::remove_dir_all(&root);
+    ran.inspected.expect("inspected")
+}
+
+#[test]
+fn a_module_loads_the_modules_it_imports() {
+    let out = run_files(
+        "rocflight_module_imports",
+        &[
+            ("Exclaim.roc", "Exclaim :: [].{\n\tbang : Str -> Str\n\tbang = |s| Str.concat(s, \"!\")\n}\n"),
+            ("Shout.roc", "import Exclaim\n\nShout :: [].{\n\tshout : Str -> Str\n\tshout = |s| Exclaim.bang(s)\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Shout\n\nmain! = |_args| Ok(Shout.shout(\"hi\"))\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"hi!\")");
+}
+
+#[test]
+fn a_package_on_disk_is_imported_through_its_alias() {
+    let out = run_files(
+        "rocflight_local_package",
+        &[
+            ("pkg/main.roc", "package [Words] {}\n"),
+            ("pkg/Letters.roc", "Letters :: [].{\n\th : Str\n\th = \"h\"\n}\n"),
+            ("pkg/Words.roc", "import Letters\n\nWords :: [].{\n\tgreeting : Str\n\tgreeting = Str.concat(Letters.h, \"i\")\n}\n"),
+            ("main.roc", "app [main!] { pkg: \"./pkg/main.roc\" }\n\nimport pkg.Words\n\nmain! = |_args| Ok(Words.greeting)\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"hi\")");
+}
+
+#[test]
+fn a_module_type_named_like_its_module_is_the_type_elsewhere() {
+    // `Maybe.Maybe(Str)` in another module is the tag union, not the empty namespace
+    // `Maybe :: []` that shares its last segment.
+    let out = run_files(
+        "rocflight_module_same_name",
+        &[
+            ("Maybe.roc", "Maybe :: [].{\n\tMaybe(a) : [Just(a), None]\n\n\twith_default : Maybe.Maybe(a), a -> a\n\twith_default = |m, d| match m {\n\t\tJust(x) => x\n\t\tNone => d\n\t}\n}\n"),
+            ("Find.roc", "import Maybe\n\nFind :: [].{\n\tfirst : List(Str) -> Maybe.Maybe(Str)\n\tfirst = |xs| match List.first(xs) {\n\t\tOk(x) => Just(x)\n\t\tErr(_) => None\n\t}\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Maybe\nimport Find\n\nmain! = |_args| Ok(Maybe.with_default(Find.first([\"given\"]), \"fallback\"))\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"given\")");
+}
+
+#[test]
+fn a_type_from_another_module_keeps_its_arguments() {
+    // `Tuple.Tup2(I64, I64)` is `Tup2` with `I64` put in, as it would be were `Tup2`
+    // declared here: the literals `first` is given are I64s, not fractions.
+    let out = run_files(
+        "rocflight_imported_type_args",
+        &[
+            ("Tuple.roc", "Tuple :: [].{\n\tTup2(a, b) : [MkTup2(a, b)]\n}\n"),
+            (
+                "main.roc",
+                "app [main!] {}\n\nimport Tuple\n\nfirst : Tuple.Tup2(I64, I64) -> I64\nfirst = |p| match p {\n\tMkTup2(x, _) => x\n}\n\nmain! = |_args| Ok(I64.to_str(first(MkTup2(1, 2))))\n",
+            ),
+        ],
+    );
+    assert_eq!(out, "Ok(\"1\")");
+}
+
+#[test]
+fn a_qualified_type_is_the_imports_even_where_the_module_shares_its_name() {
+    // In `Thing.roc`, itself the namespace `Thing :: [].{ .. }`, the annotation
+    // `Kinds.Thing` is the record `Kinds` declares, not the file's own namespace.
+    let out = run_files(
+        "rocflight_qualified_type_import",
+        &[
+            ("Kinds.roc", "Kinds :: [].{\n\tThing : { a : I64 }\n}\n"),
+            ("Thing.roc", "import Kinds\n\nThing :: [].{\n\tmake : I64 -> Kinds.Thing\n\tmake = |n| { a: n }\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Thing\n\nmain! = |_args| Ok(Thing.make(5).a)\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(5)");
+}
+
+#[test]
+fn a_nominal_built_through_its_module_has_its_declared_fields() {
+    // `Shapes.Dim.{ w: 3 }` in another file: the literal is `Dim`'s, so `3` is the
+    // `I64` its field says, not a fraction.
+    let out = run_files(
+        "rocflight_qualified_nominal_literal",
+        &[
+            ("Shapes.roc", "Shapes :: [].{\n\tDim := { w : I64 }\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Shapes\n\nmain! = |_args| {\n\td = Shapes.Dim.{ w: 3 }\n\tOk(Str.inspect(d.w))\n}\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"3\")");
+}
+
+#[test]
+fn a_nominal_built_through_its_module_is_not_the_files_own_of_that_name() {
+    // This file's `Dim` has a defaulted `h`; `Shapes.Dim` has no `h` at all. The
+    // literal is the import's, so the local default is not filled in.
+    let out = run_files(
+        "rocflight_qualified_nominal_literal_shadowed",
+        &[
+            ("Shapes.roc", "Shapes :: [].{\n\tDim := { w : I64 }\n}\n"),
+            ("main.roc", "app [main!] {}\n\nimport Shapes\n\nDim := { w : I64, h : I64 ?? 0 }\n\nmain! = |_args| {\n\td = Shapes.Dim.{ w: 3 }\n\tl = Dim.{ w: 4 }\n\tOk(Str.inspect((d.w, l.h)))\n}\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(\"(3, 0)\")");
+}
+
+#[test]
+fn an_imported_modules_expects_do_not_run_with_the_app() {
+    // `roc` runs a module's top-level `expect`s under `roc test` only. A module's
+    // top level went straight into the globals, so its `_ = expect` became a global
+    // evaluated on load: this one crashed the app, and in Fast Track one naming a
+    // helper outside the namespace block failed it with "Undefined variable".
+    let out = run_files(
+        "rocflight_module_expects_not_run",
+        &[
+            ("Rng.roc", "Rng :: [].{\n\tnext : U64 -> U64\n\tnext = |s| s + 1\n}\n\nboom : U64 -> U64\nboom = |_| crash \"a module's expect ran\"\n\nexpect boom(1) == 1\n"),
+            ("main.roc", "app [main!] {}\n\nimport Rng\n\nmain! = |_args| Ok(Rng.next(1))\n"),
+        ],
+    );
+    assert_eq!(out, "Ok(2)");
 }

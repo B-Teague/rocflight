@@ -45,6 +45,12 @@ pub struct Parser {
     /// `(module path, exposed names)`. The path is relative to the importing file and
     /// names a `.roc` beside it — `Dir/Hello` is `Dir/Hello.roc`.
     local_modules: Vec<(String, Vec<String>)>,
+    /// The method blocks open around the current position, innermost last.
+    open_blocks: Vec<String>,
+    /// Each nominal declared inside another's method block, with that owner:
+    /// `Shape :: [].{ Box := [B(I64)].{ ... } }` gives `("Box", "Shape")`. See
+    /// `enclosing_owners`.
+    enclosing_owners: Vec<(String, String)>,
     /// How deep `parse_expr` is nested. Only the outermost call wraps the program in
     /// its nominal method bindings.
     expr_depth: u32,
@@ -118,6 +124,11 @@ pub struct Parser {
     /// `Wrapper(a) := { item: a }` records the id that `a` was given, so `Wrapper(Str)`
     /// can substitute `Str` for it.
     nominal_params: Vec<(String, Vec<u32>)>,
+    /// Types the file's imports declare, with their parameters: `Tup2(I64, I64)`
+    /// written in another module is that module's `Tup2` with the arguments put
+    /// in, as a local declaration's would be. See `declare_imported`.
+    imported_types: Vec<(&'static str, Type)>,
+    imported_params: Vec<(String, Vec<u32>)>,
     /// Names introduced by `var`, which are reassignable.
     ///
     /// Flat rather than scoped: a `var x` in one function also makes a later `x = e`
@@ -168,6 +179,8 @@ impl Parser {
             imports: Vec::new(),
             ingests: Vec::new(),
             local_modules: Vec::new(),
+            open_blocks: Vec::new(),
+            enclosing_owners: Vec::new(),
             deferred_expects: Vec::new(),
             field_defaults: Vec::new(),
             optional_fields: Vec::new(),
@@ -175,6 +188,8 @@ impl Parser {
             nominal_suffixes: Vec::new(),
             where_methods: Vec::new(),
             nominal_params: Vec::new(),
+            imported_types: Vec::new(),
+            imported_params: Vec::new(),
             mutable_names: Vec::new(),
             expr_depth: 0,
             block_depth: 0,
@@ -568,6 +583,11 @@ impl Parser {
             .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '.'))
             .map_or(rest.len(), |(i, _)| i);
         let qualified: &str = &rest[..end];
+        // `Kinds.Thing` written in a module that is itself `Thing :: [].{ .. }`: the
+        // qualifier names no type of this file, so the name is the IMPORT's, and the
+        // file's own namespace of the same last segment must not answer for it.
+        let foreign = qualified.contains('.')
+            && self.nominal(qualified.split('.').next().expect("split yields one part")).is_none();
         let name = if qualified.contains('.')
             && qualified.starts_with(char::is_uppercase)
             && !qualified.ends_with('.')
@@ -656,7 +676,12 @@ impl Parser {
 
         // A declared nominal wins over the fallback: `Point` is the nominal, not an
         // anonymous variable.
-        if let Some(nominal) = self.nominal(name) {
+        let declared = if foreign {
+            self.imported_type(name).or_else(|| self.nominal(name))
+        } else {
+            self.nominal(name).or_else(|| self.imported_type(name))
+        };
+        if let Some(nominal) = declared {
             // A nominal named but not yet declared here — the recursive `ConsList(a)`
             // inside `ConsList`'s own body, or an imported name — stands in with a
             // variable for its backing. Each OCCURRENCE gets its own: the shared
@@ -668,7 +693,12 @@ impl Parser {
                 return Ok(nominal);
             }
             // `Wrapper(Str)` — put the arguments in place of the declared parameters.
-            if let Some((_, params)) = self.nominal_params.iter().find(|(n, _)| n == name) {
+            let found = if foreign {
+                self.imported_params.iter().chain(self.nominal_params.iter()).find(|(n, _)| n == name)
+            } else {
+                self.nominal_params.iter().chain(self.imported_params.iter()).find(|(n, _)| n == name)
+            };
+            if let Some((_, params)) = found {
                 let pairs: Vec<(u32, Type)> =
                     params.iter().copied().zip(args.iter().cloned()).collect();
                 self.check_extension(name, &nominal, &pairs);
@@ -1351,6 +1381,18 @@ impl Parser {
         if !self.input[self.pos..].starts_with(".{") {
             return;
         }
+        // A block inside another's: its methods see the outer block's members too.
+        if let Some(outer) = self.open_blocks.last() {
+            if outer != type_name {
+                self.enclosing_owners.push((type_name.to_string(), outer.clone()));
+            }
+        }
+        self.open_blocks.push(type_name.to_string());
+        self.parse_method_block_members(type_name);
+        self.open_blocks.pop();
+    }
+
+    fn parse_method_block_members(&mut self, type_name: &str) {
         self.pos += 2;
 
         // Whatever annotations are pending when this block closes, and were pushed
@@ -1552,6 +1594,25 @@ impl Parser {
     /// See `type_problems`.
     pub fn type_problems(&self) -> &[String] {
         &self.type_problems
+    }
+
+    /// Make the types a file's imports declare known to its annotations, so an
+    /// imported `Tup2(I64, I64)` keeps its arguments. A module's own empty
+    /// namespace (`Maybe :: []`) is not one of them: a type it declares under its
+    /// own name (`Maybe(a)`) is what `Maybe.Maybe` means.
+    pub fn declare_imported(&mut self, types: &[(&'static str, Type)], params: &[(String, Vec<u32>)]) {
+        for (name, ty) in types {
+            let empty = matches!(ty, Type::TagUnion { tags, open: false } if tags.is_empty())
+                || matches!(ty, Type::Nominal { backing, .. } if matches!(**backing, Type::TypeVar(_)) || matches!(&**backing, Type::TagUnion { tags, open: false } if tags.is_empty()));
+            if !empty {
+                self.imported_types.push((name, ty.clone()));
+            }
+        }
+        self.imported_params.extend(params.iter().cloned());
+    }
+
+    fn imported_type(&self, name: &str) -> Option<Type> {
+        self.imported_types.iter().rev().find(|(n, _)| *n == name).map(|(_, t)| t.clone())
     }
 
     fn nominal(&self, name: &str) -> Option<Type> {
@@ -1880,6 +1941,13 @@ impl Parser {
     /// Local modules imported, as `(module path, names it exposes)`.
     pub fn local_modules(&self) -> &[(String, Vec<String>)] {
         &self.local_modules
+    }
+
+    /// Each nominal declared inside another's method block, and that owner. A method
+    /// of the inner one sees the outer one's members by their bare names, as its own
+    /// siblings: `Box.is_eq` may call `Shape`'s `same_box` as `same_box`.
+    pub fn enclosing_owners(&self) -> &[(String, String)] {
+        &self.enclosing_owners
     }
 
     /// Files ingested by `import "path" as name`, as `(binding name, path)`.
@@ -3252,8 +3320,15 @@ impl Parser {
                                     {
                                         self.pos += 1;
                                         let built = self.parse_nominal_braced()?;
-                                        let built = self.fill_defaults(name, built);
-                                        if let Some(declared) = self.nominal(name) {
+                                        // Through another module, the nominal is that
+                                        // module's, as for a qualified type, and so are
+                                        // its defaults: this file's own `Dim` must not
+                                        // fill in fields of the import's.
+                                        let foreign = self.nominal(module).is_none()
+                                            && self.imported_type(name).is_some();
+                                        let built = if foreign { built } else { self.fill_defaults(name, built) };
+                                        let declared = if foreign { self.imported_type(name) } else { self.nominal(name) };
+                                        if let Some(declared) = declared {
                                             self.nominal_literals.push((built.id(), declared));
                                         }
                                         return Ok(built);

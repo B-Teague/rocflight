@@ -210,6 +210,9 @@ pub struct Unit<'a> {
     /// rather than a compile error on a name that is, after all, declared. That is how
     /// a qualified builtin like `Str.repeat` already behaves.
     pub intrinsics: std::collections::HashSet<&'static str>,
+    /// A nested nominal's enclosing owner, from `Parser::enclosing_owners`: the
+    /// owner a sibling lookup tries next.
+    pub enclosing_owners: std::collections::HashMap<&'static str, &'static str>,
     /// `roc test` semantics: run the top-level `expect`s and tally them. A normal run
     /// SKIPS them — roc only treats a top-level `expect` as a test — while an `expect`
     /// inside a function body runs either way.
@@ -247,6 +250,7 @@ pub fn compile(ast: &Expr, entry: Option<&str>) -> Result<Program, String> {
         parse_targets: std::collections::HashMap::new(),
         collect_targets: std::collections::HashMap::new(),
         intrinsics: std::collections::HashSet::new(),
+        enclosing_owners: std::collections::HashMap::new(),
         // The bare helper is what the unit tests and `vm::eval` use: run everything.
         test_mode: true,
     })
@@ -305,12 +309,8 @@ pub fn compile_reporting(
             split_bindings = bindings.len();
             split_statements = statements.len();
         }
-        let mut cursor = module.ast;
-        while let Expr::Let { name, value, body, .. } = cursor {
-            bindings.push((name, value.as_ref()));
-            cursor = body;
-        }
-        statements.push(cursor);
+        let tail = flatten_top(module.ast, &mut bindings, &mut statements);
+        statements.push(tail);
         // `exposing [hello]` makes `Hello.hello` reachable as plain `hello`.
         for name in &module.exposed {
             aliases.push((name, qualify(module.type_name, name)));
@@ -321,35 +321,7 @@ pub fn compile_reporting(
         split_statements = statements.len();
     }
 
-    let mut cursor = ast;
-    let tail = loop {
-        match cursor {
-            Expr::Let { name: "_", value, body, .. } if matches!(**value, Expr::Let { .. }) => {
-                let mut inner = value.as_ref();
-                while let Expr::Let { name, value, body, .. } = inner {
-                    bindings.push((name, value.as_ref()));
-                    inner = body;
-                }
-                // Whatever the inner chain ended in was bound to `_` and discarded, so
-                // it stays a statement: run for its effects, value thrown away.
-                statements.push(inner);
-                cursor = body;
-            }
-            // `_ = <expr>` binds nothing: it is a statement run for its effect, and
-            // that is the shape a top-level `expect` arrives in. As a binding it
-            // would take a global slot under the name `_` and, worse, be compiled
-            // as an ordinary in-function `expect` rather than as a test.
-            Expr::Let { name: "_", value, body, .. } => {
-                statements.push(value.as_ref());
-                cursor = body;
-            }
-            Expr::Let { name, value, body, .. } => {
-                bindings.push((name, value.as_ref()));
-                cursor = body;
-            }
-            other => break other,
-        }
-    };
+    let tail = flatten_top(ast, &mut bindings, &mut statements);
 
     // Chunk 0 is the top level itself, so top-level functions start at 1. Ids are
     // handed out before any body is compiled — that is what lets two functions call
@@ -477,6 +449,7 @@ pub fn compile_reporting(
         capture_free_methods: Vec::new(),
         global_owner: None,
         intrinsics: &unit.intrinsics,
+        enclosing_owners: &unit.enclosing_owners,
     };
 
     for (name, value) in bindings.iter().take(phase_a) {
@@ -784,6 +757,8 @@ struct Compiler<'u> {
     global_owner: Option<&'static str>,
     /// Bare low-level names the builtin module declares; see `Unit::intrinsics`.
     intrinsics: &'u std::collections::HashSet<&'static str>,
+    /// See `Unit::enclosing_owners`.
+    enclosing_owners: &'u std::collections::HashMap<&'static str, &'static str>,
 }
 
 /// Does this instruction move control, or leave the block?
@@ -887,6 +862,45 @@ struct Spares {
     cur: Reg,
     /// Somewhere to put a tag's payload before building it.
     slot: Reg,
+}
+
+/// A file's top level as its global bindings and its statements, answering its
+/// trailing expression. The app's and every module's go through here alike: a
+/// module's `expect`s arrive in the same shapes as the app's.
+fn flatten_top<'e>(
+    ast: &'e Expr,
+    bindings: &mut Vec<(&'static str, &'e Expr)>,
+    statements: &mut Vec<&'e Expr>,
+) -> &'e Expr {
+    let mut cursor = ast;
+    loop {
+        match cursor {
+            Expr::Let { name: "_", value, body, .. } if matches!(**value, Expr::Let { .. }) => {
+                let mut inner = value.as_ref();
+                while let Expr::Let { name, value, body, .. } = inner {
+                    bindings.push((name, value.as_ref()));
+                    inner = body;
+                }
+                // Whatever the inner chain ended in was bound to `_` and discarded, so
+                // it stays a statement: run for its effects, value thrown away.
+                statements.push(inner);
+                cursor = body;
+            }
+            // `_ = <expr>` binds nothing: it is a statement run for its effect, and
+            // that is the shape a top-level `expect` arrives in. As a binding it
+            // would take a global slot under the name `_` and, worse, be compiled
+            // as an ordinary in-function `expect` rather than as a test.
+            Expr::Let { name: "_", value, body, .. } => {
+                statements.push(value.as_ref());
+                cursor = body;
+            }
+            Expr::Let { name, value, body, .. } => {
+                bindings.push((name, value.as_ref()));
+                cursor = body;
+            }
+            other => return other,
+        }
+    }
 }
 
 impl<'u> Compiler<'u> {
@@ -1114,6 +1128,21 @@ impl<'u> Compiler<'u> {
             }
         }
         found
+    }
+
+    /// The block the code being compiled belongs to, then each block around it: the
+    /// owners a bare sibling name is tried under, innermost first.
+    fn enclosing_owners_of(&self) -> Vec<&'static str> {
+        let mut owners = Vec::new();
+        let mut owner = self.enclosing_type();
+        while let Some(o) = owner {
+            if owners.contains(&o) {
+                break;
+            }
+            owners.push(o);
+            owner = self.enclosing_owners.get(o).copied();
+        }
+        owners
     }
 
     fn enclosing_type(&self) -> Option<&'static str> {
@@ -2915,7 +2944,7 @@ impl<'u> Compiler<'u> {
             None => {
                 // The same sibling rule, for a method used as a VALUE rather than
                 // called: `map(xs, helper)` inside the block `helper` belongs to.
-                if let Some(owner) = self.enclosing_type() {
+                for owner in self.enclosing_owners_of() {
                     let qualified = qualify(owner, name);
                     if self.resolve(qualified).is_some() {
                         return self.use_name(qualified);
@@ -2973,7 +3002,7 @@ impl<'u> Compiler<'u> {
                 }
                 // A SIBLING method, called by its bare name from inside the same
                 // method block: `from_list = |l| from_dict(…)` inside `Graph`.
-                if let Some(owner) = self.enclosing_type() {
+                for owner in self.enclosing_owners_of() {
                     if let Some((chunk, arity)) = self.tops.func(qualify(owner, bare)) {
                         let (arg_base, argc) = self.arguments(args)?;
                         check_arity(bare, arity, argc)?;

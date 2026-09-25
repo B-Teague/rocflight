@@ -129,6 +129,8 @@ pub struct TypeChecker {
     /// Without this the bare name is unknown, its result is a fresh variable, and every
     /// use of the method it belongs to loses its type.
     enclosing_type: Vec<String>,
+    /// A nested nominal's enclosing owner — see `Parser::enclosing_owners`.
+    enclosing_owners: std::collections::HashMap<String, String>,
     /// Each `BinOp` node and the type its operands unified to, before the
     /// substitution is finished.
     ///
@@ -261,8 +263,23 @@ impl TypeChecker {
                 matches!(t, Type::Nominal { name: n, backing }
                     if *n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
             };
+            // A module is an empty namespace, `Maybe :: [].{ ... }`, and types are
+            // registered by their last segment, so the module and a type it declares
+            // under its own name (`Maybe(a) : [Just(a), None]`, written `Maybe.Maybe`
+            // elsewhere) are both `Maybe`. The namespace has no values to type, so
+            // the declared type wins whichever arrives first.
+            let namespace = |t: &Type| {
+                let t = match t {
+                    Type::Nominal { backing, .. } => &**backing,
+                    other => other,
+                };
+                matches!(t, Type::TagUnion { tags, open: false } if tags.is_empty())
+            };
             match self.declared_types.get(name) {
                 Some(existing) if placeholder(existing) && !placeholder(&ty) => {
+                    self.declared_types.insert(name.to_string(), ty);
+                }
+                Some(existing) if namespace(existing) && !namespace(&ty) && !placeholder(&ty) => {
                     self.declared_types.insert(name.to_string(), ty);
                 }
                 Some(_) => {}
@@ -403,6 +420,7 @@ impl TypeChecker {
             dispatches: Vec::new(),
             collect_targets: std::collections::HashMap::new(),
             enclosing_type: Vec::new(),
+            enclosing_owners: std::collections::HashMap::new(),
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
             generalized_numerals: std::collections::HashSet::new(),
@@ -1272,9 +1290,21 @@ impl TypeChecker {
     }
 
     /// The type of `name` read as a sibling of the method being checked.
+    /// A nested nominal's methods see its enclosing owner's members as well, so the
+    /// lookup walks outward: `Box.name`, then `Shape.name`.
     fn sibling(&mut self, name: &str) -> Option<Type> {
-        let owner = self.enclosing_type.last()?.clone();
-        self.lookup(&format!("{}.{}", owner, name))
+        let mut owner = self.enclosing_type.last()?.clone();
+        loop {
+            if let Some(ty) = self.lookup(&format!("{}.{}", owner, name)) {
+                return Some(ty);
+            }
+            owner = self.enclosing_owners.get(&owner)?.clone();
+        }
+    }
+
+    /// See `Parser::enclosing_owners`.
+    pub fn declare_enclosing_owners(&mut self, owners: impl IntoIterator<Item = (String, String)>) {
+        self.enclosing_owners.extend(owners);
     }
 
     /// A type as the program will actually see it: the substitution applied, and any
