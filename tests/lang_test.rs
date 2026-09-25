@@ -1723,3 +1723,12 @@ fn a_parameterised_nominal_instantiates_its_backing_type() {
                n : Wrapper(I64)\nn = Wrapper.{ item: 42 }\nunwrap(n) + 1";
     assert_eq!(value(src), "43");
 }
+
+#[test]
+fn a_call_that_names_list_keep_if_answers_a_list() {
+    // `List.keep_if(xs, p)` cannot be the lazy `Iter.keep_if`, yet every such call
+    // answered an iterator (`<opaque>`), even on a list literal, and `List.prepend` of
+    // one failed with "needs a List". Inline and named predicates, a pipe, an empty list.
+    let src = "Bag :: [].{\n\tItems(a) : List(a)\n\n\tinsert : Bag.Items(a), a -> Bag.Items(a) where [a.is_eq : a, a -> Bool]\n\tinsert = |set, item| List.prepend(List.drop_if(set, |other| other == item), item)\n}\n\nbig : I64 -> Bool\nbig = |n| n > 1\n\nStr.inspect((Bag.insert([1.I64, 2, 3], 2), List.keep_if([1.I64, 2, 3], big), [1.I64, 2, 3] |> List.drop_if(|n| n > 1), List.keep_if([], big)))";
+    assert_eq!(as_str(src), "([2, 1, 3], [2, 3], [1], [])");
+}
