@@ -664,7 +664,7 @@ pub fn shape_of(ty: &crate::types::Type) -> NominalShape {
             NominalShape::Fields(fields.iter().map(|(name, ty)| ((*name).to_string(), FieldKind::of(ty))).collect())
         }
         Type::Tuple(items) => NominalShape::Tuple(items.len()),
-        Type::Nominal { name, backing } => match crate::eval::simd_kind(name) {
+        Type::Nominal { name, backing, .. } => match crate::eval::simd_kind(name) {
             Some(kind) => NominalShape::Simd(kind),
             None => shape_of(backing),
         },
