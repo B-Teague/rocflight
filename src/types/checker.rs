@@ -94,6 +94,10 @@ pub struct TypeChecker {
     /// Variables standing for a string literal, which may still become a nominal
     /// with `from_quote`; see `numeral_vars`.
     quote_vars: std::collections::HashSet<u32>,
+    /// The ids that are tag unions' ROWS. A row stands for more tags, or for the
+    /// nominal its union turned out to be, so binding one to anything else is a
+    /// type error -- `f : [A, ..x], x -> _` may not take a `Str` for `x`.
+    row_vars: std::collections::HashSet<u32>,
     /// String literal nodes and their variables, plain and interpolated.
     str_literals: Vec<(crate::ast::NodeId, Type)>,
     interp_literals: Vec<(crate::ast::NodeId, Type)>,
@@ -122,6 +126,10 @@ pub struct TypeChecker {
     /// `parser_for` is what turns each number into a tag. Nothing at run time can
     /// recover that, so the checker has to say.
     parse_targets: std::collections::HashMap<crate::ast::NodeId, Type>,
+    /// What each `Str.inspect(x)` call and each `dbg x` shows: `x`'s type. A
+    /// nominal's `to_inspect` applies where the TYPE says that nominal, which
+    /// nothing at run time can tell -- a `CreditCard :: Str` is a plain `Str` there.
+    inspect_types: std::collections::HashMap<crate::ast::NodeId, Type>,
     /// The nominal whose method block is being checked, if any.
     ///
     /// Inside `Graph :: … .{ … }` a sibling method is in scope UNQUALIFIED — roc lets
@@ -129,6 +137,11 @@ pub struct TypeChecker {
     /// Without this the bare name is unknown, its result is a fresh variable, and every
     /// use of the method it belongs to loses its type.
     enclosing_type: Vec<String>,
+    /// Every type `synth` found and every type `check` was told, in the order they
+    /// were pushed, when `record_types` asks; `node_types` resolves them. Off by
+    /// default: it costs a type clone per call, and only a tool that reads the whole
+    /// typed tree needs it.
+    recorded_types: Option<Vec<(crate::ast::NodeId, Type)>>,
     /// Each `BinOp` node and the type its operands unified to, before the
     /// substitution is finished.
     ///
@@ -192,11 +205,12 @@ impl TypeChecker {
                 self.predeclare(value);
             }
             if let Some(declared) = annotation {
+                let declared = self.with_rows(declared);
                 let mut generics = Vec::new();
-                Self::type_vars_in(declared, &mut generics);
+                Self::type_vars_in(&declared, &mut generics);
                 generics.sort_unstable();
                 generics.dedup();
-                self.bind_poly(name, declared.clone(), generics);
+                self.bind_poly(name, declared, generics);
             }
             cursor = body;
         }
@@ -229,7 +243,7 @@ impl TypeChecker {
 
     /// The nominal a suffix names, as the program declared it.
     fn nominal_named(&self, name: &str) -> Type {
-        self.apply(&Type::Nominal { name: intern(name), backing: Box::new(Type::TypeVar(u32::MAX)) })
+        self.apply(&Type::Nominal { name: intern(name), backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() })
     }
 
     /// What `Name.from_interpolation` gives back, where it is declared.
@@ -258,7 +272,7 @@ impl TypeChecker {
             // NOT one — it names `Thing`, which resolves — so it must win over the
             // app's own `Nominal { ThingAlias, ? }` stand-in.
             let placeholder = |t: &Type| {
-                matches!(t, Type::Nominal { name: n, backing }
+                matches!(t, Type::Nominal { name: n, backing, .. }
                     if *n == name && matches!(**backing, Type::TypeVar(u32::MAX)))
             };
             match self.declared_types.get(name) {
@@ -317,28 +331,52 @@ impl TypeChecker {
             // declaration, not a stand-in. A cross-module alias to another nominal,
             // `ThingAlias : ThingMod.Thing`, has a different name and does resolve:
             // one more expansion reaches `Thing`'s declaration.
-            Type::Nominal { name: n, backing }
+            Type::Nominal { name: n, backing, .. }
                 if matches!(**backing, Type::TypeVar(_)) && (*n == name || *n == bare) => None,
             _ => Some(declared),
         }
     }
 
+    /// A parameterised nominal's declared parameters, by its name or its bare name.
+    fn params_of(&self, name: &str) -> Option<&Vec<u32>> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.nominal_params.get(name).or_else(|| self.nominal_params.get(bare))
+    }
+
     fn expand(&self, ty: &Type, seen: &mut Vec<String>) -> Type {
         match ty {
-            Type::Nominal { name, backing } => {
+            Type::Nominal { name, backing, args } => {
+                let args: Vec<Type> = args.iter().map(|t| self.expand(t, seen)).collect();
                 if matches!(**backing, Type::TypeVar(_)) && !seen.iter().any(|s| s == *name) {
                     if let Some(target) = self.placeholder_target(name) {
-                        let target = target.clone();
+                        // The declaration at THIS reference's arguments: `Step(a)`
+                        // named inside `Iter_(a)` is `Step` over `Iter_`'s `a`, not
+                        // over a type of its own.
+                        let target = match self.params_of(name) {
+                            Some(params) if !args.is_empty() => {
+                                let mapping: Vec<(u32, Type)> = params.iter().copied().zip(args.iter().cloned()).collect();
+                                Self::substitute_vars(target, &mapping)
+                            }
+                            _ => target.clone(),
+                        };
                         seen.push((*name).to_string());
                         let expanded = self.expand(&target, seen);
                         seen.pop();
-                        return expanded;
+                        // The arguments stay on the nominal they name; an alias to
+                        // another nominal (`Foo(a) : Bar`) is that one's.
+                        let bare = |n: &str| n.rsplit('.').next().unwrap_or(n).to_string();
+                        return match expanded {
+                            Type::Nominal { name: n, backing, args: none } if none.is_empty() && bare(n) == bare(name) => {
+                                Type::Nominal { name: n, backing, args }
+                            }
+                            other => other,
+                        };
                     }
                 }
                 seen.push((*name).to_string());
                 let backing = self.expand(backing, seen);
                 seen.pop();
-                Type::Nominal { name: *name, backing: Box::new(backing) }
+                Type::Nominal { name: *name, backing: Box::new(backing), args }
             }
             Type::List(inner) => Type::List(Box::new(self.expand(inner, seen))),
             Type::Range(inner) => Type::Range(Box::new(self.expand(inner, seen))),
@@ -349,12 +387,13 @@ impl TypeChecker {
                 fields: fields.iter().map(|(n, t)| (*n, self.expand(t, seen))).collect(),
                 open: *open,
             },
-            Type::TagUnion { tags, open } => Type::TagUnion {
+            Type::TagUnion { tags, open, row } => Type::TagUnion {
                 tags: tags
                     .iter()
                     .map(|(n, args)| (*n, args.iter().map(|t| self.expand(t, seen)).collect()))
                     .collect(),
                 open: *open,
+                row: *row,
             },
             _ => ty.clone(),
         }
@@ -366,7 +405,7 @@ impl TypeChecker {
             Type::Unit => true,
             Type::Record { fields, open: false } => fields.iter().all(|(_, t)| Self::zero_sized(t)),
             Type::Tuple(items) => items.iter().all(Self::zero_sized),
-            Type::TagUnion { tags, open: false } => tags.len() == 1 && tags[0].1.iter().all(Self::zero_sized),
+            Type::TagUnion { tags, open: false, .. } => tags.len() == 1 && tags[0].1.iter().all(Self::zero_sized),
             _ => false,
         }
     }
@@ -403,6 +442,7 @@ impl TypeChecker {
             dispatches: Vec::new(),
             collect_targets: std::collections::HashMap::new(),
             enclosing_type: Vec::new(),
+            recorded_types: None,
             literals: Vec::new(),
             numeral_vars: std::collections::HashSet::new(),
             generalized_numerals: std::collections::HashSet::new(),
@@ -416,6 +456,7 @@ impl TypeChecker {
             quotable: false,
             conversion_nominals: std::collections::HashSet::new(),
             quote_vars: std::collections::HashSet::new(),
+            row_vars: std::collections::HashSet::new(),
             str_literals: Vec::new(),
             interp_literals: Vec::new(),
             suffixed_nominals: std::collections::HashMap::new(),
@@ -432,6 +473,7 @@ impl TypeChecker {
             rigid_vars: std::collections::HashSet::new(),
             returns: Vec::new(),
             parse_targets: std::collections::HashMap::new(),
+            inspect_types: std::collections::HashMap::new(),
             next_var: 0,
             env: vec![Vec::new()],
         }
@@ -536,7 +578,9 @@ impl TypeChecker {
                 }
             }
         }
-        Self::substitute_vars(ty, &mapping)
+        let instance = Self::substitute_vars(ty, &mapping);
+        self.note_rows(&instance);
+        instance
     }
 
     /// Structural substitution of type variables by id.
@@ -571,7 +615,9 @@ impl TypeChecker {
             Type::Optional(inner) => {
                 Type::Optional(Box::new(Self::substitute_vars(inner, mapping)))
             }
-            Type::TagUnion { tags, open } => Type::TagUnion {
+            // The row is a variable like any other, so a generalised union's copies
+            // grow apart.
+            Type::TagUnion { tags, open, row } => Type::TagUnion {
                 tags: tags
                     .iter()
                     .map(|(n, payload)| {
@@ -582,10 +628,15 @@ impl TypeChecker {
                     })
                     .collect(),
                 open: *open,
+                row: row.map(|r| match mapping.iter().find(|(from, _)| *from == r) {
+                    Some((_, Type::TypeVar(to))) => *to,
+                    _ => r,
+                }),
             },
-            Type::Nominal { name, backing } => Type::Nominal {
+            Type::Nominal { name, backing, args } => Type::Nominal {
                 name: *name,
                 backing: Box::new(Self::substitute_vars(backing, mapping)),
+                args: args.iter().map(|t| Self::substitute_vars(t, mapping)).collect(),
             },
             other => other.clone(),
         }
@@ -605,8 +656,10 @@ impl TypeChecker {
                     out.push(*id);
                 }
             }
-            Type::List(inner) | Type::Range(inner) | Type::Nominal { backing: inner, .. } => {
-                Self::type_vars_in(inner, out)
+            Type::List(inner) | Type::Range(inner) => Self::type_vars_in(inner, out),
+            Type::Nominal { backing, args, .. } => {
+                Self::type_vars_in(backing, out);
+                args.iter().for_each(|t| Self::type_vars_in(t, out));
             }
             Type::Function(param, result) => {
                 Self::type_vars_in(param, out);
@@ -616,9 +669,13 @@ impl TypeChecker {
             Type::Record { fields, .. } => {
                 fields.iter().for_each(|(_, t)| Self::type_vars_in(t, out))
             }
-            Type::TagUnion { tags, .. } => tags
-                .iter()
-                .for_each(|(_, payload)| payload.iter().for_each(|t| Self::type_vars_in(t, out))),
+            Type::TagUnion { tags, row, .. } => {
+                tags.iter()
+                    .for_each(|(_, payload)| payload.iter().for_each(|t| Self::type_vars_in(t, out)));
+                if let Some(r) = row {
+                    Self::type_vars_in(&Type::TypeVar(*r), out);
+                }
+            }
             _ => {}
         }
     }
@@ -634,6 +691,14 @@ impl TypeChecker {
     ///
     /// Everything else falls back to synthesising and unifying, which is equivalent.
     pub fn check(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
+        self.check_node(expr, expected)?;
+        if let Some(types) = self.recorded_types.as_mut() {
+            types.push((expr.id(), expected.clone()));
+        }
+        Ok(())
+    }
+
+    fn check_node(&mut self, expr: &Expr, expected: &Type) -> Result<(), TypeError> {
         let resolved = self.apply(expected);
 
         // A string literal where a nominal with `from_quote` is expected IS that
@@ -747,6 +812,13 @@ impl TypeChecker {
             // type variable to `Config` first, so the unit is checked against the
             // nominal rather than against a bare variable and left as a bare `{}`.
             // Qualified calls keep their own synth path, which types builtins.
+            // `Str.inspect(x)` records `x`'s type (`inspect_types`), which `synth` does.
+            Expr::Call { func, args, .. }
+                if matches!(&**func, Expr::Qualified { module: "Str", name: "inspect", .. }) && args.len() == 1 =>
+            {
+                let actual = self.synth(expr)?;
+                self.unify(&actual, &resolved)
+            }
             Expr::Call { func, args, .. } if !args.is_empty() => {
                 // A builtin or method is typed by its DECLARED signature rather than
                 // by synthesising the qualified name, which has no type of its own.
@@ -985,7 +1057,7 @@ impl TypeChecker {
                 // An OPEN row is one the checker inferred from uses, not one the
                 // program declared, so the declaration is the better authority. A
                 // CLOSED union came from an annotation and keeps its own types.
-                let row_is_inferred = matches!(&resolved, Type::TagUnion { tags, open: true }
+                let row_is_inferred = matches!(&resolved, Type::TagUnion { tags, open: true, .. }
                     if tags.iter().any(|(t, payload)| t == name && payload.len() == args.len()));
                 if row_is_inferred && !args.is_empty() && !matches!(*name, "Ok" | "Err" | "True" | "False") {
                     if let Some(declared) = self.nominal_declaring_tag(name, args.len()) {
@@ -1217,6 +1289,7 @@ impl TypeChecker {
             return Some(Type::TagUnion {
                 tags: vec![("Err", vec![self.fresh_var()]), ("Ok", vec![ok])],
                 open: true,
+                row: None,
             });
         }
         if name.starts_with("from_") || name.starts_with("range_") {
@@ -1299,9 +1372,10 @@ impl TypeChecker {
                 Box::new(self.default_numerals(a, numerals)),
                 Box::new(self.default_numerals(b, numerals)),
             ),
-            Type::Nominal { name, backing } => Type::Nominal {
+            Type::Nominal { name, backing, args } => Type::Nominal {
                 name: *name,
                 backing: Box::new(self.default_numerals(backing, numerals)),
+                args: args.iter().map(|t| self.default_numerals(t, numerals)).collect(),
             },
             Type::Record { fields, open } => Type::Record {
                 fields: fields
@@ -1310,7 +1384,7 @@ impl TypeChecker {
                     .collect(),
                 open: *open,
             },
-            Type::TagUnion { tags, open } => Type::TagUnion {
+            Type::TagUnion { tags, open, row } => Type::TagUnion {
                 tags: tags
                     .iter()
                     .map(|(n, args)| {
@@ -1318,6 +1392,7 @@ impl TypeChecker {
                     })
                     .collect(),
                 open: *open,
+                row: *row,
             },
             other => other.clone(),
         }
@@ -1406,8 +1481,8 @@ impl TypeChecker {
         // an integer range still fall through to `List`.
         if module == "Range" && !self.declared_types.contains_key("Range") {
             let num = self.fresh_var();
-            let range = Type::Nominal { name: "Range", backing: Box::new(num.clone()) };
-            let closed = |tags: Vec<(&'static str, Vec<Type>)>| Type::TagUnion { tags, open: false };
+            let range = Type::Nominal { name: "Range", backing: Box::new(num.clone()), args: Vec::new() };
+            let closed = |tags: Vec<(&'static str, Vec<Type>)>| Type::TagUnion { tags, open: false, row: None };
             let len_hint = closed(vec![
                 ("Known", vec![Type::U64]),
                 ("Unknown", vec![]),
@@ -1472,6 +1547,7 @@ impl TypeChecker {
                 .find(|(name, _)| *name == qualified)
                 .map(|(_, ty)| ty.clone())?,
         };
+        let ty = self.with_rows(&ty);
         let mut generics = Vec::new();
         Self::type_vars_in(&ty, &mut generics);
         generics.sort_unstable();
@@ -1499,6 +1575,82 @@ impl TypeChecker {
         let var = Type::TypeVar(self.next_var);
         self.next_var += 1;
         var
+    }
+
+    /// A fresh row variable, for a union inferred from one tag. Rows and type
+    /// variables share one number space and one substitution.
+    fn fresh_row(&mut self) -> u32 {
+        self.next_var += 1;
+        self.row_vars.insert(self.next_var - 1);
+        self.next_var - 1
+    }
+
+    /// Note every row in `ty` as one: a signature's, or a copy of one.
+    fn note_rows(&mut self, ty: &Type) {
+        match ty {
+            Type::TagUnion { tags, row, .. } => {
+                if let Some(r) = row {
+                    self.row_vars.insert(*r);
+                }
+                tags.iter().flat_map(|(_, payload)| payload).for_each(|t| self.note_rows(t));
+            }
+            Type::List(inner) | Type::Range(inner) | Type::Optional(inner) => self.note_rows(inner),
+            Type::Function(a, b) => {
+                self.note_rows(a);
+                self.note_rows(b);
+            }
+            Type::Tuple(items) => items.iter().for_each(|t| self.note_rows(t)),
+            Type::Record { fields, .. } => fields.iter().for_each(|(_, t)| self.note_rows(t)),
+            Type::Nominal { args, .. } => args.iter().for_each(|t| self.note_rows(t)),
+            _ => {}
+        }
+    }
+
+    /// A signature as the checker uses it: each `..` in it, `[Red, ..]`, is a row
+    /// of its own, which a use instantiates like any of the signature's variables.
+    ///
+    /// The rows are numbered above every variable the signature already has. The
+    /// parser numbers an annotation's variables from the same space as the
+    /// checker's, so a row that happened to share one's id would be instantiated
+    /// as that variable, and a row became an `I64`.
+    fn with_rows(&mut self, ty: &Type) -> Type {
+        let mut vars = Vec::new();
+        Self::type_vars_in(ty, &mut vars);
+        // Not the parser's placeholder backing, `$u32::MAX`, which is no variable.
+        if let Some(highest) = vars.iter().filter(|v| **v != u32::MAX).max() {
+            self.next_var = self.next_var.max(highest + 1);
+        }
+        let with = self.add_rows(ty);
+        self.note_rows(&with);
+        with
+    }
+
+    fn add_rows(&mut self, ty: &Type) -> Type {
+        match ty {
+            Type::TagUnion { tags, open, row } => {
+                let tags = tags
+                    .iter()
+                    .map(|(n, payload)| (*n, payload.iter().map(|t| self.add_rows(t)).collect()))
+                    .collect();
+                let row = if *open && row.is_none() { Some(self.fresh_row()) } else { *row };
+                Type::TagUnion { tags, open: *open, row }
+            }
+            Type::List(inner) => Type::List(Box::new(self.add_rows(inner))),
+            Type::Range(inner) => Type::Range(Box::new(self.add_rows(inner))),
+            Type::Optional(inner) => Type::Optional(Box::new(self.add_rows(inner))),
+            Type::Function(a, b) => Type::Function(Box::new(self.add_rows(a)), Box::new(self.add_rows(b))),
+            Type::Tuple(items) => Type::Tuple(items.iter().map(|t| self.add_rows(t)).collect()),
+            Type::Record { fields, open } => Type::Record {
+                fields: fields.iter().map(|(n, t)| (*n, self.add_rows(t))).collect(),
+                open: *open,
+            },
+            Type::Nominal { name, backing, args } => Type::Nominal {
+                name: *name,
+                backing: backing.clone(),
+                args: args.iter().map(|t| self.add_rows(t)).collect(),
+            },
+            other => other.clone(),
+        }
     }
 
     /// Synthesize (infer) type of expression
@@ -1550,6 +1702,11 @@ impl TypeChecker {
     /// integer or a float: `Dec` carries eighteen decimal places exactly, which is why
     /// roc prints `147.666666666666666666` where an f64 gives `147.66666666666666`.
     /// What each `Json.parse` call was expected to produce, resolved.
+    /// See `inspect_types`: each site's type as the program will see it.
+    pub fn inspect_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
+        self.inspect_types.iter().map(|(id, ty)| (*id, self.defaulted(ty))).collect()
+    }
+
     pub fn json_parse_targets(
         &self,
     ) -> std::collections::HashMap<crate::ast::NodeId, Type> {
@@ -2010,7 +2167,7 @@ impl TypeChecker {
                 line: 0, col: 0,
             });
         }
-        if let Type::TagUnion { tags, open: false } = &resolved {
+        if let Type::TagUnion { tags, open: false, .. } = &resolved {
             if !covers_everything {
                 let uncovered: Vec<&str> = tags
                     .iter()
@@ -2036,6 +2193,34 @@ impl TypeChecker {
     }
 
     pub fn synth(&mut self, expr: &Expr) -> Result<Type, TypeError> {
+        let ty = self.synth_node(expr)?;
+        if let Some(types) = self.recorded_types.as_mut() {
+            types.push((expr.id(), ty.clone()));
+        }
+        Ok(ty)
+    }
+
+    /// Record every node's type from here on; read them with `node_types`.
+    pub fn record_types(&mut self) {
+        self.recorded_types.get_or_insert_with(Vec::new);
+    }
+
+    /// Each recorded node's type, once inference is done: the substitution applied
+    /// and an unpinned numeral defaulted, as the program will see it. Meaningful only
+    /// after checking succeeded: a check that fails leaves a partial record. It builds
+    /// the map on each call, so a caller asks once.
+    ///
+    /// A node typed more than once keeps the last type recorded for it, and a node
+    /// that is checked records the type it was checked AGAINST after its own
+    /// synthesised type, so that is the one kept. Unification is lenient in places,
+    /// so the two can differ: a nominal against its backing, a range where a list is
+    /// expected, one integer width against another. For a translator the expected
+    /// type is usually the one wanted (a `5` checked against `U8` is a `U8`).
+    pub fn node_types(&self) -> std::collections::HashMap<crate::ast::NodeId, Type> {
+        self.recorded_types.iter().flatten().map(|(id, ty)| (*id, self.defaulted(ty))).collect()
+    }
+
+    fn synth_node(&mut self, expr: &Expr) -> Result<Type, TypeError> {
         match expr {
             _ if expr_id_has_nominal(self, expr) => {
                 // Taken OUT while it is checked: `check` falls back to `synth` for a
@@ -2051,7 +2236,7 @@ impl TypeChecker {
                 // `MyTag.Foo({ x: 42 })` checked its payload against a bare variable
                 // and the literal defaulted to `Dec`.
                 let declared = match &declared {
-                    Type::Nominal { name, backing } if matches!(**backing, Type::TypeVar(u32::MAX)) => {
+                    Type::Nominal { name, backing, .. } if matches!(**backing, Type::TypeVar(u32::MAX)) => {
                         self.declared_types.get(*name).cloned().unwrap_or_else(|| declared.clone())
                     }
                     _ => declared,
@@ -2330,8 +2515,8 @@ impl TypeChecker {
                     // A range yields its element type without being a list.
                     Type::Range(elem) => *elem,
                     // A nominal with an `iter` method — a custom iterable — is looped
-                    // over its `iter()`, whose element is what the loop binds. The
-                    // compiler inserts the `.iter()` for these nodes.
+                    // over its `iter()`, whose element is what the loop binds. The VM
+                    // calls the `iter` when the loop starts.
                     Type::Nominal { ref name, .. } if self.declared(name, "iter").is_some() => {
                         self.for_iter_calls.insert(*id);
                         let iter = self.declared(name, "iter").expect("just checked");
@@ -2399,9 +2584,17 @@ impl TypeChecker {
                 self.unify(&condition_type, &Type::Bool)?;
                 Ok(Type::Unit)
             }
-            Expr::Dbg(value, _) => {
-                self.synth(value)?;
+            Expr::Dbg(value, id) => {
+                let shown = self.synth(value)?;
+                self.inspect_types.insert(*id, shown);
                 Ok(Type::Unit)
+            }
+            Expr::Call { func, args, id }
+                if matches!(&**func, Expr::Qualified { module: "Str", name: "inspect", .. }) && args.len() == 1 =>
+            {
+                let shown = self.synth(&args[0])?;
+                self.inspect_types.insert(*id, shown);
+                Ok(Type::Str)
             }
             Expr::Dispatch { receiver, method, args, id } => {
                 let receiver_type = self.synth(receiver)?;
@@ -2642,10 +2835,12 @@ impl TypeChecker {
                         ("Err", vec![Type::TagUnion {
                             tags: vec![("MissingField", Vec::new())],
                             open: false,
+                            row: None,
                         }]),
                         ("Ok", vec![value]),
                     ],
                     open: false,
+                    row: None,
                 })
             }
             Expr::FieldAccess { record, field, .. } => {
@@ -2743,6 +2938,7 @@ impl TypeChecker {
                 Ok(Type::TagUnion {
                     tags: vec![(intern(name), payload)],
                     open: true,
+                    row: Some(self.fresh_row()),
                 })
             }
             // Interpolation always produces a Str, but its embedded expressions still
@@ -3073,10 +3269,12 @@ impl TypeChecker {
                                         ("Err", vec![Type::TagUnion {
                                             tags: vec![("InvalidNumeral", vec![Type::Str])],
                                             open: false,
+                                            row: None,
                                         }]),
                                         ("Ok", vec![declared]),
                                     ],
                                     open: false,
+                                    row: None,
                                 });
                             }
                             "from_str" => {
@@ -3086,6 +3284,7 @@ impl TypeChecker {
                                         ("Ok", vec![declared]),
                                     ],
                                     open: true,
+                                    row: None,
                                 })
                             }
                             // `I64.to_str` and the `to_…` conversions say what they
@@ -3220,6 +3419,7 @@ impl TypeChecker {
                     // CHECKED against it rather than merely inferred. That is what
                     // rejects `c : [Red, Green]` with `c = Blue`.
                     Some(declared) => {
+                        let declared = &self.with_rows(declared);
                         let mut generics = Vec::new();
                         Self::type_vars_in(declared, &mut generics);
 
@@ -3329,7 +3529,7 @@ impl TypeChecker {
             "U64x2" => Type::U64, "I64x2" => Type::I64,
             _ => Type::I64,
         };
-        let vector = Type::Nominal { name: intern(module), backing: Box::new(Type::U128) };
+        let vector = Type::Nominal { name: intern(module), backing: Box::new(Type::U128), args: Vec::new() };
         match method {
             "get_lane" => elem,
             "to_u128_bits" => Type::U128,
@@ -3346,6 +3546,7 @@ impl TypeChecker {
         Type::Nominal {
             name: intern(name),
             backing: Box::new(Type::closed_record(vec![("bytes", Type::List(Box::new(Type::U8)))])),
+            args: Vec::new(),
         }
     }
 
@@ -3362,6 +3563,7 @@ impl TypeChecker {
                 ("Ok", vec![digest.clone()]),
             ],
             open: true,
+            row: None,
         };
         Some(match method {
             "hash" | "hash_chunks" | "finish" => digest,
@@ -3449,6 +3651,7 @@ impl TypeChecker {
                     ("Err", vec![self.fresh_var()]),
                 ],
                 open: true,
+                row: None,
             },
             "join_with" | "with_ascii_uppercased" | "with_ascii_lowercased" | "trim" => Type::Str,
             // The iterator API, over a list or a range: an `Iter` is the list it walks.
@@ -3503,11 +3706,13 @@ impl TypeChecker {
                         ("Skip", vec![Type::closed_record(vec![("rest", rest)])]),
                     ],
                     open: true,
+                    row: None,
                 }
             }
             "size_hint" if self.is_list_like(receiver) => Type::TagUnion {
                 tags: vec![("Known", vec![Type::U64]), ("Unknown", vec![])],
                 open: true,
+                row: None,
             },
             // `n.range_exclusive_to(m)` in method syntax builds a range of the
             // receiver's numeric type.
@@ -3561,6 +3766,7 @@ impl TypeChecker {
         Type::TagUnion {
             tags: vec![("Err", vec![self.fresh_var()]), ("Ok", vec![ok])],
             open: true,
+            row: None,
         }
     }
 
@@ -3587,7 +3793,14 @@ impl TypeChecker {
                 self.bind_pattern(inner, scrutinee);
             }
             Pattern::Tag { name, args } => {
-                let payload = match scrutinee {
+                // The scrutinee as known so far, and a nominal's tags are its
+                // backing's: `B(n)` against a `Crate := [B(I64), ..]` binds `n : I64`.
+                // Taking only a bare union left every nominal's payload unconstrained.
+                let resolved = match self.apply(scrutinee) {
+                    Type::Nominal { backing, .. } => *backing,
+                    other => other,
+                };
+                let payload = match resolved {
                     Type::TagUnion { tags, .. } => tags
                         .iter()
                         .find(|(tag, _)| tag == name)
@@ -3626,10 +3839,12 @@ impl TypeChecker {
                                 ("Err", vec![Type::TagUnion {
                                     tags: vec![("MissingField", vec![])],
                                     open: true,
+                                    row: None,
                                 }]),
                                 ("Ok", vec![*inner]),
                             ],
                             open: true,
+                            row: None,
                         },
                         other => other,
                     };
@@ -3726,7 +3941,7 @@ impl TypeChecker {
                 for arg in args {
                     payload.push(self.pattern_type(arg)?);
                 }
-                Type::TagUnion { tags: vec![(intern(name), payload)], open: true }
+                Type::TagUnion { tags: vec![(intern(name), payload)], open: true, row: Some(self.fresh_row()) }
             }
             Pattern::Tuple(items) => {
                 let mut types = Vec::with_capacity(items.len());
@@ -3781,9 +3996,14 @@ impl TypeChecker {
         self.unify(t1, t2)?;
         let (a, b) = (self.apply(t1), self.apply(t2));
 
+        // Unions with rows have grown into one union already; only those without
+        // (an annotation's `[A, ..]`, a builtin's) still need their tags merged.
+        if a == b {
+            return Ok(a);
+        }
         if let (
-            Type::TagUnion { tags: a_tags, open: a_open },
-            Type::TagUnion { tags: b_tags, open: b_open },
+            Type::TagUnion { tags: a_tags, open: a_open, .. },
+            Type::TagUnion { tags: b_tags, open: b_open, .. },
         ) = (&a, &b)
         {
             let mut merged = a_tags.clone();
@@ -3795,7 +4015,7 @@ impl TypeChecker {
             merged.sort_by(|x, y| x.0.cmp(&y.0));
             // The join is closed only if both sides were: a closed union joined with
             // an open one can still grow.
-            return Ok(Type::TagUnion { tags: merged, open: *a_open || *b_open });
+            return Ok(Type::TagUnion { tags: merged, open: *a_open || *b_open, row: None });
         }
         Ok(a)
     }
@@ -3868,6 +4088,20 @@ impl TypeChecker {
                     } else if self.quote_vars.contains(w) {
                         self.quote_vars.insert(*v);
                     }
+                    // So does being a ROW, and a row is never a number or a string.
+                    if self.row_vars.contains(v) || self.row_vars.contains(w) {
+                        self.row_vars.insert(*v);
+                        self.row_vars.insert(*w);
+                        if [v, w].iter().any(|x| self.numeral_vars.contains(x) || self.quote_vars.contains(x)) {
+                            return Err(TypeError {
+                                message: "A number or a string cannot extend a tag union".to_string(),
+                                expected: "a tag union".to_string(),
+                                actual: t1.to_string(),
+                                line: 0,
+                                col: 0,
+                            });
+                        }
+                    }
                 }
                 // A RIGID variable is the CALLER's choice, not the body's: in
                 // `get_err : [Ok(a), Err(e)] -> e` the result is whatever `e` the
@@ -3912,6 +4146,19 @@ impl TypeChecker {
                         col: 0,
                     });
                 }
+                // A ROW takes tags, or the nominal its union turned out to be.
+                if self.row_vars.contains(v)
+                    && !matches!(t, Type::TypeVar(_) | Type::TagUnion { .. })
+                    && !matches!(t, Type::Nominal { backing, .. } if matches!(**backing, Type::TagUnion { .. }))
+                {
+                    return Err(TypeError {
+                        message: format!("{} is not a tag union, so it cannot extend one", t),
+                        expected: "a tag union".to_string(),
+                        actual: t.to_string(),
+                        line: 0,
+                        col: 0,
+                    });
+                }
                 if self.occurs_check(*v, t) {
                     Err(TypeError {
                         message: format!("Infinite type: ${} = {}", v, t),
@@ -3931,9 +4178,21 @@ impl TypeChecker {
             // `Graph` satisfies a `Dict` exactly as a plain record satisfies a nominal
             // over one. Refusing it made `GraphTraversal` fail with "Dict and Graph are
             // different nominal types".
-            (Type::Nominal { name: a, backing: a_backing },
-             Type::Nominal { name: b, backing: b_backing }) => {
+            (Type::Nominal { name: a, backing: a_backing, args: a_args },
+             Type::Nominal { name: b, backing: b_backing, args: b_args }) => {
                 if a == b {
+                    // The same nominal is the same type exactly when its ARGUMENTS
+                    // are: a backing is the declaration at those arguments. It is
+                    // also what ends a recursive type -- `Iter_(a)` holds a `Step(a)`
+                    // holding an `Iter_(a)` -- which unifying backings would unfold
+                    // for ever. Without arguments on both sides (a construction, or
+                    // a nominal rocflight builds itself) the backings are compared.
+                    if !a_args.is_empty() && a_args.len() == b_args.len() {
+                        for (x, y) in a_args.clone().iter().zip(b_args.clone().iter()) {
+                            self.unify(x, y)?;
+                        }
+                        return Ok(());
+                    }
                     if a_backing == b_backing {
                         return Ok(());
                     }
@@ -3963,14 +4222,26 @@ impl TypeChecker {
             // whole list, which the generic nominal-vs-other arm below would wrongly try.
             // This is what lets `mk : U64 -> Range(U64)` accept `0..<n` and a `for` loop
             // bind the element, while the nominal identity still routes `Range.custom`.
-            (Type::Nominal { name, backing }, Type::List(elem) | Type::Range(elem))
-            | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing })
+            (Type::Nominal { name, backing, .. }, Type::List(elem) | Type::Range(elem))
+            | (Type::List(elem) | Type::Range(elem), Type::Nominal { name, backing, .. })
                 if *name == "Range" =>
             {
                 let (backing, elem) = ((**backing).clone(), (**elem).clone());
                 self.unify(&backing, &elem)
             }
 
+            // A union inferred from tags where a nominal over tags is expected: its
+            // tags are checked against the nominal's, and then its row is bound to
+            // the nominal, because the union IS that nominal. A lone `Empty` passed
+            // as a `Node` is a `Node` from then on, wherever a copy of it went.
+            (nominal @ Type::Nominal { backing, .. }, Type::TagUnion { tags, open: true, row: Some(r) })
+            | (Type::TagUnion { tags, open: true, row: Some(r) }, nominal @ Type::Nominal { backing, .. })
+                if matches!(**backing, Type::TagUnion { .. }) =>
+            {
+                let (nominal, backing, r) = (nominal.clone(), (**backing).clone(), *r);
+                self.unify(&backing, &Type::TagUnion { tags: tags.clone(), open: true, row: None })?;
+                self.bind_row(r, nominal)
+            }
             // Nominal against anything else: compare the backing type. roc accepts a
             // plain record where a `:=` nominal is expected, so this is deliberate
             // rather than lax — verified against the compiler.
@@ -3996,19 +4267,15 @@ impl TypeChecker {
             // sides of the integer/fractional divide.
             // List unification
             (Type::List(a), Type::List(b)) => self.unify(a, b),
-            // Tag-union unification is permissive: the shared tags must agree on
-            // payload arity and types, but neither side has to list the other's
-            // extra tags. `if b Red else Green` unifies [Red] with [Green] and the
-            // branch types are then merged by `join`.
-            //
-            // Closed-union membership (rejecting `c : [Red, Green]` with `c = Blue`)
-            // is NOT checked here and cannot be: the parser skips type annotations,
-            // so the declared union never reaches the AST. `roc check` enforces it,
-            // which is why every golden pair is checked by the real compiler.
-            // ponytail: needs annotations in the AST — see the type-variables phase.
+            // Two tag unions: the shared tags must agree on payload arity and types,
+            // and a closed union may not gain tags. An open union's extra tags go to
+            // the other side's ROW, when it has one: `if b Red else Green` unifies
+            // `[Red, ..]` with `[Green, ..]`, and both are `[Green, Red, ..]` from
+            // then on. An open union without a row (an annotation's `[A, ..]`, a
+            // builtin's) learns nothing itself, and `join` merges the tags it lists.
             (
-                Type::TagUnion { tags: a, open: a_open },
-                Type::TagUnion { tags: b, open: b_open },
+                Type::TagUnion { tags: a, open: a_open, row: a_row },
+                Type::TagUnion { tags: b, open: b_open, row: b_row },
             ) => {
                 // Shared tags must agree on payload arity and types.
                 for (name, a_payload) in a.iter() {
@@ -4073,7 +4340,48 @@ impl TypeChecker {
                         });
                     }
                 }
-                Ok(())
+                // The tags each side lacks, which the other's row takes on.
+                let only = |these: &[(&'static str, Vec<Type>)], those: &[(&'static str, Vec<Type>)]| -> Vec<(&'static str, Vec<Type>)> {
+                    these.iter().filter(|(n, _)| !those.iter().any(|(m, _)| m == n)).cloned().collect()
+                };
+                let (only_a, only_b) = (only(a, b), only(b, a));
+                let grown = |tags: Vec<(&'static str, Vec<Type>)>, open: bool, row: Option<u32>| Type::TagUnion { tags, open, row };
+                match (*a_row, *b_row) {
+                    (Some(r), Some(s)) if r == s => {
+                        if let Some((extra, _)) = only_a.first().or(only_b.first()) {
+                            return Err(TypeError {
+                                message: format!("Tag {} is not a member of the tag union {}", extra, t1),
+                                expected: t1.to_string(),
+                                actual: t2.to_string(),
+                                line: 0,
+                                col: 0,
+                            });
+                        }
+                        Ok(())
+                    }
+                    (Some(r), Some(s)) => match (only_a.is_empty(), only_b.is_empty()) {
+                        (true, true) => self.bind_row(r, Type::TypeVar(s)),
+                        (false, true) => self.bind_row(s, grown(only_a, true, Some(r))),
+                        (true, false) => self.bind_row(r, grown(only_b, true, Some(s))),
+                        (false, false) => {
+                            let rest = self.fresh_row();
+                            self.bind_row(r, grown(only_b, true, Some(rest)))?;
+                            self.bind_row(s, grown(only_a, true, Some(rest)))
+                        }
+                    },
+                    // Against a union without a row, a closed one ends this one's row,
+                    // and an open one leaves it open under a fresh row, to go on
+                    // learning.
+                    (Some(r), None) => {
+                        let rest = if *b_open { Some(self.fresh_row()) } else { None };
+                        self.bind_row(r, grown(only_b, *b_open, rest))
+                    }
+                    (None, Some(s)) => {
+                        let rest = if *a_open { Some(self.fresh_row()) } else { None };
+                        self.bind_row(s, grown(only_a, *a_open, rest))
+                    }
+                    (None, None) => Ok(()),
+                }
             }
             // Tuples unify positionally and only at the same arity.
             (Type::Tuple(a), Type::Tuple(b)) if a.len() == b.len() => {
@@ -4162,6 +4470,23 @@ impl TypeChecker {
                 col: 0,
             }),
         }
+    }
+
+    /// Bind an open union's row, refusing a union that would contain itself.
+    fn bind_row(&mut self, row: u32, to: Type) -> Result<(), TypeError> {
+        // `unify` applies both sides first, so a row reaching here is unbound.
+        debug_assert!(self.subst.get(row).is_none(), "row ${} bound twice", row);
+        if self.occurs_check(row, &to) {
+            return Err(TypeError {
+                message: format!("Infinite type: a tag union contains itself through {}", to),
+                expected: to.to_string(),
+                actual: format!("${}", row),
+                line: 0,
+                col: 0,
+            });
+        }
+        self.subst.insert(row, to);
+        Ok(())
     }
 
     /// Occurs check: prevent infinite types.
@@ -4275,4 +4600,39 @@ fn width_sensitive(expr: &Expr) -> bool {
         return true;
     }
     expr.children().into_iter().any(width_sensitive)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_signatures_rows_are_numbered_above_its_own_variables() {
+        // The parser numbers `a` from the checker's own space, so a fresh checker
+        // would otherwise mint the `..`'s row as `$0` too, and instantiating the
+        // signature would make the row and `a` one variable.
+        let mut checker = TypeChecker::new();
+        let signature = Type::Function(
+            Box::new(Type::TypeVar(0)),
+            Box::new(Type::TagUnion { tags: vec![("X", vec![])], open: true, row: None }),
+        );
+        let Type::Function(_, result) = checker.with_rows(&signature) else { panic!("a function") };
+        let Type::TagUnion { row: Some(row), .. } = *result else { panic!("a row: {}", result) };
+        assert_ne!(row, 0);
+    }
+
+    #[test]
+    fn a_nominals_placeholder_is_not_a_variable_to_number_above() {
+        // `Node`'s placeholder backing is the parser's `$u32::MAX`; counting it
+        // overflowed, and in a release build wrapped, leaving the row at `$0`.
+        let mut checker = TypeChecker::new();
+        let node = Type::Nominal { name: "Node", backing: Box::new(Type::TypeVar(u32::MAX)), args: Vec::new() };
+        let signature = Type::Function(
+            Box::new(Type::Tuple(vec![node, Type::TypeVar(0)])),
+            Box::new(Type::TagUnion { tags: vec![("X", vec![])], open: true, row: None }),
+        );
+        let Type::Function(_, result) = checker.with_rows(&signature) else { panic!("a function") };
+        let Type::TagUnion { row: Some(row), .. } = *result else { panic!("a row: {}", result) };
+        assert_eq!(row, 1);
+    }
 }

@@ -317,6 +317,146 @@ fn a_monomorphic_binding_is_not_generalised() {
 
 // --- declaration and construction -----------------------------------------
 
+// A nominal named inside a declaration -- its own recursive `IList(a)`, or a
+// `Step(a)` declared after it -- is the declaration's argument, not a fresh type.
+// roc rejects each `Str` below ("This string literal is being used where a
+// non-string type is needed"). Whole programs, because only `run_file` gives the
+// checker the declarations a placeholder expands to.
+fn app(decls: &str, value: &str) -> String {
+    format!("app [main!] {{}}\n\n{decls}\nmain! = |_args| {{\n\t_ = {value}\n\tOk({{}})\n}}\n")
+}
+const ILIST: &str = "IList(a) := [INil, ICons(a, IList(a))]\n";
+const ITER: &str = "Iter_(a) := { next : (I64 -> Step(a)) }\nStep(a) := [One(a, Iter_(a)), Done]\n\nempty : Iter_(I64)\nempty = Iter_.{ next: |_| Done }\n";
+
+#[test]
+fn a_recursive_nominal_keeps_its_argument() {
+    let bad = format!("{ILIST}\nl : IList(I64)\nl = ICons(1, ICons(\"x\", INil))\n");
+    let err = run_program(&app(&bad, "l")).expect_err("a Str inside an IList(I64)");
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    let good = format!("{ILIST}\nl : IList(I64)\nl = ICons(1, ICons(2, INil))\n");
+    assert_eq!(run_program(&app(&good, "l")), Ok(()));
+}
+
+#[test]
+fn a_nominal_named_before_its_declaration_keeps_its_argument() {
+    let bad = format!("{ITER}\nworse : Iter_(I64)\nworse = Iter_.{{ next: |_| One(\"oops\", empty) }}\n");
+    let err = run_program(&app(&bad, "worse")).expect_err("a Str inside an Iter_(I64)");
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    // And a well-typed one still checks: the same nominal at the same arguments is
+    // the same type, without unfolding `Iter_` inside `Step` inside `Iter_` for ever.
+    let good = format!("{ITER}\nfine : Iter_(I64)\nfine = Iter_.{{ next: |_| One(7, empty) }}\n");
+    assert_eq!(run_program(&app(&good, "fine")), Ok(()));
+}
+
+#[test]
+fn an_alias_to_a_nominal_keeps_the_nominals_own_arguments() {
+    // `Swap(I64, Str)` is `P(Str, I64)`: the alias's arguments are its own, not P's.
+    // roc rejects `t : P(I64, Str)` and accepts `u : P(Str, I64)`.
+    let decls = "P(a, b) := { x : a, y : b }\nSwap(a, b) : P(b, a)\n\ns : Swap(I64, Str)\ns = P.{ x: \"hi\", y: 1 }\n";
+    let err = run_program(&app(&format!("{decls}\nt : P(I64, Str)\nt = s\n"), "t")).expect_err("P(I64, Str) is not Swap(I64, Str)");
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    assert_eq!(run_program(&app(&format!("{decls}\nu : P(Str, I64)\nu = s\n"), "u")), Ok(()));
+}
+
+#[test]
+fn a_tag_pattern_on_a_nominal_binds_its_payload_types() {
+    // `B(n)` against a `Crate := [B(I64), Empty]` binds `n : I64`, so returning it
+    // where a Str is declared is rejected, as roc rejects it ("The first branch of
+    // this match does not match the previous branch").
+    let src = "Crate := [B(I64), Empty]\nf : Crate -> Str\nf = |c| match c {\n    B(n) => n\n    Empty => \"empty\"\n}\nf";
+    let err = type_error(src);
+    assert!(err.contains("Str") && err.contains("I64"), "got {}", err);
+    assert!(accepts("Crate := [B(I64), Empty]\nf : Crate -> I64\nf = |c| match c {\n    B(n) => n\n    Empty => 0\n}\nf"));
+}
+
+#[test]
+fn an_inferred_union_grows_where_it_is_used() {
+    // `List.repeat(Red, 2)` and `Blue` are one union once `List.append` joins them,
+    // `[Blue, Red, ..]`, and `show` takes only `[Green, Red]`. roc rejects it ("This
+    // argument has the type: [Green, Red] -> Str"); without row variables the
+    // union never grew, and the program crashed at `match` on `Blue` instead.
+    let show = "show : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
+    let err = type_error(&format!("{}List.map(List.append(List.repeat(Red, 2), Blue), show)", show));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.map(List.append(List.repeat(Red, 2), Green), show)", show)));
+}
+
+#[test]
+fn an_inferred_union_keeps_growing_past_a_builtins_open_union() {
+    // `U8.from_str`'s error is an open union with no row of its own. The list's
+    // union meets it and stays open under a fresh row, so the `Blue` appended next
+    // still reaches `show`, which roc rejects.
+    let show = "show : Try(U8, [BadNumStr]) -> Str\nshow = |t| match t {\n    Ok(n) => U8.to_str(n)\n    Err(BadNumStr) => \"bad\"\n}\n";
+    let err = type_error(&format!("{}List.map(List.append(List.append(List.repeat(Ok(1), 1), U8.from_str(\"5\")), Blue), show)", show));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.map(List.append(List.repeat(Ok(1), 1), U8.from_str(\"5\")), show)", show)));
+}
+
+#[test]
+fn an_annotations_named_extension_is_one_row() {
+    // `..others` is ONE row across `keep`'s signature, fresh at each use, so what
+    // `keep` returns is what it was given. roc rejects both programs that break it.
+    let keep = "keep : [Red, ..others] -> [Red, ..others]\nkeep = |c| c\n";
+    let show = "show : [Red, Green] -> Str\nshow = |c| match c {\n    Red => \"red\"\n    Green => \"green\"\n}\n";
+    let err = type_error(&format!("{}{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Blue), show)", keep, show));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}{}List.map(List.append(List.map(List.repeat(Red, 2), keep), Green), show)", keep, show)));
+
+    let only_red = "only_red : [Red] -> Str\nonly_red = |c| match c {\n    Red => \"red\"\n}\n";
+    let err = type_error(&format!("{}{}only_red(keep(Green))", keep, only_red));
+    assert!(err.contains("Green"), "got {}", err);
+    assert!(accepts(&format!("{}{}only_red(keep(Red))", keep, only_red)));
+}
+
+#[test]
+fn a_named_row_used_as_a_type_takes_only_tags() {
+    // `x` is `[A, ..x]`'s row and also a parameter's type. A list of tags may be
+    // it; a `Str` or a number may not -- roc rejects both, and binding the row to
+    // a `Str` used to panic the checker.
+    let f = "f : [A, ..x], x -> [A, ..x]\nf = |t, _v| t\n";
+    assert!(type_error(&format!("{}f(A, \"hello\")", f)).contains("Str"));
+    let _ = type_error(&format!("{}f(A, 42)", f));
+    let h = "h : [A, ..x], List(x) -> [A, ..x]\nh = |t, _v| t\n";
+    assert!(accepts(&format!("{}h(A, [B])", h)));
+}
+
+#[test]
+fn an_extension_alias_puts_its_argument_in_for_the_row() {
+    // `T([B, C])` is `[A, B, C]`, so `show` covers it with three arms. roc agrees.
+    let src = "T(x) : [A, ..x]\nshow : T([B, C]) -> Str\nshow = |t| match t {\n    A => \"a\"\n    B => \"b\"\n    C => \"c\"\n}\n";
+    assert_eq!(as_str(&format!("{}show(B)", src)), "b");
+    assert!(type_error(&format!("{}show(D)", src)).contains("D"));
+}
+
+#[test]
+fn a_signature_naming_a_nominal_still_numbers_its_rows_apart() {
+    // `pick` is used before it is defined, so its signature's rows are minted
+    // early, while `a`'s id is still in range -- and `Node` in the signature brings
+    // the parser's placeholder id, `u32::MAX`, which is no variable to number above.
+    // Counting it made the row `a`, a `Str`, and the checker panicked. roc prints `s`.
+    let src = "app [main!] {}\n\nNode := [Leaf, Branch(Node, Node)]\n\nx : [A, ..]\nx = A\n\nmain! = |_args| {\n    t = pick(Leaf, \"s\")\n    echo!(match t { Tagged(s) => s, _ => \"other\" })\n    Ok({})\n}\n\npick : Node, a -> [Tagged(a), ..]\npick = |_n, v| Tagged(v)\n";
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn a_lone_tag_passed_as_a_nominal_is_that_nominal() {
+    // Each `Empty` meets `Node` through `show`, and from then on it IS a `Node`:
+    // the `Blue` appended afterwards is not one of its tags, as roc says.
+    let node = "Node := [Empty, Leaf(U8)]\nshow : Node -> Str\nshow = |n| match n {\n    Empty => \"empty\"\n    Leaf(b) => U8.to_str(b)\n}\n";
+    let err = type_error(&format!("{}List.append(List.map(List.repeat(Empty, 2), |n| {{\n    _s = show(n)\n    n\n}}), Blue)", node));
+    assert!(err.contains("Blue"), "got {}", err);
+    assert!(accepts(&format!("{}List.append(List.map(List.repeat(Empty, 2), |n| {{\n    _s = show(n)\n    n\n}}), Leaf(7))", node)));
+
+    // And its recorded type says so: no node is left typed `[Empty, ..]`.
+    let ast = build(&format!("{}List.map(List.repeat(Empty, 2), show)", node));
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    checker.synth(&ast).unwrap();
+    let types: Vec<String> = checker.node_types().values().map(|t| t.to_string()).collect();
+    assert!(!types.iter().any(|t| t.starts_with("[Empty")), "{:?}", types);
+    assert!(types.iter().any(|t| t == "List(Node)"), "{:?}", types);
+}
+
 #[test]
 fn a_nominal_annotation_resolves_to_the_nominal() {
     assert_eq!(type_of("Point := { x: I64 }\np : Point\np = Point.{ x: 1 }\np"), "Point");
@@ -694,4 +834,175 @@ fn a_defaulted_field_is_present_while_an_optional_one_may_not_be() {
         as_str(&format!("{}f = |c| match c.?o {{ Ok(v) => I64.to_str(v) Err(MissingField) => \"absent\" }}\nf(Cfg.{{}})", both)),
         "absent"
     );
+}
+
+#[test]
+fn node_types_are_recorded_only_when_asked() {
+    // Off by default. Asked, every node's type is kept, defaulted as the program will
+    // see it: the whole program's, and the list literal's `List(Dec)`.
+    let ast = build("xs = [1, 2]\nList.len(xs)");
+    let mut quiet = TypeChecker::new();
+    quiet.synth(&ast).unwrap();
+    assert!(quiet.node_types().is_empty());
+
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    let ty = checker.synth(&ast).unwrap();
+    let types = checker.node_types();
+    assert_eq!(types.get(&ast.id()).map(|t| t.to_string()), Some(checker.defaulted(&ty).to_string()));
+    assert!(types.values().any(|t| t.to_string() == "List(Dec)"), "{:?}", types.values().map(|t| t.to_string()).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_checked_node_keeps_the_type_it_was_checked_against() {
+    // `y` is an `I64`; `x : U8` checks it against `U8`, which the checker accepts
+    // between integer widths. The use of `y` keeps `U8`, the type it was checked
+    // against, not the `I64` it synthesises.
+    let ast = build("y : I64\ny = 3\n\nx : U8\nx = y\n\nx");
+    let mut checker = TypeChecker::new();
+    checker.record_types();
+    checker.synth(&ast).unwrap();
+    let types = checker.node_types();
+    let rocflight::ast::Expr::Let { body, .. } = &ast else { panic!("a let: {}", ast) };
+    let rocflight::ast::Expr::Let { name: "x", value, .. } = &**body else { panic!("x: {}", body) };
+    assert_eq!(types.get(&value.id()).map(|t| t.to_string()).as_deref(), Some("U8"));
+}
+
+// --- inspect follows the static type ---------------------------------------
+
+#[test]
+fn a_to_inspect_applies_where_the_type_says_so() {
+    // `CreditCard :: Str` is a plain `Str` at run time, so a value alone cannot say
+    // which it is. The type can: the `Str` `Color.to_inspect` returns is shown as a
+    // `Str`, not given to `CreditCard.to_inspect`, and a `Color` inside a list or a
+    // record is shown by its own method, and so is a recursive nominal's inner
+    // one, with or without a `to_inspect`. roc prints each as asserted here.
+    let src = r#"app [main!] {}
+
+Color := [Red, Green].{
+    to_inspect : Color -> Str
+    to_inspect = |c| match c {
+        Red => "_RED_"
+        Green => "_GREEN_"
+    }
+}
+
+CreditCard :: Str.{
+    to_inspect = |CreditCard.(nb)| "**** ${nb}"
+}
+
+Node := [Leaf, Branch(List(Node))].{
+    to_inspect : Node -> Str
+    to_inspect = |n| match n {
+        Leaf => "L"
+        Branch(kids) => "B${Str.inspect(kids)}"
+    }
+}
+
+Holder := [H(List(Holder)), S(Str)]
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(Str.inspect(Color.(Red))), "\"_RED_\"")
+    check(Str.inspect("1234"), "\"1234\"")
+    check(Str.inspect(CreditCard.("1234")), "**** 1234")
+    check(Str.inspect([Color.(Red), Color.(Green)]), "[_RED_, _GREEN_]")
+    check(Str.inspect({ c: Color.(Green), s: "x" }), "{ c: _GREEN_, s: \"x\" }")
+    n : Node
+    n = Branch([Leaf, Branch([Leaf])])
+    check(Str.inspect(n), "B[L, B[L]]")
+    h : Holder
+    h = H([S("x"), H([S("y")])])
+    check(Str.inspect(h), "H([S(\"x\"), H([S(\"y\")])])")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+// --- a list is not an iterator ---------------------------------------------
+
+#[test]
+fn a_lists_keep_if_is_a_list_and_an_iterators_is_an_iterator() {
+    // `Builtin.roc` declares `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`,
+    // the second lazy. `.iter()` gives the iterator, so the two stay apart at run time:
+    // a list's `keep_if` can be concatenated, and an iterator is `<opaque>` until it is
+    // collected. roc prints each as asserted here.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(["B"].concat(["C"].keep_if(|n| n != "A"))), "[\"B\", \"C\"]")
+    check(Str.inspect([1.I64, 2, 3].keep_if(|n| n > 1)), "[2, 3]")
+    check(Str.inspect([1.I64, 2, 3].drop_if(|n| n > 1)), "[1]")
+    check(Str.inspect([1.I64, 2, 3].iter()), "<opaque>")
+    check(Str.inspect([1.I64, 2, 3].iter().keep_if(|n| n > 1)), "<opaque>")
+    check(Str.inspect((1.I64..=3).iter().keep_if(|n| n > 1)), "<opaque>")
+    check(Str.inspect(List.from_iter([1.I64, 2, 3].iter().keep_if(|n| n > 1))), "[2, 3]")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn every_iter_method_answers_on_a_lists_iterator() {
+    // `.iter()` gives a `Value::Iter`, so each of `Builtin.roc`'s `Iter` methods has
+    // to answer on one, and the ones that build an iterator give one. The examples
+    // are `Builtin.roc`'s own; roc prints each as asserted here.
+    let src = r#"app [main!] {}
+
+check = |got, want| if got == want { {} } else { crash "got ${got}, want ${want}" }
+
+main! = |_args| {
+    check(Str.inspect(Iter.fold([7.I64, 8].iter().drop_first(1), [], |acc, x| acc.append(x))), "[8]")
+    check(Str.inspect([7.I64].iter().drop_first(1).size_hint()), "Known(0)")
+    check(Str.inspect(Iter.fold([2.I64, 3].iter().prepended(1.I64), [], |acc, x| acc.append(x))), "[1, 2, 3]")
+    check(Str.inspect(Iter.fold([1.I64, 2].iter().append(3), [], |acc, x| acc.append(x))), "[1, 2, 3]")
+    check(Str.inspect([3.I64, 1, 2].iter().min()), "Ok(1)")
+    check(Str.inspect([3.I64, 1, 2].iter().max()), "Ok(3)")
+    check(Str.inspect([7.I64].iter().drop_first(1).min()), "Err(IterWasEmpty)")
+    check(Str.inspect([2.I64, 3].iter().product()), "Ok(6)")
+    check(Str.inspect([7.I64].iter().drop_first(1).product()), "Err(IterWasEmpty)")
+    check(Str.inspect((1.I64..=4).iter().product()), "Ok(24)")
+    check(Str.inspect([1.I64, 2].iter_rev().keep_if(|n| n > 1)), "<opaque>")
+    check(Str.inspect(Iter.single(42.I64).keep_if(|_| Bool.True)), "<opaque>")
+    check(Str.inspect(List.single(3.I64)), "[3]")
+    empty : List(I64)
+    empty = []
+    check(Str.inspect(empty.min()), "Err(ListWasEmpty)")
+    check(Str.inspect(empty.max()), "Err(ListWasEmpty)")
+    Ok({})
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
+}
+
+#[test]
+fn a_for_loop_walks_the_iterator_its_nominals_iter_gives() {
+    // `for x in bag` calls `Bag.iter`, and a list's `.iter()` is a lazy iterator, which
+    // the loop then walks. roc prints 6.
+    let src = r#"app [main!] {}
+
+Bag := [Bag(List(I64))].{
+    iter : Bag -> Iter(I64)
+    iter = |Bag(xs)| xs.iter()
+}
+
+total : Bag -> I64
+total = |bag| {
+    var $s = 0
+    for x in bag {
+        $s = $s + x
+    }
+    $s
+}
+
+main! = |_args| {
+    if total(Bag.Bag([1, 2, 3])) == 6 { Ok({}) } else { crash "wrong total" }
+}
+"#;
+    assert_eq!(run_program(src), Ok(()));
 }
