@@ -15,6 +15,7 @@ use crate::error::EvalError;
 pub mod crypto;
 pub mod f32math;
 pub mod lazy;
+pub mod num_parse;
 pub mod numeral;
 pub mod value;
 
@@ -31,6 +32,12 @@ thread_local! {
     /// Refusing a method already on the stack is what ends it, and matches what roc
     /// does for the reason roc does it.
     static INSPECTING: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+
+    /// The same for `inspect_as`, with the value each method is showing. There the
+    /// types say which method applies, so only showing the SAME value again is a
+    /// loop: a `Node.to_inspect` that inspects its child `Node`s is not one.
+    static INSPECTING_TYPED: std::cell::RefCell<Vec<(&'static str, Value)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -172,6 +179,23 @@ fn elements(value: Value, name: &str) -> Result<Elements, EvalError> {
     }
 }
 
+/// `min` or `max` of some items, or `Err(empty)`: `List`'s and `Iter`'s differ only
+/// in what they call nothing.
+pub(crate) fn extreme(name: &str, mut items: impl Iterator<Item = Value>, empty: &'static str) -> Value {
+    let Some(mut best) = items.next() else {
+        return Value::tag("Err", [Value::bare(empty)]);
+    };
+    for item in items {
+        let ordering = order_values(&item, &best);
+        if (name == "min" && ordering == Some(std::cmp::Ordering::Less))
+            || (name == "max" && ordering == Some(std::cmp::Ordering::Greater))
+        {
+            best = item;
+        }
+    }
+    Value::tag("Ok", [best])
+}
+
 fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
     let expect = |wanted: usize, got: usize| -> Result<(), EvalError> {
         if wanted == got {
@@ -257,8 +281,14 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             let capacity = if zero_sized { 0 } else if let Value::List(rc) = &args[0] { rc.capacity() } else { 0 };
             Ok(Value::Int(capacity as i128))
         }
-        // `.iter()` and `.collect()` are the identity on what is already a list.
-        "iter" | "collect" => {
+        // `.iter()` gives the iterator, which is `<opaque>` and whose `keep_if` is lazy;
+        // `.collect()` is the identity on what is already a list.
+        "iter" => {
+            expect(1, args.len())?;
+            let list = std::mem::replace(&mut args[0], Value::Unit);
+            Ok(lazy::of(list).map(Value::Iter).expect("a list is iterable"))
+        }
+        "collect" => {
             expect(1, args.len())?;
             Ok(std::mem::replace(&mut args[0], Value::Unit))
         }
@@ -266,7 +296,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
             expect(1, args.len())?;
             let mut items = as_list(&mut args[0])?;
             items.reverse();
-            Ok(Value::list(items))
+            Ok(lazy::of(Value::list(items)).map(Value::Iter).expect("a list is iterable"))
         }
         "size_hint" => {
             expect(1, args.len())?;
@@ -418,19 +448,7 @@ fn call_list_builtin(name: &str, args: &mut [Value]) -> Result<Value, EvalError>
         }
         "min" | "max" => {
             expect(1, args.len())?;
-            let mut items = elements(args[0].clone(), name)?;
-            let Some(mut best) = items.next() else {
-                return Ok(Value::tag("Err", [Value::bare("IterWasEmpty")]));
-            };
-            for item in items {
-                let ordering = order_values(&item, &best);
-                if (name == "min" && ordering == Some(std::cmp::Ordering::Less))
-                    || (name == "max" && ordering == Some(std::cmp::Ordering::Greater))
-                {
-                    best = item;
-                }
-            }
-            Ok(Value::tag("Ok", [best]))
+            Ok(extreme(name, elements(args[0].clone(), name)?, "ListWasEmpty"))
         }
         "sort" | "sort_reversed" | "sort_by" | "sort_by_reversed" | "sort_with" | "sort_with_reversed" => {
             let has_fn = name != "sort" && name != "sort_reversed";
@@ -1006,14 +1024,6 @@ fn call_u128(method: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
     match method {
         "highest" => return Some(out(u128::MAX)),
         "lowest" => return Some(out(0)),
-        "from_str" => {
-            let Value::Str(text) = args.first()? else { return None };
-            let parsed = text.trim().parse::<u128>().ok();
-            return Some(Ok(match parsed {
-                Some(n) => Value::tag("Ok", [Value::U128(n)]),
-                None => Value::tag("Err", [Value::bare("BadNumStr")]),
-            }));
-        }
         _ => {}
     }
     let a = u(args.first()?)?;
@@ -1944,21 +1954,6 @@ fn call_float(module: &str, method: &str, args: &[Value]) -> Option<Result<Value
             let step = if narrow { Value::F32(1.0) } else { Value::Float(1.0) };
             return numeric_range(m, args[0].clone(), args[1].clone(), step);
         }
-        "from_str" => {
-            let Value::Str(text) = args.first()? else { return None };
-            let text = text.trim();
-            // Rust reads `inf` and `NaN`; roc's `from_str` reads digits.
-            let parsed = if text.bytes().any(|b| b.is_ascii_alphabetic() && b != b'e' && b != b'E') {
-                None
-            } else {
-                // `"1e400"` is not a number an `F64` can hold.
-                text.parse::<f64>().ok().filter(|x| x.is_finite())
-            };
-            return Some(Ok(match parsed {
-                Some(x) => Value::tag("Ok", [mk(x)]),
-                None => Value::tag("Err", [Value::bare("BadNumStr")]),
-            }));
-        }
         "from_bits" => {
             let bits = as_whole(args.first()?)?;
             return Some(ok(if narrow {
@@ -2154,21 +2149,6 @@ fn call_numeric(
     match method {
         "highest" => return Some(Ok(Value::Int(hi))),
         "lowest" => return Some(Ok(Value::Int(lo))),
-        // `U8.from_str("256")` is `Err(BadNumStr)`: the width decides, not the parse.
-        "from_str" => {
-            let Value::Str(text) = args.first()? else { return None };
-            // Plain digits first; then the exact decimal reader, so that `"2e5"` and
-            // `"1.0"` are whole numbers too.
-            let text = text.trim();
-            let parsed = text.parse::<i128>().ok().or_else(|| {
-                let attos = dec_from_str(text)?;
-                (attos % DEC_SCALE == 0).then_some(attos / DEC_SCALE)
-            });
-            return Some(Ok(match parsed {
-                Some(n) if fits(n) => Value::tag("Ok", [Value::Int(n)]),
-                _ => Value::tag("Err", [Value::bare("BadNumStr")]),
-            }));
-        }
         _ => {}
     }
 
@@ -2332,8 +2312,362 @@ pub fn low_level_arity(name: &str) -> Option<usize> {
         "u8_list_get_unsafe" => 2,
         "hasher_finish" => 1,
         "dict_pseudo_seed" => 0,
+        "f64_atan2_unsafe" | "f32_atan2_unsafe" | "dec_atan2_unsafe" => 2,
+        // `u8_from_str_prefix_raw`, `dec_from_utf8_prefix_raw`, … for every numeric type:
+        // what 2026-09-27's `Json` number parsers and `T.from_str_prefix` call.
+        _ if name
+            .strip_suffix("_from_str_prefix_raw")
+            .or_else(|| name.strip_suffix("_from_utf8_prefix_raw"))
+            .and_then(num_parse::Kind::named)
+            .is_some() =>
+        {
+            1
+        }
         _ => return None,
     })
+}
+
+/// The numeric members `Builtin.roc` (roc 2026-09-27) defines, as their Roc bodies
+/// define them: parsing (`from_str`, `from_str_prefix`, `from_utf8_prefix`, one
+/// grammar in `num_parse`), `atan2`, `is_approx_eq`, and `Dec`'s rounding in whole
+/// attos. `None` for every other name, which the older dispatch answers.
+fn call_num_2026_09_27(module: &str, name: &str, args: &[Value]) -> Option<Result<Value, EvalError>> {
+    let kind = num_parse::Kind::named(module)?;
+    let crash = |what: &str| Some(Err(EvalError { message: format!("crash: {}", what) }));
+    let field = |value: &Value, wanted: &str| match value {
+        Value::Record(fields) => fields.iter().find(|(f, _)| *f == wanted).map(|(_, v)| v.clone()),
+        _ => None,
+    };
+    let overflow = || Value::tag("Err", [Value::bare("Overflow")]);
+    let ok = |value: Value| Some(Ok(Value::tag("Ok", [value])));
+    let err = |tag: &'static str| Some(Ok(Value::tag("Err", [Value::bare(tag)])));
+    // A `List(U8)` argument as bytes, whatever shape an untyped numeral gave them.
+    let bytes = |value: &Value| -> Option<Vec<u8>> {
+        match value {
+            Value::List(items) => items.iter().map(|b| as_whole(b).and_then(|b| u8::try_from(b).ok())).collect(),
+            _ => None,
+        }
+    };
+    // Base-10 digits, most significant first, as the text `num_parse` reads; `None` when
+    // any item is not a digit.
+    let digits = |value: &Value| -> Option<String> {
+        let list = bytes(value)?;
+        list.iter().all(|d| *d <= 9).then(|| list.iter().map(|d| char::from(b'0' + d)).collect())
+    };
+    match name {
+        // `U16.from_le_bytes(bytes, index)`: the type's width in bytes at `index`,
+        // least significant first, or `Err(OutOfBounds)` past the end.
+        "from_le_bytes" => {
+            let num_parse::Kind::Int { signed, bits } = kind else { return None };
+            let (list, index) = (bytes(args.first()?)?, as_index(args.get(1)?)?);
+            let width = bits as usize / 8;
+            let Some(chunk) = index.checked_add(width).and_then(|end| list.get(index..end)) else {
+                return err("OutOfBounds");
+            };
+            let raw = chunk.iter().rev().fold(0u128, |acc, b| acc << 8 | u128::from(*b));
+            Some(Ok(Value::tag("Ok", [if !signed && bits == 128 {
+                Value::U128(raw)
+            } else if signed && bits < 128 && raw >> (bits - 1) & 1 == 1 {
+                Value::Int(raw as i128 - (1i128 << bits))
+            } else {
+                Value::Int(raw as i128)
+            }])))
+        }
+        // `U64.append_le_bytes_to(value, bytes, count)`: the `count` lowest bytes of the
+        // value appended least significant first; more than it has is `Err(OutOfBounds)`.
+        "append_le_bytes_to" => {
+            let value = as_u128_bits(args.first()?)?;
+            let mut list = bytes(args.get(1)?)?;
+            let count = as_index(args.get(2)?)?;
+            if count > 8 {
+                return err("OutOfBounds");
+            }
+            list.extend((0..count).map(|i| (value >> (8 * i)) as u8));
+            ok(Value::list(list.into_iter().map(|b| Value::Int(i128::from(b))).collect()))
+        }
+        // `from_int_digits([1, 2, 3])` is `Ok(123)`; an item that is not a digit, an
+        // empty list, or a value the type cannot hold is `Err(OutOfRange)`.
+        "from_int_digits" => {
+            let text = digits(args.first()?);
+            match text.filter(|t| !t.is_empty()).and_then(|t| num_parse::parse_whole(kind, t.as_bytes())) {
+                Some(value) => ok(value),
+                None => err("OutOfRange"),
+            }
+        }
+        // `from_dec_digits((integer digits, fractional digits))`, always non-negative.
+        "from_dec_digits" => {
+            let Value::Tuple(parts) = args.first()? else { return None };
+            let (whole, fraction) = (digits(parts.first()?), digits(parts.get(1)?));
+            let text = whole.zip(fraction).and_then(|(w, f)| match (w.is_empty(), f.is_empty()) {
+                (true, true) => None,
+                (_, true) => Some(w),
+                (true, false) => Some(format!("0.{}", f)),
+                (false, false) => Some(format!("{}.{}", w, f)),
+            });
+            match text.and_then(|t| num_parse::parse_whole(kind, t.as_bytes())) {
+                Some(value) => ok(value),
+                None => err("OutOfRange"),
+            }
+        }
+        // `unsigned_is_multiple_of` / `signed_is_multiple_of`: every value is a multiple
+        // of -1, and only 0 is a multiple of 0.
+        "is_multiple_of" => {
+            let num_parse::Kind::Int { signed, bits } = kind else { return None };
+            let answer = if !signed && bits == 128 {
+                let (a, b) = (as_u128_bits(args.first()?)?, as_u128_bits(args.get(1)?)?);
+                if b == 0 { a == 0 } else { a % b == 0 }
+            } else {
+                let (a, b) = (as_whole(args.first()?)?, as_whole(args.get(1)?)?);
+                if b == 0 {
+                    a == 0
+                } else {
+                    b == -1 || a % b == 0
+                }
+            };
+            Some(Ok(Value::Bool(answer)))
+        }
+        // `U8.to(1, 4)` is 1, 2, 3, 4 and `U8.until(1, 4)` is 1, 2, 3: the integer ranges
+        // rocflight already walks.
+        "to" | "until" => match kind {
+            num_parse::Kind::Int { .. } => {
+                let method = if name == "to" { "range_inclusive_to" } else { "range_exclusive_to" };
+                Some(call_builtin_values(module, method, &mut args.to_vec()))
+            }
+            // `Dec.to(1.5, 4.0)` is 1.5, 2.5, 3.5: steps of 1.0 from the start, as
+            // `Builtin.roc` walks it, stopping rather than overflowing at the top.
+            num_parse::Kind::Dec => Some(Ok(Value::Iter(std::rc::Rc::new(lazy::Lazy::Range {
+                at: Value::Dec(as_dec(args.first()?)?),
+                end: Value::Dec(as_dec(args.get(1)?)?),
+                step: Value::Dec(DEC_SCALE),
+                inclusive: name == "to",
+            })))),
+            _ => None,
+        },
+        // The conversions `Builtin.roc` declares on these types that the older numeric
+        // runtime never grew; the other types answer below.
+        "to_dec_try" if matches!(module, "U128" | "I128" | "Dec") => {
+            let scaled = match args.first()? {
+                Value::Dec(d) => Some(*d),
+                Value::U128(n) => i128::try_from(*n).ok().and_then(|n| n.checked_mul(DEC_SCALE)),
+                other => as_whole(other).and_then(|n| n.checked_mul(DEC_SCALE)),
+            };
+            match scaled {
+                Some(d) => ok(Value::Dec(d)),
+                None => err("OutOfRange"),
+            }
+        }
+        "to_f64_wrap" if module == "F64" => Some(Ok(Value::Float(as_f64(args.first()?)?))),
+        "to_f64_try" if module == "F64" => ok(Value::Float(as_f64(args.first()?)?)),
+        "from_str" => {
+            let Value::Str(text) = args.first()? else { return None };
+            Some(Ok(match num_parse::parse_whole(kind, text.as_bytes()) {
+                Some(value) => Value::tag("Ok", [value]),
+                None => Value::tag("Err", [Value::bare("BadNumStr")]),
+            }))
+        }
+        "from_str_prefix" | "from_utf8_prefix" => {
+            let low_level = format!("{}_{}_raw", module.to_ascii_lowercase(), name);
+            let parsed = call_low_level(&low_level, &mut [args.first()?.clone()]);
+            let parsed = match parsed {
+                Ok(parsed) => parsed,
+                Err(e) => return Some(Err(e)),
+            };
+            let err = field(&parsed, "err")?;
+            Some(Ok(match err {
+                Value::Int(0) => Value::tag(
+                    "Ok",
+                    [Value::record(vec![("rest", field(&parsed, "rest")?), ("value", field(&parsed, "value")?)])],
+                ),
+                Value::Int(1) => Value::tag("Err", [Value::bare("NotANumber")]),
+                _ => Value::tag("Err", [Value::bare("OutOfRange")]),
+            }))
+        }
+        // `atan2 = |{ x, y }| f64_atan2_unsafe(y, x)`.
+        "atan2" if matches!(kind, num_parse::Kind::F32 | num_parse::Kind::F64 | num_parse::Kind::Dec) => {
+            let point = args.first()?;
+            let low_level = format!("{}_atan2_unsafe", module.to_ascii_lowercase());
+            Some(call_low_level(&low_level, &mut [field(point, "y")?, field(point, "x")?]))
+        }
+        "is_approx_eq" => {
+            let (a, b, options) = (args.first()?, args.get(1)?, args.get(2)?);
+            let (rel, abs) = (field(options, "rel")?, field(options, "abs")?);
+            let equal = match kind {
+                num_parse::Kind::F64 => {
+                    let (a, b, rel, abs) = (as_f64(a)?, as_f64(b)?, as_f64(&rel)?, as_f64(&abs)?);
+                    if !(rel >= 0.0 && rel <= 1.0 && abs >= 0.0 && abs.is_finite()) {
+                        return crash("F64.is_approx_eq: rel must be in [0, 1] and abs finite and non-negative");
+                    }
+                    a == b || (a.is_finite() && b.is_finite() && (a - b).abs() <= abs.max(rel * a.abs().max(b.abs())))
+                }
+                num_parse::Kind::F32 => {
+                    let f32_of = |v: &Value| as_f64(v).map(|x| x as f32);
+                    let (a, b, rel, abs) = (f32_of(a)?, f32_of(b)?, f32_of(&rel)?, f32_of(&abs)?);
+                    if !(rel >= 0.0 && rel <= 1.0 && abs >= 0.0 && abs.is_finite()) {
+                        return crash("F32.is_approx_eq: rel must be in [0, 1] and abs finite and non-negative");
+                    }
+                    a == b || (a.is_finite() && b.is_finite() && (a - b).abs() <= abs.max(rel * a.abs().max(b.abs())))
+                }
+                num_parse::Kind::Dec => {
+                    let (a, b, rel, abs) = (as_dec(a)?, as_dec(b)?, as_dec(&rel)?, as_dec(&abs)?);
+                    if !(rel >= 0 && rel <= DEC_SCALE && abs >= 0) {
+                        return crash("Dec.is_approx_eq: rel must be in [0, 1] and abs non-negative");
+                    }
+                    if a == b {
+                        true
+                    } else {
+                        let diff = if a > b { a.checked_sub(b) } else { b.checked_sub(a) };
+                        match diff {
+                            // A difference too large for a Dec is never approximately equal.
+                            None => false,
+                            Some(diff) => {
+                                let magnitude = if a == i128::MIN || b == i128::MIN {
+                                    i128::MAX
+                                } else {
+                                    a.abs().max(b.abs())
+                                };
+                                match dec_mul(rel, magnitude) {
+                                    Some(scaled) => diff <= abs.max(scaled),
+                                    None => return Some(Err(EvalError { message: "crash: Dec overflowed".to_string() })),
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => return None,
+            };
+            Some(Ok(Value::Bool(equal)))
+        }
+        // `Dec`'s rounding, in whole attos: `dec_round_to_multiple_try` and
+        // `dec_attos_multiple_try`, with a whole number as the step unless `round_to`.
+        "round" | "round_try" | "floor" | "floor_try" | "ceiling" | "ceiling_try" | "trunc" | "round_to"
+        | "round_to_try"
+            if kind == num_parse::Kind::Dec =>
+        {
+            let attos = as_dec(args.first()?)?;
+            let multiple = |quotient: i128, step: i128| quotient.checked_mul(step);
+            let nearest = |step: i128, to_even: bool| {
+                let truncated = attos / step;
+                let remainder = (attos % step).abs();
+                let distance_to_next = step - remainder;
+                let away = remainder > distance_to_next
+                    || (remainder == distance_to_next && (!to_even || truncated % 2 != 0));
+                let quotient = if !away {
+                    truncated
+                } else if attos < 0 {
+                    truncated - 1
+                } else {
+                    truncated + 1
+                };
+                multiple(quotient, step)
+            };
+            let result = match name {
+                "round" | "round_try" => nearest(DEC_SCALE, false),
+                "floor" | "floor_try" => multiple(floor_div(attos, DEC_SCALE), DEC_SCALE),
+                "ceiling" | "ceiling_try" => multiple(ceil_div(attos, DEC_SCALE), DEC_SCALE),
+                "trunc" => Some(attos / DEC_SCALE * DEC_SCALE),
+                _ => {
+                    let options = args.get(1)?;
+                    let step = as_dec(&field(options, "step")?)?;
+                    if step <= 0 {
+                        return crash("Dec.round_to: step must be positive");
+                    }
+                    let to_even = matches!(field(options, "ties")?, Value::Tag("ToEven", _));
+                    nearest(step, to_even)
+                }
+            };
+            Some(Ok(match (name.ends_with("_try"), result) {
+                (true, Some(attos)) => Value::tag("Ok", [Value::Dec(attos)]),
+                (true, None) => overflow(),
+                (false, Some(attos)) => Value::Dec(attos),
+                (false, None) => return crash(&format!("Dec.{} overflowed", name)),
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// Division rounding toward positive infinity, as `I128.div_ceil_by`.
+fn ceil_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) == (b < 0)) {
+        q + 1
+    } else {
+        q
+    }
+}
+
+/// Division rounding toward negative infinity, as `I128.div_floor_by`.
+fn floor_div(a: i128, b: i128) -> i128 {
+    let q = a / b;
+    if (a % b != 0) && ((a < 0) != (b < 0)) {
+        q - 1
+    } else {
+        q
+    }
+}
+
+/// `Dec.atan2`, as roc computes it (`dec.zig`): vectoring CORDIC on the two
+/// coordinates normalised together, in Dec's own fixed point, so the answer is bit for
+/// bit roc's rather than a float's rounded back.
+fn dec_atan2(y: i128, x: i128) -> i128 {
+    const PI: i128 = 3_141_592_653_589_793_238;
+    const HALF_PI: i128 = 1_570_796_326_794_896_619;
+    const STEPS: [i128; 64] = [
+        785398163397448309, 463647609000806116, 244978663126864154, 124354994546761435,
+        62418809995957348, 31239833430268276, 15623728620476830, 7812341060101111,
+        3906230131966971, 1953122516478818, 976562189559319, 488281211194898,
+        244140620149361, 122070311893670, 61035156174208, 30517578115526,
+        15258789061315, 7629394531101, 3814697265606, 1907348632810,
+        953674316405, 476837158203, 238418579101, 119209289550,
+        59604644775, 29802322387, 14901161193, 7450580596,
+        3725290298, 1862645149, 931322574, 465661287,
+        232830643, 116415321, 58207660, 29103830,
+        14551915, 7275957, 3637978, 1818989,
+        909494, 454747, 227373, 113686,
+        56843, 28421, 14210, 7105,
+        3552, 1776, 888, 444,
+        222, 111, 55, 27,
+        13, 6, 3, 1,
+        0, 0, 0, 0,
+    ];
+    if y == 0 {
+        return if x < 0 { PI } else { 0 };
+    }
+    if x == 0 {
+        return if y < 0 { -HALF_PI } else { HALF_PI };
+    }
+    let (ax, ay) = (x.unsigned_abs(), y.unsigned_abs());
+    // The larger magnitude's leading bit at bit 120: headroom for CORDIC's growth.
+    let leading = ax.max(ay).leading_zeros();
+    let (mut cx, mut cy) = if leading >= 7 {
+        ((ax << (leading - 7)) as i128, (ay << (leading - 7)) as i128)
+    } else {
+        ((ax >> (7 - leading)) as i128, (ay >> (7 - leading)) as i128)
+    };
+    let mut angle: i128 = 0;
+    for (i, step) in STEPS.iter().enumerate() {
+        if cy == 0 {
+            break;
+        }
+        let (dx, dy) = (cx >> i, cy >> i);
+        if cy > 0 {
+            cx += dy;
+            cy -= dx;
+            angle += step;
+        } else {
+            cx -= dy;
+            cy += dx;
+            angle -= step;
+        }
+    }
+    if x < 0 {
+        angle = PI - angle;
+    }
+    if y < 0 {
+        -angle
+    } else {
+        angle
+    }
 }
 
 /// Run one low-level op. `low_level_arity` decides what reaches here.
@@ -2412,6 +2746,58 @@ fn call_low_level(name: &str, args: &mut [Value]) -> Result<Value, EvalError> {
         // make hash flooding impractical, which no test here can observe, and a
         // constant keeps a Dict's iteration order reproducible between runs.
         "dict_pseudo_seed" => Ok(Value::Int(0x243F_6A88_85A3_08D3u64 as i128)),
+        // `atan2 = |{ x, y }| f64_atan2_unsafe(y, x)`: (y, x) order, as C's.
+        "f64_atan2_unsafe" | "f32_atan2_unsafe" | "dec_atan2_unsafe" => {
+            // By value, as the rest of the numeric runtime reads its arguments: a numeral
+            // the checker could not type arrives as a `Dec`.
+            let (y, x) = (&args[0], &args[1]);
+            let answer = match name {
+                "f64_atan2_unsafe" => as_f64(y).zip(as_f64(x)).map(|(y, x)| Value::Float(libm::atan2(y, x))),
+                "f32_atan2_unsafe" => {
+                    as_f64(y).zip(as_f64(x)).map(|(y, x)| Value::F32(f32math::atan2(y as f32, x as f32)))
+                }
+                _ => as_dec(y).zip(as_dec(x)).map(|(y, x)| Value::Dec(dec_atan2(y, x))),
+            };
+            answer.ok_or_else(|| wrong("two numbers"))
+        }
+        // `u8_from_str_prefix_raw : Str -> { err : U8, rest : Str, value : U8 }`, and the
+        // same over `List(U8)`. `err` is 0 for a number, 1 when none starts the input and
+        // 2 when the longest token does not fit; see `num_parse`.
+        _ if name.ends_with("_from_str_prefix_raw") || name.ends_with("_from_utf8_prefix_raw") => {
+            let kind = name
+                .split('_')
+                .next()
+                .and_then(num_parse::Kind::named)
+                .ok_or_else(|| wrong("a numeric type"))?;
+            let (consumed, parsed, rest) = match &args[0] {
+                Value::Str(text) => {
+                    let (consumed, parsed) = num_parse::parse_prefix(kind, text.as_bytes());
+                    (consumed, parsed, str_value(text[consumed..].to_string()))
+                }
+                Value::List(items) => {
+                    let bytes: Vec<u8> = items
+                        .iter()
+                        .map(|item| as_whole(item).and_then(|b| u8::try_from(b).ok()))
+                        .collect::<Option<_>>()
+                        .ok_or_else(|| wrong("a List(U8)"))?;
+                    let (consumed, parsed) = num_parse::parse_prefix(kind, &bytes);
+                    // Bytes, whatever shape an untyped numeral gave them on the way in.
+                    let rest = bytes[consumed..].iter().map(|b| Value::Int(i128::from(*b))).collect();
+                    (consumed, parsed, Value::list(rest))
+                }
+                _ => return Err(wrong("a Str or a List(U8)")),
+            };
+            let err = match (consumed, &parsed) {
+                (_, Some(_)) => 0,
+                (0, None) => 1,
+                (_, None) => 2,
+            };
+            Ok(Value::record(vec![
+                ("err", Value::Int(err)),
+                ("rest", rest),
+                ("value", parsed.unwrap_or_else(|| kind.zero())),
+            ]))
+        }
         _ => Err(EvalError { message: format!("low-level op `{}` is not implemented", name) }),
     }
 }
@@ -2445,6 +2831,21 @@ pub fn call_builtin_values(
     }
     if module == "Lit" && name == "coerce" {
         return numeral::coerce(args);
+    }
+    // What roc 2026-09-27's `Builtin.roc` defines for the numeric types and rocflight
+    // runs in Rust, since the `Num` member is not loaded; see `call_num_2026_09_27`.
+    // Only these names, tested before anything else so every other numeric call pays
+    // one string match and nothing more.
+    if matches!(
+        name,
+        "from_str" | "from_str_prefix" | "from_utf8_prefix" | "atan2" | "is_approx_eq" | "round" | "round_try"
+            | "floor" | "floor_try" | "ceiling" | "ceiling_try" | "trunc" | "round_to" | "round_to_try"
+            | "from_le_bytes" | "append_le_bytes_to" | "from_int_digits" | "from_dec_digits" | "is_multiple_of"
+            | "to" | "until" | "to_dec_try" | "to_f64_wrap" | "to_f64_try"
+    ) {
+        if let Some(result) = call_num_2026_09_27(module, name, args) {
+            return result;
+        }
     }
     // `U32.from_numeral(n)` is the width's `from_str` of the literal's text, with roc's
     // name for the failure.
@@ -2533,34 +2934,6 @@ pub fn call_builtin_values(
     // `from_str` is dispatched on the numeric type too: `I64.from_str`, and so on.
     // It returns a Try, which is the tag union [Ok(a), Err(b)] — so the result is
     // an ordinary tag value. roc names the failure `BadNumStr`.
-    if name == "from_str" && is_numeric_module(module) {
-        if args.len() != 1 {
-            return Err(EvalError {
-                message: format!("{}.from_str expects 1 argument, got {}", module, args.len()),
-            });
-        }
-        let text = match args[0].clone() {
-            Value::Str(s) => s,
-            other => {
-                return Err(EvalError {
-                    message: format!("{}.from_str needs a Str, got {}", module, other),
-                })
-            }
-        };
-        // The integer widths answered above, in `call_numeric`; these are the
-        // fractional ones. `Dec` is parsed EXACTLY, digit by digit, never through
-        // a float.
-        let text = text.trim();
-        let parsed = match module {
-            "Dec" => dec_from_str(text).map(Value::Dec),
-            _ => text.parse::<f64>().ok().map(Value::Float),
-        };
-        return Ok(match parsed {
-            Some(value) => Value::tag("Ok", [value]),
-            None => Value::tag("Err", [Value::bare("BadNumStr")]),
-        });
-    }
-
     // Width conversions: `I64.to_f64(n)`, `n.to_dec()`, `x.to_i64()`. Integer
     // widths are not modelled separately here, so every integer target is the same
     // conversion — only int/float actually changes the representation.
@@ -2672,25 +3045,22 @@ pub fn call_builtin_values(
             // `Iter(a) -> Iter((U64, a))` and nowhere else — so it always produces a
             // lazy iterator, even off a list.
             //
-            // `keep_if`/`drop_if` are here for a worse reason: `Builtin.roc` declares
-            // BOTH `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, and roc
-            // inspects `[1, 2, 3].keep_if(p)` as `[2, 3]` but
-            // `[1, 2, 3].iter().keep_if(p)` as `<opaque>`. Nothing here can tell those
-            // apart, because `.iter()` on a list IS the list at run time — so this path
-            // answers the lazy one for both, and the COMPILER answers the eager one
-            // wherever the checker knows the receiver is a `List` (`Compiler::list_loop`).
-            // What is left divergent is a receiver whose module the checker cannot name,
-            // such as an unannotated `|xs| xs.keep_if(p)`: roc gives a list there and
-            // this gives an iterator. Fixing it needs an `Iter` that is its own value.
-            || matches!(name, "keep_if" | "drop_if" | "with_index")
-            // `concat` and `size_hint` are shared with `List`: lazy only for a range
-            // or an iterator, so `List.concat` of two lists stays an eager list.
-            || (matches!(name, "concat" | "size_hint") && on_lazy_source)
+            || name == "with_index"
+            // The rest are shared with `List`: `Builtin.roc` declares both
+            // `List.keep_if -> List(a)` and `Iter.keep_if -> Iter(a)`, the second lazy.
+            // `.iter()` gives a `Value::Iter`, so the receiver says which is meant: a
+            // list's stays an eager list, and a range's or an iterator's is lazy.
+            || (matches!(name, "keep_if" | "drop_if" | "concat" | "size_hint") && on_lazy_source)
             || (name == "from_iter" && on_iter);
         if lazy_method {
             if let Some(result) = lazy::call(name, args) {
                 return result;
             }
+        }
+        // `Iter.single` and `List.single` share a name and nothing else.
+        if module == "Iter" && name == "single" && args.len() == 1 {
+            let item = std::mem::replace(&mut args[0], Value::Unit);
+            return Ok(lazy::of(Value::list(vec![item])).map(Value::Iter).expect("a list is iterable"));
         }
         return call_list_builtin(name, args);
     }
@@ -2737,12 +3107,16 @@ pub fn call_builtin_values(
             }
         }
         ("Str", "inspect") => {
-            if args.len() != 1 {
+            if args.is_empty() || args.len() > 2 {
                 return Err(EvalError {
                     message: format!("Str.inspect expects 1 argument, got {}", args.len()),
                 });
             }
             let val = args[0].clone();
+            // The compiler passes the argument's type, when the checker knew it.
+            if let Some(shape) = args.get(1) {
+                return Ok(str_value(inspect_as(&val, shape)));
+            }
             // A nominal may define `to_inspect` to control how it is shown.
             if let Some(custom) = custom_inspect(&val) {
                 return Ok(custom);
@@ -3267,16 +3641,31 @@ pub fn inspect(value: &Value) -> String {
     {
         return "<opaque>".to_string();
     }
+    render(value, &|_, v| inspect(v))
+}
+
+/// A part of a value that `render` shows by asking its caller.
+pub enum Part<'a> {
+    /// A list's or tuple's element, by position.
+    Item(usize),
+    /// A record's field.
+    Field(&'a str),
+    /// A tag's payload, by position.
+    Payload(usize),
+}
+
+/// A value as roc shows it, each part shown by `part`.
+fn render(value: &Value, part: &dyn Fn(Part, &Value) -> String) -> String {
     match value {
         Value::Str(s) => crate::eval::value::quoted(s),
         Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
         Value::Unit => "{}".to_string(),
         Value::List(items) => {
-            let rendered: Vec<String> = items.iter().map(inspect).collect();
+            let rendered: Vec<String> = items.iter().enumerate().map(|(i, v)| part(Part::Item(i), v)).collect();
             format!("[{}]", rendered.join(", "))
         }
         Value::Tuple(items) => {
-            let rendered: Vec<String> = items.iter().map(inspect).collect();
+            let rendered: Vec<String> = items.iter().enumerate().map(|(i, v)| part(Part::Item(i), v)).collect();
             format!("({})", rendered.join(", "))
         }
         Value::Range { .. } => "<opaque>".to_string(),
@@ -3288,18 +3677,101 @@ pub fn inspect(value: &Value) -> String {
             sorted.sort_by(|a, b| a.0.cmp(b.0));
             let rendered: Vec<String> = sorted
                 .iter()
-                .map(|(name, v)| format!("{}: {}", name, inspect(v)))
+                .map(|(name, v)| format!("{}: {}", name, part(Part::Field(name), v)))
                 .collect();
             format!("{{ {} }}", rendered.join(", "))
         }
         Value::Tag(name, args) if args.is_empty() => name.to_string(),
         Value::Tag(name, args) => {
-            let rendered: Vec<String> = args.iter().map(inspect).collect();
+            let rendered: Vec<String> = args.iter().enumerate().map(|(i, v)| part(Part::Payload(i), v)).collect();
             format!("{}({})", name, rendered.join(", "))
         }
         // roc shows every function the same way, whatever its parameters.
         Value::Closure(_) | Value::Builtin(..) => "<function>".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// `inspect`, steered by the value's static TYPE: a nominal's `to_inspect` runs
+/// exactly where the type says that nominal, and nowhere else. roc erases nominals,
+/// so a value alone cannot say it is a `CreditCard :: Str` rather than a plain
+/// `Str`; `inspect` guesses from its shape, and a `Str` fits.
+///
+/// `shape` is the compiler's descriptor of the type (`vm::compile::inspect_shape`).
+/// Where it says nothing -- a type the checker left a variable, in a generic
+/// function -- or disagrees with the value, the value is shown by `inspect`.
+pub fn inspect_as(value: &Value, shape: &Value) -> String {
+    match shape {
+        Value::Tag(kind, parts) if &**kind == "Typed" => match &parts[..] {
+            [root, Value::List(table)] => shown_as(value, root, table),
+            _ => inspect(value),
+        },
+        _ => inspect(value),
+    }
+}
+
+/// `inspect_as` below the top: `table` holds what a `Ref` to a recursive nominal is.
+fn shown_as(value: &Value, shape: &Value, table: &[Value]) -> String {
+    let Value::Tag(kind, parts) = shape else { return inspect(value) };
+    match (&**kind, &parts[..], value) {
+        ("Ref", [Value::Str(name)], _) => {
+            let entry = table.iter().find_map(|e| match e {
+                Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if n == name) => Some(pair[1].clone()),
+                _ => None,
+            });
+            entry.map_or_else(|| inspect(value), |e| shown_as(value, &e, table))
+        }
+        ("Nominal", [Value::Str(name), Value::Bool(opaque), inner], _) => {
+            let found = crate::vm::method_of(name, "to_inspect").filter(|(qualified, _)| {
+                INSPECTING_TYPED.with(|r| !r.borrow().iter().any(|(q, v)| q == qualified && values_equal(v, value)))
+            });
+            if let Some((qualified, to_inspect)) = found {
+                INSPECTING_TYPED.with(|r| r.borrow_mut().push((qualified, value.clone())));
+                let shown = call_function(to_inspect, vec![value.clone()]);
+                INSPECTING_TYPED.with(|r| {
+                    r.borrow_mut().pop();
+                });
+                if let Ok(Value::Str(shown)) = shown {
+                    return shown.to_string();
+                }
+            }
+            if *opaque {
+                return "<opaque>".to_string();
+            }
+            shown_as(value, inner, table)
+        }
+        ("Plain", [], _) => render(value, &|_, v| inspect(v)),
+        ("List", [element], Value::List(_)) => render(value, &|_, v| shown_as(v, element, table)),
+        ("Tuple", [Value::List(items)], Value::Tuple(values)) if items.len() == values.len() => {
+            render(value, &|p, v| match p {
+                Part::Item(i) => shown_as(v, &items[i], table),
+                _ => inspect(v),
+            })
+        }
+        ("Record", [Value::List(fields)], Value::Record(_)) => render(value, &|p, v| {
+            let declared = match p {
+                Part::Field(name) => fields.iter().find_map(|f| match f {
+                    Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if &**n == name) => Some(&pair[1]),
+                    _ => None,
+                }),
+                _ => None,
+            };
+            declared.map_or_else(|| inspect(v), |d| shown_as(v, d, table))
+        }),
+        ("Tags", [Value::List(tags)], Value::Tag(tag, _)) => {
+            let payload = tags.iter().find_map(|t| match t {
+                Value::Tuple(pair) if matches!(&pair[0], Value::Str(n) if **n == **tag) => match &pair[1] {
+                    Value::List(ds) => Some(ds.clone()),
+                    _ => None,
+                },
+                _ => None,
+            });
+            render(value, &|p, v| match (p, &payload) {
+                (Part::Payload(i), Some(ds)) if i < ds.len() => shown_as(v, &ds[i], table),
+                _ => inspect(v),
+            })
+        }
+        _ => inspect(value),
     }
 }
 
@@ -3342,8 +3814,8 @@ pub fn run_test_expect(value: &Value) -> Result<(), EvalError> {
 }
 
 /// `dbg value` — to stderr, so it never mixes into a program's output.
-pub fn run_dbg(value: &Value) {
-    report(Report::Dbg, &inspect(value));
+pub fn run_dbg(value: &Value, shape: &Value) {
+    report(Report::Dbg, &inspect_as(value, shape));
 }
 
 /// What a program has to say outside its output: a `dbg`, a failed inline `expect`.
@@ -3452,17 +3924,19 @@ pub fn dispatch_builtin(method: &str, values: &mut [Value]) -> Result<Value, Eva
         message: format!("`{}` was dispatched on nothing", method),
     })?;
     let receiver = receiver.clone();
-    // `.iter()` on something already iterable is the identity. A range STAYS a range:
-    // building the list of its elements cost 190 MB on a two-million-element range, and
-    // every builtin that only walks the elements can walk a range instead. It also
-    // matches roc, which inspects a range as `<opaque>` rather than as a list.
+    // `.iter()` on a list is the iterator over it, which is what keeps `List.keep_if`
+    // and `Iter.keep_if` apart at run time. A range STAYS a range: building the list of
+    // its elements cost 190 MB on a two-million-element range, and every builtin that
+    // only walks the elements can walk a range instead. roc inspects both as `<opaque>`.
     //
     // ponytail: still eager in the sense that `map` over a range builds its output
     // list. Fusing `map` into the consumer needs a real lazy iterator; this removes the
     // ceiling without one.
     if method == "iter" && args.is_empty() {
-        if matches!(receiver, Value::List(_) | Value::Range { .. }) {
-            return Ok(receiver);
+        match receiver {
+            Value::List(_) => return Ok(lazy::of(receiver).map(Value::Iter).expect("a list is iterable")),
+            Value::Range { .. } => return Ok(receiver),
+            _ => {}
         }
     }
 
